@@ -3334,6 +3334,184 @@ this.AlertConfig = {
       await new Promise(resolve => setTimeout(resolve, ms));
     }
 
+    /**
+ * Admin interface for managing SyAPP instance
+ * @namespace
+ */
+this.Admin = {
+  /**
+   * Check if current user is admin
+   * @param {string} id - User/build ID
+   * @returns {boolean} Whether user is admin
+   */
+  IsAdmin: (id) => {
+    if (!this._syappInstance) return false;
+    return this._syappInstance._adminManager.isAdmin(id);
+  },
+
+  /**
+   * Get SyAPP instance configuration (admin only)
+   * @param {string} id - User/build ID
+   * @returns {Object|null} Instance configuration or null if not admin
+   */
+  GetConfig: (id) => {
+    if (!this.Admin.IsAdmin(id)) {
+      if (this.Log) {
+        console.log(`Admin.GetConfig() - Access denied for ${id}`);
+      }
+      return null;
+    }
+    return this._syappInstance._adminManager.getConfig();
+  },
+
+  /**
+   * Update SyAPP instance configuration (admin only)
+   * @param {string} id - User/build ID
+   * @param {Object} updates - Configuration updates
+   * @returns {Object} Result of the operation
+   */
+  UpdateConfig: (id, updates) => {
+    if (!this.Admin.IsAdmin(id)) {
+      if (this.Log) {
+        console.log(`Admin.UpdateConfig() - Access denied for ${id}`);
+      }
+      return { success: false, error: 'Not authorized' };
+    }
+    return this._syappInstance._adminManager.queueUpdate(id, 'updateConfig', updates);
+  },
+
+  /**
+   * Get server statistics (admin only)
+   * @param {string} id - User/build ID
+   * @returns {Object|null} Server statistics or null if not admin
+   */
+  GetStats: (id) => {
+    if (!this.Admin.IsAdmin(id)) {
+      if (this.Log) {
+        console.log(`Admin.GetStats() - Access denied for ${id}`);
+      }
+      return null;
+    }
+    return this._syappInstance._adminManager.getStats();
+  },
+
+  /**
+   * Get active sessions list (admin only)
+   * @param {string} id - User/build ID
+   * @returns {Array|null} Array of session info or null if not admin
+   */
+  GetSessions: (id) => {
+    if (!this.Admin.IsAdmin(id)) {
+      if (this.Log) {
+        console.log(`Admin.GetSessions() - Access denied for ${id}`);
+      }
+      return null;
+    }
+    return this._syappInstance._adminManager.getSessions();
+  },
+
+  /**
+   * Add admin user (admin only)
+   * @param {string} id - User/build ID
+   * @param {string} newAdminId - ID to add as admin
+   * @returns {Object} Result of the operation
+   */
+  AddAdmin: (id, newAdminId) => {
+    if (!this.Admin.IsAdmin(id)) {
+      if (this.Log) {
+        console.log(`Admin.AddAdmin() - Access denied for ${id}`);
+      }
+      return { success: false, error: 'Not authorized' };
+    }
+    return this._syappInstance._adminManager.queueUpdate(id, 'addAdmin', { adminId: newAdminId });
+  },
+
+  /**
+   * Remove admin user (admin only)
+   * @param {string} id - User/build ID
+   * @param {string} adminId - ID to remove from admins
+   * @returns {Object} Result of the operation
+   */
+  RemoveAdmin: (id, adminId) => {
+    if (!this.Admin.IsAdmin(id)) {
+      if (this.Log) {
+        console.log(`Admin.RemoveAdmin() - Access denied for ${id}`);
+      }
+      return { success: false, error: 'Not authorized' };
+    }
+    return this._syappInstance._adminManager.queueUpdate(id, 'removeAdmin', { adminId });
+  },
+
+  /**
+   * Get HTTP server configuration (admin only)
+   * @param {string} id - User/build ID
+   * @returns {Object|null} HTTP config or null if not admin
+   */
+  GetHTTPConfig: (id) => {
+    if (!this.Admin.IsAdmin(id)) {
+      if (this.Log) {
+        console.log(`Admin.GetHTTPConfig() - Access denied for ${id}`);
+      }
+      return null;
+    }
+    return this._syappInstance._adminManager.getHTTPConfig();
+  },
+
+  /**
+   * Update HTTP server configuration (admin only)
+   * @param {string} id - User/build ID
+   * @param {Object} updates - HTTP config updates
+   * @returns {Object} Result of the operation
+   */
+  UpdateHTTPConfig: (id, updates) => {
+    if (!this.Admin.IsAdmin(id)) {
+      if (this.Log) {
+        console.log(`Admin.UpdateHTTPConfig() - Access denied for ${id}`);
+      }
+      return { success: false, error: 'Not authorized' };
+    }
+    return this._syappInstance._adminManager.queueUpdate(id, 'updateHTTPConfig', updates);
+  },
+
+  /**
+   * Get function information (admin only)
+   * @param {string} id - User/build ID
+   * @param {string} funcName - Function name to get info about
+   * @returns {Object|null} Function info or null if not admin
+   */
+  GetFunctionInfo: (id, funcName) => {
+    if (!this.Admin.IsAdmin(id)) {
+      if (this.Log) {
+        console.log(`Admin.GetFunctionInfo() - Access denied for ${id}`);
+      }
+      return null;
+    }
+    return this._syappInstance._adminManager.getFunctionInfo(funcName);
+  },
+
+  /**
+   * Get admin commands help
+   * @returns {Object} Available admin commands
+   */
+  Help: () => {
+    return {
+      commands: {
+        'IsAdmin': 'Check if user is admin',
+        'GetConfig': 'Get instance configuration',
+        'UpdateConfig': 'Update instance configuration',
+        'GetStats': 'Get server statistics',
+        'GetSessions': 'Get active sessions',
+        'AddAdmin': 'Add admin user',
+        'RemoveAdmin': 'Remove admin user',
+        'GetHTTPConfig': 'Get HTTP configuration',
+        'UpdateHTTPConfig': 'Update HTTP configuration',
+        'GetFunctionInfo': 'Get function information'
+      },
+      usage: 'Replace "this" with the function instance and provide your user ID as first parameter'
+    };
+  }
+};
+
     // --------------------------- HTTP Route Methods ---------------------------
 
     /**
@@ -4824,6 +5002,335 @@ class HTTPRoutesStorage {
   }
 }
 
+// --------------------------- AdminManager Class ---------------------------
+
+/**
+ * Admin management system for SyAPP
+ * @class
+ */
+class AdminManager {
+  /**
+   * @param {SyAPP} syappInstance - Reference to SyAPP instance
+   * @param {string} mainSessionId - Main session ID (always admin)
+   */
+  constructor(syappInstance, mainSessionId) {
+    /** @type {SyAPP} */
+    this.syapp = syappInstance;
+    
+    /** @type {Set<string>} */
+    this.adminIds = new Set([mainSessionId]);
+    
+    /** @type {Object|null} */
+    this.configCache = null;
+  }
+
+  /**
+   * Check if an ID is admin
+   * @param {string} id - User/build ID
+   * @returns {boolean}
+   */
+  isAdmin(id) {
+    return this.adminIds.has(id);
+  }
+
+  /**
+   * Get instance configuration
+   * @returns {Object}
+   */
+  getConfig() {
+    this.configCache = {
+      mainFuncName: this.syapp.MainFunc.Name,
+      mainFuncOriginalName: this.syapp.MainFunc.OriginalName,
+      functionsCount: this.syapp.Funcs.size,
+      sessionsCount: this.syapp.Sessions.size,
+      adminCount: this.adminIds.size,
+      httpEnabled: this.syapp.serverConfig.enableHTTP,
+      httpPort: this.syapp.serverConfig.port,
+      httpHost: this.syapp.serverConfig.host,
+      baseRoute: this.syapp.serverConfig.baseRoute,
+      includeFuncName: this.syapp.serverConfig.includeFuncName,
+      hasRefresher: !!this.syapp.Refresher,
+      refreshInterval: this.syapp._refreshInterval || 500,
+      timestamp: new Date().toISOString()
+    };
+    return { ...this.configCache };
+  }
+
+  /**
+   * Get server statistics
+   * @returns {Object}
+   */
+  getStats() {
+    const stats = {
+      sessions: {
+        total: this.syapp.Sessions.size,
+        active: 0,
+        details: []
+      },
+      functions: {
+        total: this.syapp.Funcs.size,
+        list: Array.from(this.syapp.Funcs.keys())
+      },
+      http: null,
+      memory: {
+        heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024 * 100) / 100,
+        heapTotal: Math.round(process.memoryUsage().heapTotal / 1024 / 1024 * 100) / 100,
+        external: Math.round(process.memoryUsage().external / 1024 / 1024 * 100) / 100
+      },
+      uptime: process.uptime()
+    };
+
+    // Session details
+    for (const [sessionId, session] of this.syapp.Sessions) {
+      const sessionInfo = {
+        id: sessionId,
+        isAdmin: this.adminIds.has(sessionId),
+        currentPath: session.ActualPath,
+        hasPage: !!session.ActualProps?.page,
+        currentPage: session.ActualProps?.page || null,
+        inAction: session.InAction || false
+      };
+      stats.sessions.details.push(sessionInfo);
+      if (!session.InAction) stats.sessions.active++;
+    }
+
+    // HTTP stats if enabled
+    if (this.syapp.serverConfig.enableHTTP && this.syapp.routeStorage) {
+      stats.http = this.syapp.routeStorage.getStats();
+    }
+
+    return stats;
+  }
+
+  /**
+   * Get active sessions
+   * @returns {Array}
+   */
+  getSessions() {
+    const sessions = [];
+    for (const [sessionId, session] of this.syapp.Sessions) {
+      sessions.push({
+        id: sessionId,
+        isAdmin: this.adminIds.has(sessionId),
+        currentPath: session.ActualPath,
+        previousPath: session.PreviousPath,
+        hasPage: !!session.ActualProps?.page,
+        currentPage: session.ActualProps?.page || null,
+        inAction: session.InAction || false,
+        uniqueId: session.UniqueID
+      });
+    }
+    return sessions;
+  }
+
+  /**
+   * Get HTTP configuration
+   * @returns {Object}
+   */
+  getHTTPConfig() {
+    return {
+      enabled: this.syapp.serverConfig.enableHTTP,
+      port: this.syapp.serverConfig.port,
+      host: this.syapp.serverConfig.host,
+      baseRoute: this.syapp.serverConfig.baseRoute,
+      includeFuncName: this.syapp.serverConfig.includeFuncName,
+      httpConfig: this.syapp.serverConfig.httpConfig,
+      routesCount: this.syapp.routeStorage ? this.syapp.routeStorage.getStats().total : 0
+    };
+  }
+
+  /**
+   * Get function information
+   * @param {string} funcName - Function name
+   * @returns {Object|null}
+   */
+  getFunctionInfo(funcName) {
+    if (!this.syapp.Funcs.has(funcName)) {
+      return null;
+    }
+    
+    const func = this.syapp.Funcs.get(funcName);
+    return {
+      name: func.Name,
+      originalName: func.OriginalName,
+      isMainFunc: func.IsMainFunc || false,
+      hasCustomName: !!func.CustomName,
+      customName: func.CustomName || null,
+      linkedCount: func.Linked ? func.Linked.length : 0,
+      routesCount: func.Routes ? func.Routes.length : 0,
+      group: func.Group || '',
+      useridOnly: func.UserID_Only || false,
+      hasLogging: func.Log || false,
+      hasAlertConfig: !!func.AlertConfig,
+      storageStats: {
+        userStorage: func.UserStorage ? func.UserStorage.size : 0,
+        alertStorage: func.AlertStorage ? func.AlertStorage.size : 0,
+        buildsCount: func.Builds ? func.Builds.size : 0
+      }
+    };
+  }
+
+  /**
+   * Add admin user
+   * @param {string} adminId - ID to add
+   * @returns {Object}
+   */
+  addAdmin(adminId) {
+    if (!adminId) {
+      return { success: false, error: 'Invalid admin ID' };
+    }
+    
+    if (this.adminIds.has(adminId)) {
+      return { success: false, error: 'Already an admin' };
+    }
+    
+    this.adminIds.add(adminId);
+    this.configCache = null;
+    
+    return { 
+      success: true, 
+      message: `Added ${adminId} as admin`,
+      adminCount: this.adminIds.size
+    };
+  }
+
+  /**
+   * Remove admin user
+   * @param {string} adminId - ID to remove
+   * @returns {Object}
+   */
+  removeAdmin(adminId) {
+    if (adminId === this.syapp.MainSessionID) {
+      return { success: false, error: 'Cannot remove main session admin' };
+    }
+    
+    if (!this.adminIds.has(adminId)) {
+      return { success: false, error: 'Not an admin' };
+    }
+    
+    this.adminIds.delete(adminId);
+    this.configCache = null;
+    
+    return { 
+      success: true, 
+      message: `Removed ${adminId} from admins`,
+      adminCount: this.adminIds.size
+    };
+  }
+
+  /**
+   * Update instance configuration
+   * @param {Object} updates - Configuration updates
+   * @returns {Object}
+   */
+  updateConfig(updates) {
+    const allowedUpdates = ['httpConfig', 'baseRoute', 'includeFuncName'];
+    const applied = [];
+    const rejected = [];
+
+    for (const [key, value] of Object.entries(updates)) {
+      if (allowedUpdates.includes(key)) {
+        if (key === 'httpConfig' && this.syapp.serverConfig.enableHTTP) {
+          this.syapp.serverConfig.httpConfig = { ...this.syapp.serverConfig.httpConfig, ...value };
+          applied.push(key);
+        } else if (key === 'baseRoute') {
+          this.syapp.serverConfig.baseRoute = !!value;
+          applied.push(key);
+        } else if (key === 'includeFuncName') {
+          this.syapp.serverConfig.includeFuncName = !!value;
+          applied.push(key);
+        }
+      } else {
+        rejected.push(key);
+      }
+    }
+
+    this.configCache = null;
+    
+    return {
+      success: applied.length > 0,
+      applied,
+      rejected,
+      message: applied.length > 0 ? 'Configuration updated' : 'No valid updates applied'
+    };
+  }
+
+  /**
+   * Update HTTP configuration
+   * @param {Object} updates - HTTP config updates
+   * @returns {Object}
+   */
+  updateHTTPConfig(updates) {
+    if (!this.syapp.serverConfig.enableHTTP) {
+      return { success: false, error: 'HTTP server not enabled' };
+    }
+
+    const allowedUpdates = ['port', 'host', 'httpConfig'];
+    const applied = [];
+    const rejected = [];
+
+    for (const [key, value] of Object.entries(updates)) {
+      if (allowedUpdates.includes(key)) {
+        if (key === 'port' && Number.isInteger(value) && value > 0 && value < 65536) {
+          this.syapp.serverConfig.port = value;
+          applied.push(key);
+        } else if (key === 'host' && typeof value === 'string') {
+          this.syapp.serverConfig.host = value;
+          applied.push(key);
+        } else if (key === 'httpConfig' && typeof value === 'object') {
+          this.syapp.serverConfig.httpConfig = { ...this.syapp.serverConfig.httpConfig, ...value };
+          applied.push(key);
+        } else {
+          rejected.push(`${key} (invalid value)`);
+        }
+      } else {
+        rejected.push(key);
+      }
+    }
+
+    this.configCache = null;
+
+    return {
+      success: applied.length > 0,
+      applied,
+      rejected,
+      message: applied.length > 0 ? 'HTTP configuration updated (requires server restart for port/host changes)' : 'No valid updates applied'
+    };
+  }
+
+  /**
+   * Execute an admin operation
+   * @param {string} id - Requesting user ID
+   * @param {string} operation - Operation name
+   * @param {*} data - Operation data
+   * @returns {Object}
+   */
+  executeOperation(id, operation, data) {
+    if (!this.isAdmin(id)) {
+      return { success: false, error: 'Not authorized' };
+    }
+
+    switch (operation) {
+      case 'updateConfig':
+        return this.updateConfig(data);
+      
+      case 'updateHTTPConfig':
+        return this.updateHTTPConfig(data);
+      
+      case 'addAdmin':
+        return this.addAdmin(data.adminId);
+      
+      case 'removeAdmin':
+        return this.removeAdmin(data.adminId);
+      
+      default:
+        return { success: false, error: `Unknown operation: ${operation}` };
+    }
+  }
+}
+
+// --------------------------- SyAPP Class ---------------------------
+
 /**
  * Main SyAPP application class
  * @class
@@ -4840,8 +5347,8 @@ class SyAPP {
    * @param {string} [config.mainFuncName] - Custom name for the main function
    * @param {boolean} [config.baseRoute=false] - Use base routes (no function name prefix)
    * @param {boolean} [config.includeFuncName=true] - Include function name in routes
-   * * @param {boolean} [config.RefreshMode=false] - Start with Refresh Screen mode
-   * * * @param {number} [config.RefreshInterval=500] - Set the Refresh Screen mode interval in ms
+   * @param {boolean} [config.RefreshMode=false] - Start with Refresh Screen mode
+   * @param {number} [config.RefreshInterval=500] - Set the Refresh Screen mode interval in ms
    */
   constructor(mainFuncOrConfig, config = {}) {
     /** @type {TerminalHUD} */
@@ -4908,29 +5415,36 @@ class SyAPP {
       includeFuncName: userConfig.includeFuncName !== false
     };
 
-    // In the SyAPP constructor, RefreshMode section:
-if(userConfig.RefreshMode){
-  this.Refresher = setInterval(async () => {  
-    let sessions = [...this.Sessions.keys()]
-    
-    sessions.forEach(k => {
-      if(this.Sessions.get(k).ActualProps.page){
-        this.LoadScreen(this.Sessions.get(k).ActualPath, {
-          props: {
-            page: this.Sessions.get(k).ActualProps.page,
-            _isRefresh: true // Mark as refresh
+    // Initialize admin manager with main session as admin
+    /** @type {AdminManager} */
+    this._adminManager = new AdminManager(this, this.MainSessionID);
+
+    // Store refresh interval for admin stats
+    this._refreshInterval = userConfig.RefreshInterval || 500;
+
+    // Refresh mode
+    if (userConfig.RefreshMode) {
+      this.Refresher = setInterval(async () => {  
+        let sessions = [...this.Sessions.keys()]
+        
+        sessions.forEach(k => {
+          if (this.Sessions.get(k).ActualProps.page) {
+            this.LoadScreen(this.Sessions.get(k).ActualPath, {
+              props: {
+                page: this.Sessions.get(k).ActualProps.page,
+                _isRefresh: true
+              }
+            })
+          } else {
+            this.LoadScreen(this.Sessions.get(k).ActualPath, {
+              props: {
+                _isRefresh: true
+              }
+            })
           }
         })
-      } else {
-        this.LoadScreen(this.Sessions.get(k).ActualPath, {
-          props: {
-            _isRefresh: true // Mark as refresh
-          }
-        })
-      }
-    })
-  }, config.RefreshInterval || 500);
-}
+      }, this._refreshInterval);
+    }
 
     /**
      * Process and register a function class
@@ -4948,15 +5462,16 @@ if(userConfig.RefreshMode){
           const originalInstance = new FuncClass();
           originalInstance.IsMainFunc = true;
           originalInstance.CustomName = this.serverConfig.mainFuncName;
+          originalInstance._syappInstance = this;
           this.Funcs.set(funcName, originalInstance);
         }
         
-        // Register with custom name - IMPORTANT: We need to override the Name property
+        // Register with custom name
         if (!this.Funcs.has(this.serverConfig.mainFuncName)) {
           const customInstance = new FuncClass();
           customInstance.IsMainFunc = true;
           customInstance.OriginalName = funcName;
-          // Override the Name property that comes from the class
+          customInstance._syappInstance = this;
           Object.defineProperty(customInstance, 'Name', {
             value: this.serverConfig.mainFuncName,
             writable: false,
@@ -4982,6 +5497,7 @@ if(userConfig.RefreshMode){
       }
 
       const instance = new FuncClass();
+      instance._syappInstance = this;
       this.Funcs.set(funcName, instance);
 
       instance.Linked.forEach(linkedFunc => {
@@ -5004,163 +5520,163 @@ if(userConfig.RefreshMode){
 
     // --------------------------- LoadScreen Method ---------------------------
 
-     /**
- * Load a screen/function
- * @param {string} [funcname] - Function name to load
- * @param {Object} [config] - Load configuration
- * @param {boolean|number} [config.jumpTo=false] - Jump to index
- * @param {boolean} [config.resetSelection=false] - Reset selection
- * @param {Object} [config.props={}] - Props to pass
- * @returns {Promise<void>}
- */
-this.LoadScreen = async (funcname = this.MainFunc.Name, config = { jumpTo: false, resetSelection: false, props: {} }) => {
-  const session = this.Sessions.get(this.MainSessionID);
-  
-  // Lock check - if session is already in action, silently return
-  if (session.InAction) {
-    return;
-  }
-  
-  // Acquire lock
-  session.InAction = true;
-  
-  try {
-    if (!config.props) { config.props = {}; }
-
-    // Handle main function name aliasing
-    let targetFuncName = funcname;
-    
-    // If trying to access main function by original name but we have a custom name
-    if (this.serverConfig.mainFuncName && 
-        funcname === this.MainFunc.OriginalName && 
-        this.Funcs.has(this.serverConfig.mainFuncName)) {
-      targetFuncName = this.serverConfig.mainFuncName;
-    }
-
-    if (!this.Funcs.has(targetFuncName)) {
-      config.props.notfounded_func = funcname;
-      targetFuncName = 'notfounded';
-    }
-    config.props.mainfunc = this.MainFunc.Name;
-
-    // Pass HTTP config to the build function if available
-    if (this.serverConfig.enableHTTP && this.serverConfig.httpConfig) {
-      config.props._httpConfig = this.serverConfig.httpConfig;
-    }
-
-    session.PreviousPath = session.ActualPath;
-    session.ActualPath = targetFuncName;
-    session.PreviousProps = session.ActualProps;
-    config.props.session = session;
-    session.ActualProps = config.props;
-
-    try {
-      const return_obj = await this.Funcs.get(targetFuncName).Build(config.props);
-
-      if (config.props) {
-        if (config.props.session) {
-          if (config.props.session.ActualPath && config.props.session.PreviousPath) {
-            if (config.props.session.ActualPath != config.props.session.PreviousPath) {
-              this.HUD.lastFocusedIndex = 0
-              config.resetSelection = true;
-            }
-          }
-        }
-      }
-
-      if (return_obj && return_obj.goto_now) {
-        // Release lock before recursive call
-        session.InAction = false;
-        
-        this.LoadScreen(return_obj.goto_now.path, {
-          props: return_obj.goto_now.props || {},
-          jumpTo: false,
-          resetSelection: true
-        }).catch(er => {
-          this.LoadScreen('error', {
-            props: {
-              error_message: er,
-              error_func: return_obj.goto_now.path,
-              mainfunc: this.MainFunc.Name
-            }
-          });
-        });
+    /**
+     * Load a screen/function
+     * @param {string} [funcname] - Function name to load
+     * @param {Object} [config] - Load configuration
+     * @param {boolean|number} [config.jumpTo=false] - Jump to index
+     * @param {boolean} [config.resetSelection=false] - Reset selection
+     * @param {Object} [config.props={}] - Props to pass
+     * @returns {Promise<void>}
+     */
+    this.LoadScreen = async (funcname = this.MainFunc.Name, config = { jumpTo: false, resetSelection: false, props: {} }) => {
+      const session = this.Sessions.get(this.MainSessionID);
+      
+      // Lock check - if session is already in action, silently return
+      if (session.InAction) {
         return;
       }
+      
+      // Acquire lock
+      session.InAction = true;
+      
+      try {
+        if (!config.props) { config.props = {}; }
 
-      this.HUD.displayMenu(return_obj.hud_obj, {
-        remember: (!config.resetSelection) ? true : false,
-        jumpToIndex: (!config.jumpTo) ? undefined : config.jumpTo
-      })
-        .catch(e => {
-          this.LoadScreen('error', {
-            props: {
-              error_message: e,
-              error_func: targetFuncName,
-              mainfunc: this.MainFunc.Name
-            }
-          });
-        });
+        // Handle main function name aliasing
+        let targetFuncName = funcname;
+        
+        // If trying to access main function by original name but we have a custom name
+        if (this.serverConfig.mainFuncName && 
+            funcname === this.MainFunc.OriginalName && 
+            this.Funcs.has(this.serverConfig.mainFuncName)) {
+          targetFuncName = this.serverConfig.mainFuncName;
+        }
 
-      if (return_obj.wait_input) {
-        let response;
+        if (!this.Funcs.has(targetFuncName)) {
+          config.props.notfounded_func = funcname;
+          targetFuncName = 'notfounded';
+        }
+        config.props.mainfunc = this.MainFunc.Name;
+
+        // Pass HTTP config to the build function if available
+        if (this.serverConfig.enableHTTP && this.serverConfig.httpConfig) {
+          config.props._httpConfig = this.serverConfig.httpConfig;
+        }
+
+        session.PreviousPath = session.ActualPath;
+        session.ActualPath = targetFuncName;
+        session.PreviousProps = session.ActualProps;
+        config.props.session = session;
+        session.ActualProps = config.props;
 
         try {
-          if (return_obj.input_obj.password) {
-            response = await this.HUD.ask(return_obj.input_obj.question || 'Password: ', {
-              password: true,
-              mask: return_obj.input_obj.mask || '*'
-            });
-          } else {
-            response = await this.HUD.ask(return_obj.input_obj.question || 'Type: ');
+          const return_obj = await this.Funcs.get(targetFuncName).Build(config.props);
+
+          if (config.props) {
+            if (config.props.session) {
+              if (config.props.session.ActualPath && config.props.session.PreviousPath) {
+                if (config.props.session.ActualPath != config.props.session.PreviousPath) {
+                  this.HUD.lastFocusedIndex = 0
+                  config.resetSelection = true;
+                }
+              }
+            }
           }
 
-          // Release lock before recursive call
-          session.InAction = false;
-          
-          this.LoadScreen(return_obj.input_obj.path, {
-            props: {
-              inputValue: response,
-              ...return_obj.input_obj.props
-            }
-          });
+          if (return_obj && return_obj.goto_now) {
+            // Release lock before recursive call
+            session.InAction = false;
+            
+            this.LoadScreen(return_obj.goto_now.path, {
+              props: return_obj.goto_now.props || {},
+              jumpTo: false,
+              resetSelection: true
+            }).catch(er => {
+              this.LoadScreen('error', {
+                props: {
+                  error_message: er,
+                  error_func: return_obj.goto_now.path,
+                  mainfunc: this.MainFunc.Name
+                }
+              });
+            });
+            return;
+          }
 
-        } catch (e) {
+          this.HUD.displayMenu(return_obj.hud_obj, {
+            remember: (!config.resetSelection) ? true : false,
+            jumpToIndex: (!config.jumpTo) ? undefined : config.jumpTo
+          })
+            .catch(e => {
+              this.LoadScreen('error', {
+                props: {
+                  error_message: e,
+                  error_func: targetFuncName,
+                  mainfunc: this.MainFunc.Name
+                }
+              });
+            });
+
+          if (return_obj.wait_input) {
+            let response;
+
+            try {
+              if (return_obj.input_obj.password) {
+                response = await this.HUD.ask(return_obj.input_obj.question || 'Password: ', {
+                  password: true,
+                  mask: return_obj.input_obj.mask || '*'
+                });
+              } else {
+                response = await this.HUD.ask(return_obj.input_obj.question || 'Type: ');
+              }
+
+              // Release lock before recursive call
+              session.InAction = false;
+              
+              this.LoadScreen(return_obj.input_obj.path, {
+                props: {
+                  inputValue: response,
+                  ...return_obj.input_obj.props
+                }
+              });
+
+            } catch (e) {
+              // Release lock before recursive error call
+              session.InAction = false;
+              
+              this.LoadScreen('error', {
+                props: {
+                  error_message: e,
+                  error_func: targetFuncName,
+                  mainfunc: this.MainFunc.Name
+                }
+              });
+            }
+            return;
+          }
+
+          // Release lock on successful completion
+          session.InAction = false;
+
+        } catch (buildError) {
           // Release lock before recursive error call
           session.InAction = false;
           
           this.LoadScreen('error', {
             props: {
-              error_message: e,
+              error_message: buildError,
               error_func: targetFuncName,
               mainfunc: this.MainFunc.Name
             }
           });
         }
-        return;
+      } catch (error) {
+        // Ensure lock is released even if an unexpected error occurs
+        session.InAction = false;
+        throw error;
       }
-
-      // Release lock on successful completion
-      session.InAction = false;
-
-    } catch (buildError) {
-      // Release lock before recursive error call
-      session.InAction = false;
-      
-      this.LoadScreen('error', {
-        props: {
-          error_message: buildError,
-          error_func: targetFuncName,
-          mainfunc: this.MainFunc.Name
-        }
-      });
-    }
-  } catch (error) {
-    // Ensure lock is released even if an unexpected error occurs
-    session.InAction = false;
-    throw error;
-  }
-};
+    };
 
     this.HUD.on(this.HUD.eventTypes.MENU_SELECTION, (e) => {
       const currentSession = this.Sessions.get(this.MainSessionID);
@@ -5191,6 +5707,37 @@ this.LoadScreen = async (funcname = this.MainFunc.Name, config = { jumpTo: false
     if (!this.serverConfig.enableHTTP) {
       this.LoadScreen();
     }
+  }
+
+  // --------------------------- Admin Methods ---------------------------
+
+  /**
+   * Register an external ID as admin
+   * @param {string} id - ID to register as admin
+   * @returns {Object} Result
+   */
+  registerAdmin(id) {
+    if (!id) {
+      return { success: false, error: 'Invalid ID' };
+    }
+    return this._adminManager.addAdmin(id);
+  }
+
+  /**
+   * Check if an ID is admin
+   * @param {string} id - ID to check
+   * @returns {boolean}
+   */
+  isAdmin(id) {
+    return this._adminManager.isAdmin(id);
+  }
+
+  /**
+   * Get admin manager instance
+   * @returns {AdminManager}
+   */
+  getAdminManager() {
+    return this._adminManager;
   }
 
   // --------------------------- Route Discovery ---------------------------
@@ -5333,7 +5880,6 @@ this.LoadScreen = async (funcname = this.MainFunc.Name, config = { jumpTo: false
         if (route.hasValidation) {
           validationInfo = ColorText.cyan(' 🔒');
           
-          // Show validation options
           if (route.validationOptions && route.validationOptions.includeMissingKeys === false) {
             validationInfo += ColorText.dim(' (no missingKeys)');
           }
@@ -5341,7 +5887,6 @@ this.LoadScreen = async (funcname = this.MainFunc.Name, config = { jumpTo: false
         
         console.log(`    ${methodColor(route.method.padEnd(6))} ${route.path}${modelInfo}${validationInfo}`);
         
-        // Show model details if present
         if (Object.keys(route.models.input).length > 0) {
           console.log(`      ${ColorText.dim('Input: ' + JSON.stringify(HTTPModelValidator.describe(route.models.input)))}`);
         }
@@ -5370,166 +5915,178 @@ this.LoadScreen = async (funcname = this.MainFunc.Name, config = { jumpTo: false
     return this.routeStorage.getStats();
   }
 
+  // --------------------------- HTTP Server Methods ---------------------------
 
-
-// --------------------------- HTTP Server Methods ---------------------------
-
-/**
- * Start the HTTP server
- * @private
- */
-startHTTPServer() {
-  this.httpServer = http.createServer((req, res) => {
-    this.handleRequest(req, res);
-  });
-
-  this.httpServer.listen(this.serverConfig.port, this.serverConfig.host, () => {
-    console.log('\n' + ColorText.brightGreen('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
-    console.log(ColorText.brightCyan('                              🚀 SyAPP HTTP Server'));
-    console.log(ColorText.brightGreen('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━') + '\n');
-    
-    console.log(`   ${ColorText.brightWhite('URL:')} http://${this.serverConfig.host}:${this.serverConfig.port}/`);
-    console.log(`   ${ColorText.brightWhite('Mode:')} ${this.serverConfig.baseRoute ? 'Root level' : 'With function names'}${this.serverConfig.includeFuncName ? '' : ' (no func name)'}`);
-    console.log(`   ${ColorText.brightWhite('Routes:')} ${this.routeStorage.getStats().total} total\n`);
-    
-    console.log(ColorText.brightGreen('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━') + '\n');
-  });
-
-  this.httpServer.on('error', (error) => {
-    console.error(ColorText.brightRed('❌ HTTP Server error:'), error);
-  });
-}
- 
-/**
- * Handle incoming HTTP requests with model validation
- * @param {http.IncomingMessage} req - Request object
- * @param {http.ServerResponse} res - Response object
- * @private
- */
-async handleRequest(req, res) {
-  const parsedUrl = url.parse(req.url, true);
-  const path = parsedUrl.pathname;
-  const method = req.method;
-
-  console.log(`   ${ColorText.brightCyan('➡️')}  ${method} ${path}${ColorText.reset}`);
-
-  const route = this.routeStorage.getRoute(method, path);
-
-  if (!route) {
-    console.log(`   ${ColorText.brightRed('❌ Route not found')}${ColorText.reset}`);
-    
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ 
-      error: 'Route not found',
-      requested: `${method} ${path}`,
-      appname: this.MainFunc.Name,
-      port : this.serverConfig.port,
-      available: this.routeStorage.getAllRoutes().map(r => `${r.method} ${r.path}`)
-    }));
-    return;
-  }
-
-  // Add helper methods to response object
-  res.json = (data) => {
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify(data));
-  };
-
-  res.status = (code) => {
-    res.statusCode = 200;
-    return res;
-  };
-
-  // Get validation options for this route
-  const validationOptions = this.routeStorage.getValidationOptions(method, path);
-  
-  // Function to send validation error response with missingKeys
-  const sendValidationError = (missingKeys = []) => {
-    console.log(`   ${ColorText.brightRed('❌ Input validation failed - returning custom response')}${ColorText.reset}`);
-    
-    if (route.input_validate) {
-      // If input_validate is an object, enhance it with missingKeys if enabled
-      if (typeof route.input_validate === 'object' && route.input_validate !== null) {
-        const enhancedResponse = { ...route.input_validate };
-        
-        // Add missingKeys only if validation options allow it
-        if (validationOptions.includeMissingKeys && missingKeys.length > 0) {
-          enhancedResponse.missingKeys = missingKeys;
-        }
-        
-        res.status(200).json(enhancedResponse);
-      } else {
-        // If input_validate is not an object, send it as is (maintaining backward compatibility)
-        res.status(200).json(route.input_validate);
-      }
-    } else {
-      // Default response if no input_validate provided
-      const defaultResponse = { 
-        error: 'Validation failed',
-        message: 'Input validation failed'
-      };
-      
-      // Add missingKeys if enabled
-      if (validationOptions.includeMissingKeys && missingKeys.length > 0) {
-        defaultResponse.missingKeys = missingKeys;
-      }
-      
-      res.status(200).json(defaultResponse);
-    }
-  };
-
-  // Parse body for POST/PUT requests
-  if (method === 'POST' || method === 'PUT') {
-    let body = '';
-    req.on('data', chunk => {
-      body += chunk.toString();
-      if (body.length > 1e6) req.destroy();
+  /**
+   * Start the HTTP server
+   * @private
+   */
+  startHTTPServer() {
+    this.httpServer = http.createServer((req, res) => {
+      this.handleRequest(req, res);
     });
 
-    req.on('end', async () => {
-      try {
-        let parsedBody = {};
-        const contentType = req.headers['content-type'];
-        
-        if (contentType && contentType.includes('application/json') && body) {
-          parsedBody = JSON.parse(body);
-        } else if (body) {
-          parsedBody = querystring.parse(body);
-        }
+    this.httpServer.listen(this.serverConfig.port, this.serverConfig.host, () => {
+      console.log('\n' + ColorText.brightGreen('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
+      console.log(ColorText.brightCyan('                              🚀 SyAPP HTTP Server'));
+      console.log(ColorText.brightGreen('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━') + '\n');
+      
+      console.log(`   ${ColorText.brightWhite('URL:')} http://${this.serverConfig.host}:${this.serverConfig.port}/`);
+      console.log(`   ${ColorText.brightWhite('Mode:')} ${this.serverConfig.baseRoute ? 'Root level' : 'With function names'}${this.serverConfig.includeFuncName ? '' : ' (no func name)'}`);
+      console.log(`   ${ColorText.brightWhite('Routes:')} ${this.routeStorage.getStats().total} total`);
+      console.log(`   ${ColorText.brightWhite('Admin:')} ${this._adminManager.adminIds.size} admin(s) registered\n`);
+      
+      console.log(ColorText.brightGreen('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━') + '\n');
+    });
 
-        req.query = parsedUrl.query;
-        req.body = parsedBody;
-        req.params = parsedUrl.query;
+    this.httpServer.on('error', (error) => {
+      console.error(ColorText.brightRed('❌ HTTP Server error:'), error);
+    });
+  }
+ 
+  /**
+   * Handle incoming HTTP requests with model validation
+   * @param {http.IncomingMessage} req - Request object
+   * @param {http.ServerResponse} res - Response object
+   * @private
+   */
+  async handleRequest(req, res) {
+    const parsedUrl = url.parse(req.url, true);
+    const path = parsedUrl.pathname;
+    const method = req.method;
 
-        // Validate input against model FIRST
-        if (route.input_model && Object.keys(route.input_model).length > 0) {
-          const validation = HTTPModelValidator.validate(
-            req.body, 
-            route.input_model, 
-            { includeMissingKeys: validationOptions.includeMissingKeys }
-          );
+    console.log(`   ${ColorText.brightCyan('➡️')}  ${method} ${path}${ColorText.reset}`);
+
+    const route = this.routeStorage.getRoute(method, path);
+
+    if (!route) {
+      console.log(`   ${ColorText.brightRed('❌ Route not found')}${ColorText.reset}`);
+      
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ 
+        error: 'Route not found',
+        requested: `${method} ${path}`,
+        appname: this.MainFunc.Name,
+        port: this.serverConfig.port,
+        available: this.routeStorage.getAllRoutes().map(r => `${r.method} ${r.path}`)
+      }));
+      return;
+    }
+
+    // Add helper methods to response object
+    res.json = (data) => {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify(data));
+    };
+
+    res.status = (code) => {
+      res.statusCode = 200;
+      return res;
+    };
+
+    // Get validation options for this route
+    const validationOptions = this.routeStorage.getValidationOptions(method, path);
+    
+    // Function to send validation error response with missingKeys
+    const sendValidationError = (missingKeys = []) => {
+      console.log(`   ${ColorText.brightRed('❌ Input validation failed - returning custom response')}${ColorText.reset}`);
+      
+      if (route.input_validate) {
+        if (typeof route.input_validate === 'object' && route.input_validate !== null) {
+          const enhancedResponse = { ...route.input_validate };
           
-          if (!validation.valid) {
-            // Send validation error with missing keys
-            sendValidationError(validation.missingKeys);
-            return; // Stop execution
+          if (validationOptions.includeMissingKeys && missingKeys.length > 0) {
+            enhancedResponse.missingKeys = missingKeys;
           }
           
-          // Replace body with sanitized data
-          req.body = validation.sanitized;
-          console.log(`   ${ColorText.brightGreen('✅ Input validation passed')}${ColorText.reset}`);
+          res.status(200).json(enhancedResponse);
+        } else {
+          res.status(200).json(route.input_validate);
         }
+      } else {
+        const defaultResponse = { 
+          error: 'Validation failed',
+          message: 'Input validation failed'
+        };
+        
+        if (validationOptions.includeMissingKeys && missingKeys.length > 0) {
+          defaultResponse.missingKeys = missingKeys;
+        }
+        
+        res.status(200).json(defaultResponse);
+      }
+    };
 
-        // Only execute handler if validation passed
-        await route.handler(req, res);
+    // Parse body for POST/PUT requests
+    if (method === 'POST' || method === 'PUT') {
+      let body = '';
+      req.on('data', chunk => {
+        body += chunk.toString();
+        if (body.length > 1e6) req.destroy();
+      });
 
-      } catch (error) {
-        console.error('Error handling request:', error);
+      req.on('end', async () => {
+        try {
+          let parsedBody = {};
+          const contentType = req.headers['content-type'];
+          
+          if (contentType && contentType.includes('application/json') && body) {
+            parsedBody = JSON.parse(body);
+          } else if (body) {
+            parsedBody = querystring.parse(body);
+          }
+
+          req.query = parsedUrl.query;
+          req.body = parsedBody;
+          req.params = parsedUrl.query;
+
+          // Validate input against model FIRST
+          if (route.input_model && Object.keys(route.input_model).length > 0) {
+            const validation = HTTPModelValidator.validate(
+              req.body, 
+              route.input_model, 
+              { includeMissingKeys: validationOptions.includeMissingKeys }
+            );
+            
+            if (!validation.valid) {
+              sendValidationError(validation.missingKeys);
+              return;
+            }
+            
+            req.body = validation.sanitized;
+            console.log(`   ${ColorText.brightGreen('✅ Input validation passed')}${ColorText.reset}`);
+          }
+
+          await route.handler(req, res);
+
+        } catch (error) {
+          console.error('Error handling request:', error);
+          if (!res.headersSent) {
+            if (route.input_validate) {
+              if (validationOptions.includeMissingKeys) {
+                const errorResponse = typeof route.input_validate === 'object' 
+                  ? { ...route.input_validate, missingKeys: [] }
+                  : route.input_validate;
+                res.status(200).json(errorResponse);
+              } else {
+                res.status(200).json(route.input_validate);
+              }
+            } else {
+              res.status(200).json({ 
+                error: 'Internal server error', 
+                details: error.message 
+              });
+            }
+          }
+        }
+      });
+
+      req.on('error', (error) => {
+        console.error('Request error:', error);
         if (!res.headersSent) {
           if (route.input_validate) {
-            // Check if we should include missingKeys in error response
             if (validationOptions.includeMissingKeys) {
-              const errorResponse = typeof route.input_validate === 'object' 
+              const errorResponse = typeof route.input_validate === 'object'
                 ? { ...route.input_validate, missingKeys: [] }
                 : route.input_validate;
               res.status(200).json(errorResponse);
@@ -5538,82 +6095,57 @@ async handleRequest(req, res) {
             }
           } else {
             res.status(200).json({ 
-              error: 'Internal server error', 
+              error: 'Request error', 
+              details: error.message 
+            });
+          }
+        }
+      });
+    } else {
+      // GET and DELETE requests
+      req.query = parsedUrl.query;
+      req.params = parsedUrl.query;
+      
+      if (route.input_model && Object.keys(route.input_model).length > 0) {
+        const validation = HTTPModelValidator.validate(
+          req.query, 
+          route.input_model,
+          { includeMissingKeys: validationOptions.includeMissingKeys }
+        );
+        
+        if (!validation.valid) {
+          sendValidationError(validation.missingKeys);
+          return;
+        }
+        
+        req.query = validation.sanitized;
+        console.log(`   ${ColorText.brightGreen('✅ Query validation passed')}${ColorText.reset}`);
+      }
+      
+      try {
+        await route.handler(req, res);
+      } catch (error) {
+        console.error('Handler error:', error);
+        if (!res.headersSent) {
+          if (route.input_validate) {
+            if (validationOptions.includeMissingKeys) {
+              const errorResponse = typeof route.input_validate === 'object'
+                ? { ...route.input_validate, missingKeys: [] }
+                : route.input_validate;
+              res.status(200).json(errorResponse);
+            } else {
+              res.status(200).json(route.input_validate);
+            }
+          } else {
+            res.status(200).json({ 
+              error: 'Handler error', 
               details: error.message 
             });
           }
         }
       }
-    });
-
-    req.on('error', (error) => {
-      console.error('Request error:', error);
-      if (!res.headersSent) {
-        if (route.input_validate) {
-          if (validationOptions.includeMissingKeys) {
-            const errorResponse = typeof route.input_validate === 'object'
-              ? { ...route.input_validate, missingKeys: [] }
-              : route.input_validate;
-            res.status(200).json(errorResponse);
-          } else {
-            res.status(200).json(route.input_validate);
-          }
-        } else {
-          res.status(200).json({ 
-            error: 'Request error', 
-            details: error.message 
-          });
-        }
-      }
-    });
-  } else {
-    // GET and DELETE requests
-    req.query = parsedUrl.query;
-    req.params = parsedUrl.query;
-    
-    // Validate query parameters for GET/DELETE FIRST
-    if (route.input_model && Object.keys(route.input_model).length > 0) {
-      const validation = HTTPModelValidator.validate(
-        req.query, 
-        route.input_model,
-        { includeMissingKeys: validationOptions.includeMissingKeys }
-      );
-      
-      if (!validation.valid) {
-        // Send validation error with missing keys
-        sendValidationError(validation.missingKeys);
-        return; // Stop execution
-      }
-      
-      req.query = validation.sanitized;
-      console.log(`   ${ColorText.brightGreen('✅ Query validation passed')}${ColorText.reset}`);
-    }
-    
-    // Only execute handler if validation passed
-    try {
-      await route.handler(req, res);
-    } catch (error) {
-      console.error('Handler error:', error);
-      if (!res.headersSent) {
-        if (route.input_validate) {
-          if (validationOptions.includeMissingKeys) {
-            const errorResponse = typeof route.input_validate === 'object'
-              ? { ...route.input_validate, missingKeys: [] }
-              : route.input_validate;
-            res.status(200).json(errorResponse);
-          } else {
-            res.status(200).json(route.input_validate);
-          }
-        } else {
-          res.status(200).json({ 
-            error: 'Handler error', 
-            details: error.message 
-          });
-        }
-      }
     }
   }
-}
 
   // --------------------------- Utility Methods ---------------------------
 
