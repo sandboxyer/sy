@@ -59,6 +59,7 @@ LOG_MODE=false
 SKIP_DEBS=false
 LOCAL_DIR_MODE=false
 PRESERVE_DATA=true
+INSTALL_NODE=false
 
 # External dependencies (uncomment and configure if needed)
 # PM2_TAR_GZ="$ARCHIVE_DIR/pm2.tar.gz"              # Uncomment if using pm2
@@ -78,6 +79,8 @@ show_help() {
     echo "  --skip-debs      Skip .deb package installation"
     echo "  --local-dir      Run commands from current directory"
     echo "  --no-preserve    Don't preserve files during update"
+    echo "  --node           Auto-install Node.js if missing (requires internet)"
+    echo "  --nodejs         Same as --node"
     echo
     echo "Commands will be created for:"
     for cmd in $NODE_ENTRY_POINTS_CMD; do
@@ -112,6 +115,358 @@ detect_ubuntu_variant() {
         echo "desktop"
     else
         echo "server"
+    fi
+}
+
+# Detect Linux distribution for package management
+detect_distro() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        echo "$ID"
+    elif [ -f /etc/debian_version ]; then
+        echo "debian"
+    elif [ -f /etc/redhat-release ]; then
+        echo "rhel"
+    elif [ -f /etc/arch-release ]; then
+        echo "arch"
+    else
+        echo "unknown"
+    fi
+}
+
+# Check for internet connectivity
+check_internet() {
+    log_message "Checking internet connectivity..."
+    if command -v wget >/dev/null 2>&1; then
+        wget -q --spider http://google.com 2>/dev/null && return 0
+    elif command -v curl >/dev/null 2>&1; then
+        curl -s --head http://google.com >/dev/null 2>&1 && return 0
+    elif command -v ping >/dev/null 2>&1; then
+        ping -c 1 -W 2 google.com >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+# Check if Node.js is installed
+check_node() {
+    if command -v node >/dev/null 2>&1; then
+        node_version=$(node --version 2>/dev/null)
+        log_message "Node.js is already installed: $node_version"
+        return 0
+    else
+        log_message "Node.js is not installed"
+        return 1
+    fi
+}
+
+# Install Node.js using apt with fallback
+install_nodejs_apt() {
+    echo "Attempting direct Node.js installation..."
+    
+    # Try direct install first, capture output to temp file for progress display
+    tmp_output=$(mktemp)
+    if sudo apt install -y nodejs > "$tmp_output" 2>&1; then
+        # Success - show progress from temp file
+        grep -E "(Get:|Unpacking|Setting up|Processing|Selecting|Preparing)" "$tmp_output" | while IFS= read -r line; do
+            echo "[APT] $line"
+        done
+        rm -f "$tmp_output"
+        return 0
+    else
+        # Show what happened
+        grep -E "(Get:|Unpacking|Setting up|Processing|Selecting|Preparing)" "$tmp_output" | while IFS= read -r line; do
+            echo "[APT] $line"
+        done
+        rm -f "$tmp_output"
+        
+        echo "Direct installation failed. Updating package lists..."
+        if sudo apt update 2>&1 | grep --line-buffered -E "(Get:|Hit:|Ign:|Reading)" | while IFS= read -r line; do
+            echo "[APT UPDATE] $line"
+        done; then
+            echo "Package lists updated. Retrying Node.js installation..."
+            # Retry installation
+            sudo apt install -y nodejs 2>&1 | grep --line-buffered -E "(Get:|Unpacking|Setting up|Processing|Selecting|Preparing)" | while IFS= read -r line; do
+                echo "[APT] $line"
+            done
+            return ${PIPESTATUS[0]}
+        else
+            echo "Failed to update package lists"
+            return 1
+        fi
+    fi
+}
+
+# Install Node.js using dnf with fallback
+install_nodejs_dnf() {
+    echo "Attempting direct Node.js installation with DNF..."
+    
+    sudo dnf install -y nodejs 2>&1 | grep --line-buffered -E "(Downloading|Installing|Running|Complete|Error)" | while IFS= read -r line; do
+        echo "[DNF] $line"
+    done
+    
+    if [ ${PIPESTATUS[0]} -eq 0 ]; then
+        return 0
+    fi
+    
+    echo "Direct installation failed. Updating package metadata..."
+    sudo dnf makecache 2>&1 | grep --line-buffered -E "(Metadata|Cache|Download)" | while IFS= read -r line; do
+        echo "[DNF UPDATE] $line"
+    done
+    
+    echo "Retrying Node.js installation..."
+    sudo dnf install -y nodejs 2>&1 | grep --line-buffered -E "(Downloading|Installing|Running|Complete)" | while IFS= read -r line; do
+        echo "[DNF] $line"
+    done
+    return ${PIPESTATUS[0]}
+}
+
+# Install Node.js using yum with fallback
+install_nodejs_yum() {
+    echo "Attempting direct Node.js installation with YUM..."
+    
+    sudo yum install -y nodejs 2>&1 | grep --line-buffered -E "(Downloading|Installing|Running|Complete|Error)" | while IFS= read -r line; do
+        echo "[YUM] $line"
+    done
+    
+    if [ ${PIPESTATUS[0]} -eq 0 ]; then
+        return 0
+    fi
+    
+    echo "Direct installation failed. Updating package metadata..."
+    sudo yum makecache 2>&1 | grep --line-buffered -E "(Metadata|Cache|Download)" | while IFS= read -r line; do
+        echo "[YUM UPDATE] $line"
+    done
+    
+    echo "Retrying Node.js installation..."
+    sudo yum install -y nodejs 2>&1 | grep --line-buffered -E "(Downloading|Installing|Running|Complete)" | while IFS= read -r line; do
+        echo "[YUM] $line"
+    done
+    return ${PIPESTATUS[0]}
+}
+
+# Install Node.js using pacman with fallback
+install_nodejs_pacman() {
+    echo "Attempting direct Node.js installation with Pacman..."
+    
+    sudo pacman -S --noconfirm nodejs 2>&1 | grep --line-buffered -E "(resolving|downloading|installing|checking|error)" | while IFS= read -r line; do
+        echo "[PACMAN] $line"
+    done
+    
+    if [ ${PIPESTATUS[0]} -eq 0 ]; then
+        return 0
+    fi
+    
+    echo "Direct installation failed. Updating package database..."
+    sudo pacman -Sy 2>&1 | grep --line-buffered -E "(synchronizing|downloading|core|extra)" | while IFS= read -r line; do
+        echo "[PACMAN UPDATE] $line"
+    done
+    
+    echo "Retrying Node.js installation..."
+    sudo pacman -S --noconfirm nodejs 2>&1 | grep --line-buffered -E "(resolving|downloading|installing|checking)" | while IFS= read -r line; do
+        echo "[PACMAN] $line"
+    done
+    return ${PIPESTATUS[0]}
+}
+
+# Install Node.js using zypper with fallback
+install_nodejs_zypper() {
+    echo "Attempting direct Node.js installation with Zypper..."
+    
+    sudo zypper install -y nodejs 2>&1 | grep --line-buffered -E "(Retrieving|Installing|Downloading|In progress|Finished|Error)" | while IFS= read -r line; do
+        echo "[ZYPPER] $line"
+    done
+    
+    if [ ${PIPESTATUS[0]} -eq 0 ]; then
+        return 0
+    fi
+    
+    echo "Direct installation failed. Refreshing repositories..."
+    sudo zypper refresh 2>&1 | grep --line-buffered -E "(Retrieving|Repository|Building|Downloading)" | while IFS= read -r line; do
+        echo "[ZYPPER UPDATE] $line"
+    done
+    
+    echo "Retrying Node.js installation..."
+    sudo zypper install -y nodejs 2>&1 | grep --line-buffered -E "(Retrieving|Installing|Downloading|In progress|Finished)" | while IFS= read -r line; do
+        echo "[ZYPPER] $line"
+    done
+    return ${PIPESTATUS[0]}
+}
+
+# Install Node.js using apk with fallback
+install_nodejs_apk() {
+    echo "Attempting direct Node.js installation with APK..."
+    
+    sudo apk add nodejs 2>&1 | grep --line-buffered -E "(fetch|Installing|Downloading|[0-9]+%|ERROR)" | while IFS= read -r line; do
+        echo "[APK] $line"
+    done
+    
+    if [ ${PIPESTATUS[0]} -eq 0 ]; then
+        return 0
+    fi
+    
+    echo "Direct installation failed. Updating package index..."
+    sudo apk update 2>&1 | grep --line-buffered -E "(fetch|Downloading|Index)" | while IFS= read -r line; do
+        echo "[APK UPDATE] $line"
+    done
+    
+    echo "Retrying Node.js installation..."
+    sudo apk add nodejs 2>&1 | grep --line-buffered -E "(fetch|Installing|Downloading|[0-9]+%)" | while IFS= read -r line; do
+        echo "[APK] $line"
+    done
+    return ${PIPESTATUS[0]}
+}
+
+# Install Node.js with progress tracking based on detected distribution
+install_nodejs() {
+    distro=$(detect_distro)
+    log_message "Detected Linux distribution: $distro"
+    
+    case "$distro" in
+        ubuntu|debian|linuxmint|pop|elementary|zorin)
+            log_message "Installing Node.js using apt..."
+            if [ "$LOG_MODE" = true ]; then
+                # Try direct install with logging
+                sudo apt install -y nodejs 2>&1 | tee -a "$LOG_FILE" || {
+                    log_message "Direct install failed, updating and retrying..."
+                    sudo apt update 2>&1 | tee -a "$LOG_FILE"
+                    sudo apt install -y nodejs 2>&1 | tee -a "$LOG_FILE"
+                }
+                return ${PIPESTATUS[0]}
+            else
+                install_nodejs_apt
+            fi
+            return $?
+            ;;
+        rhel|centos|fedora|rocky|almalinux)
+            if command -v dnf >/dev/null 2>&1; then
+                log_message "Installing Node.js using dnf..."
+                if [ "$LOG_MODE" = true ]; then
+                    sudo dnf install -y nodejs 2>&1 | tee -a "$LOG_FILE" || {
+                        log_message "Direct install failed, updating and retrying..."
+                        sudo dnf makecache 2>&1 | tee -a "$LOG_FILE"
+                        sudo dnf install -y nodejs 2>&1 | tee -a "$LOG_FILE"
+                    }
+                    return ${PIPESTATUS[0]}
+                else
+                    install_nodejs_dnf
+                fi
+            else
+                log_message "Installing Node.js using yum..."
+                if [ "$LOG_MODE" = true ]; then
+                    sudo yum install -y nodejs 2>&1 | tee -a "$LOG_FILE" || {
+                        log_message "Direct install failed, updating and retrying..."
+                        sudo yum makecache 2>&1 | tee -a "$LOG_FILE"
+                        sudo yum install -y nodejs 2>&1 | tee -a "$LOG_FILE"
+                    }
+                    return ${PIPESTATUS[0]}
+                else
+                    install_nodejs_yum
+                fi
+            fi
+            return $?
+            ;;
+        arch|manjaro|endeavouros)
+            log_message "Installing Node.js using pacman..."
+            if [ "$LOG_MODE" = true ]; then
+                sudo pacman -S --noconfirm nodejs 2>&1 | tee -a "$LOG_FILE" || {
+                    log_message "Direct install failed, updating and retrying..."
+                    sudo pacman -Sy 2>&1 | tee -a "$LOG_FILE"
+                    sudo pacman -S --noconfirm nodejs 2>&1 | tee -a "$LOG_FILE"
+                }
+                return ${PIPESTATUS[0]}
+            else
+                install_nodejs_pacman
+            fi
+            return $?
+            ;;
+        opensuse*|suse)
+            log_message "Installing Node.js using zypper..."
+            if [ "$LOG_MODE" = true ]; then
+                sudo zypper install -y nodejs 2>&1 | tee -a "$LOG_FILE" || {
+                    log_message "Direct install failed, refreshing and retrying..."
+                    sudo zypper refresh 2>&1 | tee -a "$LOG_FILE"
+                    sudo zypper install -y nodejs 2>&1 | tee -a "$LOG_FILE"
+                }
+                return ${PIPESTATUS[0]}
+            else
+                install_nodejs_zypper
+            fi
+            return $?
+            ;;
+        alpine)
+            log_message "Installing Node.js using apk..."
+            if [ "$LOG_MODE" = true ]; then
+                sudo apk add nodejs 2>&1 | tee -a "$LOG_FILE" || {
+                    log_message "Direct install failed, updating and retrying..."
+                    sudo apk update 2>&1 | tee -a "$LOG_FILE"
+                    sudo apk add nodejs 2>&1 | tee -a "$LOG_FILE"
+                }
+                return ${PIPESTATUS[0]}
+            else
+                install_nodejs_apk
+            fi
+            return $?
+            ;;
+        *)
+            log_message "Unknown distribution. Cannot install Node.js automatically"
+            log_message "Please install Node.js manually from: https://nodejs.org/"
+            return 1
+            ;;
+    esac
+}
+
+# Main Node.js installation logic
+ensure_nodejs() {
+    [ "$INSTALL_NODE" = false ] && return 0
+    
+    log_message "========================================="
+    log_message "Node.js installation check requested (--node/--nodejs flag detected)"
+    log_message "========================================="
+    
+    # First check if node is already installed
+    if check_node; then
+        return 0
+    fi
+    
+    echo ""
+    echo "========================================="
+    echo "  Node.js Installation"
+    echo "========================================="
+    echo ""
+    
+    # Node.js is not installed, check internet connectivity
+    if ! check_internet; then
+        log_message "No internet connection detected"
+        log_message "Skipping Node.js installation - proceeding with normal installation"
+        return 0
+    fi
+    
+    # Internet is available, install Node.js
+    log_message "Internet connection detected. Starting Node.js installation..."
+    echo "Starting download and installation of Node.js..."
+    echo "This may take a few minutes depending on your internet speed."
+    echo ""
+    
+    if install_nodejs; then
+        echo ""
+        log_message "Node.js installation completed successfully"
+        # Verify installation
+        if check_node; then
+            node_version=$(node --version 2>/dev/null)
+            npm_version=$(npm --version 2>/dev/null)
+            echo "✓ Node.js $node_version installed successfully"
+            [ -n "$npm_version" ] && echo "✓ npm $npm_version installed successfully"
+            return 0
+        else
+            log_message "Warning: Node.js installation completed but verification failed"
+            log_message "Continuing with installation anyway..."
+            return 0
+        fi
+    else
+        echo ""
+        log_message "Warning: Failed to install Node.js"
+        log_message "Continuing with installation anyway..."
+        return 0
     fi
 }
 
@@ -824,10 +1179,14 @@ for arg in "$@"; do
         --skip-debs) SKIP_DEBS=true ;;
         --local-dir) LOCAL_DIR_MODE=true ;;
         --no-preserve) PRESERVE_DATA=false ;;
+        --node|--nodejs) INSTALL_NODE=true ;;
     esac
 done
 
 log_message "Starting $PROJECT_NAME installation..."
+
+# Check and install Node.js if --node or --nodejs flag was provided
+ensure_nodejs
 
 if [ -d "$INSTALL_DIR" ]; then
     log_message "Existing installation found."
