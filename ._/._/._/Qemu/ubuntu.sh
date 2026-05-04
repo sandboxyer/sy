@@ -78,6 +78,22 @@ password: ubuntu
 chpasswd:
   expire: False
 ssh_pwauth: True
+
+# Enable root login
+user: root
+disable_root: false
+
+# Configure SSH for root login
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-enable-root-login.conf
+    content: |
+      PermitRootLogin yes
+      PasswordAuthentication yes
+    permissions: '0644'
+    owner: root:root
+
+runcmd:
+  - systemctl restart ssh
 EOF
 
     cat > meta-data << EOF
