@@ -12,3 +12,29 @@ log.json
 test_sydb.c
 *.sqlite
 sypm_sydb_*
+
+# Ubuntu cloud image downloads
+noble-server-cloudimg-amd64.img
+*.img
+
+# Cloud-init generated files
+noble-cloud-init.iso
+cloud-init-source/
+
+# VM data directories (both temp and persistent)
+noble-vm-*/
+/tmp/noble-vm-tmp.*/
+
+# Any .qcow2 files that might be generated
+*.qcow2
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# IDE/editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
