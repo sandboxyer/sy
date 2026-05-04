@@ -241,11 +241,34 @@ check_kvm() {
     fi
 }
 
+# --- Smart installation helper for apt-based systems ---
+smart_apt_install() {
+    local package="$1"
+    local display_name="$2"
+    
+    echo "[INSTALL] Installing ${display_name} via apt..."
+    
+    # First try: Install without updating package lists (much faster if cache is recent)
+    if apt-get install -y -qq "$package" 2>/dev/null; then
+        echo "[INSTALL] ${display_name} installed successfully (no update needed)"
+        return 0
+    fi
+    
+    # Second try: Update package lists and retry (only if first attempt failed)
+    echo "[INSTALL] Direct install failed, updating package lists and retrying..."
+    if apt-get update -qq && apt-get install -y -qq "$package"; then
+        echo "[INSTALL] ${display_name} installed successfully (after update)"
+        return 0
+    fi
+    
+    echo "ERROR: Failed to install ${display_name}"
+    return 1
+}
+
 # --- Check and install genisoimage ---
 install_genisoimage() {
     if command -v apt-get >/dev/null 2>&1; then
-        echo "[INSTALL] Installing genisoimage via apt..."
-        apt-get update -qq && apt-get install -y -qq genisoimage
+        smart_apt_install "genisoimage" "genisoimage" || exit 1
     elif command -v apk >/dev/null 2>&1; then
         echo "[INSTALL] Installing genisoimage via apk..."
         apk add --no-cache genisoimage
@@ -264,8 +287,7 @@ install_genisoimage() {
 # --- Check and install qemu-img if needed ---
 install_qemu_img() {
     if command -v apt-get >/dev/null 2>&1; then
-        echo "[INSTALL] Installing qemu-utils via apt..."
-        apt-get update -qq && apt-get install -y -qq qemu-utils
+        smart_apt_install "qemu-utils" "qemu-utils" || exit 1
     elif command -v apk >/dev/null 2>&1; then
         echo "[INSTALL] Installing qemu-img via apk..."
         apk add --no-cache qemu-img
@@ -284,8 +306,7 @@ install_qemu_img() {
 # --- Check and install QEMU system emulator if needed ---
 install_qemu_system() {
     if command -v apt-get >/dev/null 2>&1; then
-        echo "[INSTALL] Installing qemu-system-x86 via apt..."
-        apt-get update -qq && apt-get install -y -qq qemu-system-x86
+        smart_apt_install "qemu-system-x86" "qemu-system-x86" || exit 1
     elif command -v apk >/dev/null 2>&1; then
         echo "[INSTALL] Installing qemu-system-x86_64 via apk..."
         apk add --no-cache qemu-system-x86_64
