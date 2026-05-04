@@ -246,15 +246,11 @@ install_nodejs_apt() {
         rm -f "$tmp_output"
         
         echo "Direct installation failed. Updating package lists..."
-        if sudo apt update 2>&1 | grep --line-buffered -E "(Get:|Hit:|Ign:|Reading)" | while IFS= read -r line; do
-            echo "[APT UPDATE] $line"
-        done; then
+        if sudo apt update 2>&1 | tee /dev/stderr | grep -E "(Get:|Hit:|Ign:|Reading)" > /dev/null; then
             echo "Package lists updated. Retrying Node.js installation..."
             # Retry installation
-            sudo apt install -y nodejs 2>&1 | grep --line-buffered -E "(Get:|Unpacking|Setting up|Processing|Selecting|Preparing)" | while IFS= read -r line; do
-                echo "[APT] $line"
-            done
-            return ${PIPESTATUS[0]}
+            sudo apt install -y nodejs 2>&1 | grep -E "(Get:|Unpacking|Setting up|Processing|Selecting|Preparing)"
+            return $?
         else
             echo "Failed to update package lists"
             return 1
@@ -266,120 +262,150 @@ install_nodejs_apt() {
 install_nodejs_dnf() {
     echo "Attempting direct Node.js installation with DNF..."
     
-    sudo dnf install -y nodejs 2>&1 | grep --line-buffered -E "(Downloading|Installing|Running|Complete|Error)" | while IFS= read -r line; do
-        echo "[DNF] $line"
+    sudo dnf install -y nodejs 2>&1 | while IFS= read -r line; do
+        if echo "$line" | grep -qE "(Downloading|Installing|Running|Complete|Error)"; then
+            echo "[DNF] $line"
+        fi
     done
     
-    if [ ${PIPESTATUS[0]} -eq 0 ]; then
+    if [ $? -eq 0 ]; then
         return 0
     fi
     
     echo "Direct installation failed. Updating package metadata..."
-    sudo dnf makecache 2>&1 | grep --line-buffered -E "(Metadata|Cache|Download)" | while IFS= read -r line; do
-        echo "[DNF UPDATE] $line"
+    sudo dnf makecache 2>&1 | while IFS= read -r line; do
+        if echo "$line" | grep -qE "(Metadata|Cache|Download)"; then
+            echo "[DNF UPDATE] $line"
+        fi
     done
     
     echo "Retrying Node.js installation..."
-    sudo dnf install -y nodejs 2>&1 | grep --line-buffered -E "(Downloading|Installing|Running|Complete)" | while IFS= read -r line; do
-        echo "[DNF] $line"
+    sudo dnf install -y nodejs 2>&1 | while IFS= read -r line; do
+        if echo "$line" | grep -qE "(Downloading|Installing|Running|Complete)"; then
+            echo "[DNF] $line"
+        fi
     done
-    return ${PIPESTATUS[0]}
+    return $?
 }
 
 # Install Node.js using yum with fallback
 install_nodejs_yum() {
     echo "Attempting direct Node.js installation with YUM..."
     
-    sudo yum install -y nodejs 2>&1 | grep --line-buffered -E "(Downloading|Installing|Running|Complete|Error)" | while IFS= read -r line; do
-        echo "[YUM] $line"
+    sudo yum install -y nodejs 2>&1 | while IFS= read -r line; do
+        if echo "$line" | grep -qE "(Downloading|Installing|Running|Complete|Error)"; then
+            echo "[YUM] $line"
+        fi
     done
     
-    if [ ${PIPESTATUS[0]} -eq 0 ]; then
+    if [ $? -eq 0 ]; then
         return 0
     fi
     
     echo "Direct installation failed. Updating package metadata..."
-    sudo yum makecache 2>&1 | grep --line-buffered -E "(Metadata|Cache|Download)" | while IFS= read -r line; do
-        echo "[YUM UPDATE] $line"
+    sudo yum makecache 2>&1 | while IFS= read -r line; do
+        if echo "$line" | grep -qE "(Metadata|Cache|Download)"; then
+            echo "[YUM UPDATE] $line"
+        fi
     done
     
     echo "Retrying Node.js installation..."
-    sudo yum install -y nodejs 2>&1 | grep --line-buffered -E "(Downloading|Installing|Running|Complete)" | while IFS= read -r line; do
-        echo "[YUM] $line"
+    sudo yum install -y nodejs 2>&1 | while IFS= read -r line; do
+        if echo "$line" | grep -qE "(Downloading|Installing|Running|Complete)"; then
+            echo "[YUM] $line"
+        fi
     done
-    return ${PIPESTATUS[0]}
+    return $?
 }
 
 # Install Node.js using pacman with fallback
 install_nodejs_pacman() {
     echo "Attempting direct Node.js installation with Pacman..."
     
-    sudo pacman -S --noconfirm nodejs 2>&1 | grep --line-buffered -E "(resolving|downloading|installing|checking|error)" | while IFS= read -r line; do
-        echo "[PACMAN] $line"
+    sudo pacman -S --noconfirm nodejs 2>&1 | while IFS= read -r line; do
+        if echo "$line" | grep -qE "(resolving|downloading|installing|checking|error)"; then
+            echo "[PACMAN] $line"
+        fi
     done
     
-    if [ ${PIPESTATUS[0]} -eq 0 ]; then
+    if [ $? -eq 0 ]; then
         return 0
     fi
     
     echo "Direct installation failed. Updating package database..."
-    sudo pacman -Sy 2>&1 | grep --line-buffered -E "(synchronizing|downloading|core|extra)" | while IFS= read -r line; do
-        echo "[PACMAN UPDATE] $line"
+    sudo pacman -Sy 2>&1 | while IFS= read -r line; do
+        if echo "$line" | grep -qE "(synchronizing|downloading|core|extra)"; then
+            echo "[PACMAN UPDATE] $line"
+        fi
     done
     
     echo "Retrying Node.js installation..."
-    sudo pacman -S --noconfirm nodejs 2>&1 | grep --line-buffered -E "(resolving|downloading|installing|checking)" | while IFS= read -r line; do
-        echo "[PACMAN] $line"
+    sudo pacman -S --noconfirm nodejs 2>&1 | while IFS= read -r line; do
+        if echo "$line" | grep -qE "(resolving|downloading|installing|checking)"; then
+            echo "[PACMAN] $line"
+        fi
     done
-    return ${PIPESTATUS[0]}
+    return $?
 }
 
 # Install Node.js using zypper with fallback
 install_nodejs_zypper() {
     echo "Attempting direct Node.js installation with Zypper..."
     
-    sudo zypper install -y nodejs 2>&1 | grep --line-buffered -E "(Retrieving|Installing|Downloading|In progress|Finished|Error)" | while IFS= read -r line; do
-        echo "[ZYPPER] $line"
+    sudo zypper install -y nodejs 2>&1 | while IFS= read -r line; do
+        if echo "$line" | grep -qE "(Retrieving|Installing|Downloading|In progress|Finished|Error)"; then
+            echo "[ZYPPER] $line"
+        fi
     done
     
-    if [ ${PIPESTATUS[0]} -eq 0 ]; then
+    if [ $? -eq 0 ]; then
         return 0
     fi
     
     echo "Direct installation failed. Refreshing repositories..."
-    sudo zypper refresh 2>&1 | grep --line-buffered -E "(Retrieving|Repository|Building|Downloading)" | while IFS= read -r line; do
-        echo "[ZYPPER UPDATE] $line"
+    sudo zypper refresh 2>&1 | while IFS= read -r line; do
+        if echo "$line" | grep -qE "(Retrieving|Repository|Building|Downloading)"; then
+            echo "[ZYPPER UPDATE] $line"
+        fi
     done
     
     echo "Retrying Node.js installation..."
-    sudo zypper install -y nodejs 2>&1 | grep --line-buffered -E "(Retrieving|Installing|Downloading|In progress|Finished)" | while IFS= read -r line; do
-        echo "[ZYPPER] $line"
+    sudo zypper install -y nodejs 2>&1 | while IFS= read -r line; do
+        if echo "$line" | grep -qE "(Retrieving|Installing|Downloading|In progress|Finished)"; then
+            echo "[ZYPPER] $line"
+        fi
     done
-    return ${PIPESTATUS[0]}
+    return $?
 }
 
 # Install Node.js using apk with fallback
 install_nodejs_apk() {
     echo "Attempting direct Node.js installation with APK..."
     
-    sudo apk add nodejs 2>&1 | grep --line-buffered -E "(fetch|Installing|Downloading|[0-9]+%|ERROR)" | while IFS= read -r line; do
-        echo "[APK] $line"
-    done
-    
-    if [ ${PIPESTATUS[0]} -eq 0 ]; then
-        return 0
+    # Check if we're running as root
+    if [ "$(id -u)" = "0" ]; then
+        APK_CMD="apk"
+    elif command -v sudo >/dev/null 2>&1; then
+        APK_CMD="sudo apk"
+    else
+        echo "Error: Need root privileges to install packages"
+        echo "Please run as root or install sudo"
+        return 1
     fi
     
-    echo "Direct installation failed. Updating package index..."
-    sudo apk update 2>&1 | grep --line-buffered -E "(fetch|Downloading|Index)" | while IFS= read -r line; do
-        echo "[APK UPDATE] $line"
-    done
+    # First update the package index
+    echo "Updating package index..."
+    $APK_CMD update
     
-    echo "Retrying Node.js installation..."
-    sudo apk add nodejs 2>&1 | grep --line-buffered -E "(fetch|Installing|Downloading|[0-9]+%)" | while IFS= read -r line; do
-        echo "[APK] $line"
-    done
-    return ${PIPESTATUS[0]}
+    # Install nodejs and npm
+    echo "Installing Node.js and npm..."
+    if $APK_CMD add nodejs npm; then
+        echo "Node.js installation completed"
+        return 0
+    else
+        echo "Node.js installation failed"
+        return 1
+    fi
 }
 
 # Install Node.js with progress tracking based on detected distribution
@@ -397,7 +423,7 @@ install_nodejs() {
                     sudo apt update 2>&1 | tee -a "$LOG_FILE"
                     sudo apt install -y nodejs 2>&1 | tee -a "$LOG_FILE"
                 }
-                return ${PIPESTATUS[0]}
+                return $?
             else
                 install_nodejs_apt
             fi
@@ -412,7 +438,7 @@ install_nodejs() {
                         sudo dnf makecache 2>&1 | tee -a "$LOG_FILE"
                         sudo dnf install -y nodejs 2>&1 | tee -a "$LOG_FILE"
                     }
-                    return ${PIPESTATUS[0]}
+                    return $?
                 else
                     install_nodejs_dnf
                 fi
@@ -424,7 +450,7 @@ install_nodejs() {
                         sudo yum makecache 2>&1 | tee -a "$LOG_FILE"
                         sudo yum install -y nodejs 2>&1 | tee -a "$LOG_FILE"
                     }
-                    return ${PIPESTATUS[0]}
+                    return $?
                 else
                     install_nodejs_yum
                 fi
@@ -439,7 +465,7 @@ install_nodejs() {
                     sudo pacman -Sy 2>&1 | tee -a "$LOG_FILE"
                     sudo pacman -S --noconfirm nodejs 2>&1 | tee -a "$LOG_FILE"
                 }
-                return ${PIPESTATUS[0]}
+                return $?
             else
                 install_nodejs_pacman
             fi
@@ -453,7 +479,7 @@ install_nodejs() {
                     sudo zypper refresh 2>&1 | tee -a "$LOG_FILE"
                     sudo zypper install -y nodejs 2>&1 | tee -a "$LOG_FILE"
                 }
-                return ${PIPESTATUS[0]}
+                return $?
             else
                 install_nodejs_zypper
             fi
@@ -467,7 +493,7 @@ install_nodejs() {
                     sudo apk update 2>&1 | tee -a "$LOG_FILE"
                     sudo apk add nodejs 2>&1 | tee -a "$LOG_FILE"
                 }
-                return ${PIPESTATUS[0]}
+                return $?
             else
                 install_nodejs_apk
             fi
