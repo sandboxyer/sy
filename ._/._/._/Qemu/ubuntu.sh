@@ -4,6 +4,7 @@
 IMG_URL="https://cloud-images.ubuntu.com/noble/20260216/noble-server-cloudimg-amd64.img"
 IMG_FILE="noble-server-cloudimg-amd64.img"
 ISO_FILE="noble-cloud-init.iso"
+SSH_BASE_PORT=2222
 
 # --- Check and install genisoimage ---
 install_genisoimage() {
@@ -33,6 +34,25 @@ else
 fi
 
 # --- Functions ---
+find_available_port() {
+    local start_port="$1"
+    local port="$start_port"
+    local max_attempts=100
+    
+    while [ $((port - start_port)) -lt $max_attempts ]; do
+        if ! ss -tlnp 2>/dev/null | grep -q ":${port} " && \
+           ! netstat -tlnp 2>/dev/null | grep -q ":${port} " && \
+           ! lsof -i :${port} 2>/dev/null >/dev/null; then
+            echo "$port"
+            return 0
+        fi
+        port=$((port + 1))
+    done
+    
+    echo "ERROR: No available ports found between ${start_port} and $((start_port + max_attempts - 1))"
+    return 1
+}
+
 create_cloud_init_iso() {
     local target_dir="$1"  # Directory where ISO will be placed
     
@@ -91,19 +111,18 @@ EOF
 run_vm() {
     local img_path="$1"
     local iso_path="$2"
+    local ssh_port="$3"
     
     # Convert to absolute paths safely
     if [ -d "$(dirname "$img_path")" ]; then
         img_path=$(cd "$(dirname "$img_path")" && pwd)/$(basename "$img_path")
     else
-        # If directory doesn't exist yet, use the path as-is
         img_path="$(pwd)/${img_path#./}"
     fi
     
     if [ -d "$(dirname "$iso_path")" ]; then
         iso_path=$(cd "$(dirname "$iso_path")" && pwd)/$(basename "$iso_path")
     else
-        # If directory doesn't exist yet, use the path as-is
         iso_path="$(pwd)/${iso_path#./}"
     fi
     
@@ -122,19 +141,67 @@ run_vm() {
     echo "[VM] Starting QEMU with:"
     echo "  Disk: ${img_path}"
     echo "  ISO:  ${iso_path}"
+    echo "  SSH:  localhost:${ssh_port} -> VM:22"
     
     qemu-system-x86_64 \
         -drive file="${img_path}",format=qcow2,if=virtio \
         -cdrom "${iso_path}" \
         -m 2048 \
-        -netdev user,id=net0 \
+        -netdev user,id=net0,hostfwd=tcp::${ssh_port}-:22 \
         -device virtio-net,netdev=net0 \
         -nographic \
         -enable-kvm
 }
 
 # --- Main Logic ---
-VM_NAME="$1"
+CUSTOM_PORT=""
+VM_NAME=""
+
+# Parse arguments
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --port)
+            if [ -n "$2" ] && [ "$2" -eq "$2" ] 2>/dev/null; then
+                CUSTOM_PORT="$2"
+                shift 2
+            else
+                echo "ERROR: --port requires a valid number"
+                exit 1
+            fi
+            ;;
+        *)
+            if [ -z "$VM_NAME" ]; then
+                VM_NAME="$1"
+                shift
+            else
+                echo "ERROR: Unknown argument: $1"
+                exit 1
+            fi
+            ;;
+    esac
+done
+
+# Determine starting port for search
+if [ -n "$CUSTOM_PORT" ]; then
+    START_PORT="$CUSTOM_PORT"
+    echo "[PORT] Searching for available port starting from custom port: ${START_PORT}"
+else
+    START_PORT="$SSH_BASE_PORT"
+    echo "[PORT] Searching for available port starting from default port: ${START_PORT}"
+fi
+
+# Find available port with fallback
+SSH_PORT=$(find_available_port "$START_PORT")
+if [ $? -ne 0 ]; then
+    echo "$SSH_PORT"
+    exit 1
+fi
+
+if [ "$SSH_PORT" != "$START_PORT" ]; then
+    echo "[PORT] Port ${START_PORT} is in use, using fallback port: ${SSH_PORT}"
+else
+    echo "[PORT] Using port: ${SSH_PORT}"
+fi
 
 # Store the absolute path of the current directory
 BASE_DIR=$(pwd)
@@ -164,7 +231,7 @@ if [ -z "$VM_NAME" ]; then
     create_cloud_init_iso "${TMPDIR}"
     
     # Run VM
-    run_vm "${TMPDIR}/${IMG_FILE}" "${TMPDIR}/${ISO_FILE}"
+    run_vm "${TMPDIR}/${IMG_FILE}" "${TMPDIR}/${ISO_FILE}" "${SSH_PORT}"
     
     # Cleanup
     echo "[TEMP MODE] Cleaning up..."
@@ -194,6 +261,6 @@ else
     create_cloud_init_iso "${VMDIR}"
     
     # Run VM with persistent data
-    run_vm "${VMDIR}/${IMG_FILE}" "${VMDIR}/${ISO_FILE}"
+    run_vm "${VMDIR}/${IMG_FILE}" "${VMDIR}/${ISO_FILE}" "${SSH_PORT}"
     echo "[PERSISTENT MODE] VM data preserved in: ${VMDIR}"
 fi
