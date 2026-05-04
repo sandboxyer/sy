@@ -16,7 +16,8 @@
 DEFAULT_OS="alpine"
 SSH_BASE_PORT=2222
 DEFAULT_DISK_SIZE="5G"
-DEFAULT_MEMORY="2048"  # Will be auto-adjusted based on host RAM
+DEFAULT_MEMORY="2048"  # Will be auto-adjusted based on host RAM and OS
+ALPINE_DEFAULT_MEMORY="256"  # Alpine runs well with minimal memory
 
 # --- Helper: Show help message ---
 show_help() {
@@ -131,9 +132,18 @@ get_available_memory_mb() {
 # --- Helper: Calculate safe VM memory size ---
 calculate_vm_memory() {
     local requested_memory="$1"
+    local os_type="$2"
     local available_mem=$(get_available_memory_mb)
     
     echo "[MEMORY] Host available memory: ${available_mem}MB" >&2
+    
+    # Determine OS-specific default memory
+    local os_default_memory
+    if [ "$os_type" = "alpine" ]; then
+        os_default_memory="$ALPINE_DEFAULT_MEMORY"
+    else
+        os_default_memory="$DEFAULT_MEMORY"
+    fi
     
     # If specific memory requested, try to honor it
     if [ -n "$requested_memory" ] && [ "$requested_memory" -gt 0 ]; then
@@ -156,28 +166,60 @@ calculate_vm_memory() {
         fi
     fi
     
-    # Auto-calculate based on available memory
+    # Auto-calculate based on available memory and OS type
     local vm_memory
-    if [ "$available_mem" -ge 8192 ]; then
-        vm_memory=4096  # 4GB for VMs when host has 8GB+
-        echo "[MEMORY] High memory detected, allocating: ${vm_memory}MB" >&2
-    elif [ "$available_mem" -ge 4096 ]; then
-        vm_memory=2048  # 2GB for VMs when host has 4-8GB
-        echo "[MEMORY] Moderate memory detected, allocating: ${vm_memory}MB" >&2
-    elif [ "$available_mem" -ge 2048 ]; then
-        vm_memory=1024  # 1GB for VMs when host has 2-4GB
-        echo "[MEMORY] Limited memory detected, allocating: ${vm_memory}MB" >&2
-    elif [ "$available_mem" -ge 1024 ]; then
-        vm_memory=512   # 512MB for VMs when host has 1-2GB
-        echo "[MEMORY] Low memory detected, allocating minimal: ${vm_memory}MB" >&2
-    elif [ "$available_mem" -ge 512 ]; then
-        vm_memory=256   # 256MB absolute minimum
-        echo "[MEMORY] Very low memory! Allocating absolute minimum: ${vm_memory}MB" >&2
-        echo "[WARNING] VM may be unstable with only ${vm_memory}MB RAM" >&2
+    
+    # For Alpine, we can be much more conservative
+    if [ "$os_type" = "alpine" ]; then
+        if [ "$available_mem" -ge 8192 ]; then
+            vm_memory="$os_default_memory"  # Alpine runs fine on 256MB even with plenty of RAM
+            echo "[MEMORY] Alpine selected, using minimal memory: ${vm_memory}MB" >&2
+        elif [ "$available_mem" -ge 2048 ]; then
+            vm_memory="$os_default_memory"  # 256MB is enough for Alpine
+            echo "[MEMORY] Alpine selected, using minimal memory: ${vm_memory}MB" >&2
+        elif [ "$available_mem" -ge 1024 ]; then
+            vm_memory="$os_default_memory"  # 256MB still possible
+            echo "[MEMORY] Alpine selected, using minimal memory: ${vm_memory}MB" >&2
+        elif [ "$available_mem" -ge 512 ]; then
+            vm_memory=256   # 256MB minimum for Alpine
+            echo "[MEMORY] Low memory, Alpine using minimum: ${vm_memory}MB" >&2
+        elif [ "$available_mem" -ge 384 ]; then
+            vm_memory=192   # Alpine can run on very little
+            echo "[MEMORY] Very low memory! Alpine using absolute minimum: ${vm_memory}MB" >&2
+            echo "[WARNING] VM may be unstable with only ${vm_memory}MB RAM" >&2
+        elif [ "$available_mem" -ge 256 ]; then
+            vm_memory=128   # Alpine absolute minimum
+            echo "[MEMORY] Extremely low memory! Alpine using bare minimum: ${vm_memory}MB" >&2
+            echo "[WARNING] VM will be severely limited with only ${vm_memory}MB RAM" >&2
+        else
+            echo "ERROR: Insufficient memory available (${available_mem}MB). Cannot start VM." >&2
+            echo "Minimum required: 256MB available, have: ${available_mem}MB" >&2
+            exit 1
+        fi
     else
-        echo "ERROR: Insufficient memory available (${available_mem}MB). Cannot start VM." >&2
-        echo "Minimum required: 512MB available, have: ${available_mem}MB" >&2
-        exit 1
+        # For Ubuntu and other OS, use standard memory allocation
+        if [ "$available_mem" -ge 8192 ]; then
+            vm_memory=4096  # 4GB for VMs when host has 8GB+
+            echo "[MEMORY] High memory detected, allocating: ${vm_memory}MB" >&2
+        elif [ "$available_mem" -ge 4096 ]; then
+            vm_memory=2048  # 2GB for VMs when host has 4-8GB
+            echo "[MEMORY] Moderate memory detected, allocating: ${vm_memory}MB" >&2
+        elif [ "$available_mem" -ge 2048 ]; then
+            vm_memory=1024  # 1GB for VMs when host has 2-4GB
+            echo "[MEMORY] Limited memory detected, allocating: ${vm_memory}MB" >&2
+        elif [ "$available_mem" -ge 1024 ]; then
+            vm_memory=512   # 512MB for VMs when host has 1-2GB
+            echo "[MEMORY] Low memory detected, allocating minimal: ${vm_memory}MB" >&2
+            echo "[WARNING] Ubuntu may struggle with only ${vm_memory}MB RAM" >&2
+        elif [ "$available_mem" -ge 512 ]; then
+            vm_memory=256   # 256MB absolute minimum for non-Alpine
+            echo "[MEMORY] Very low memory! Allocating absolute minimum: ${vm_memory}MB" >&2
+            echo "[WARNING] VM may be unstable with only ${vm_memory}MB RAM" >&2
+        else
+            echo "ERROR: Insufficient memory available (${available_mem}MB). Cannot start VM." >&2
+            echo "Minimum required: 512MB available, have: ${available_mem}MB" >&2
+            exit 1
+        fi
     fi
     
     echo "$vm_memory"
@@ -532,9 +574,9 @@ else
     fi
 fi
 
-# Calculate VM memory based on host availability
+# Calculate VM memory based on host availability and OS type
 # Redirect stderr to stdout temporarily to capture the memory value
-VM_MEMORY=$(calculate_vm_memory "$CUSTOM_MEMORY" 2>&1)
+VM_MEMORY=$(calculate_vm_memory "$CUSTOM_MEMORY" "$SELECTED_OS" 2>&1)
 MEMORY_EXIT_CODE=$?
 # Display the informational messages that were on stderr
 echo "$VM_MEMORY" | while IFS= read -r line; do
