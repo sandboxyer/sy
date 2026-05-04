@@ -24,6 +24,8 @@ cloud-init-source/
 # VM data directories (both temp and persistent)
 noble-vm-*/
 /tmp/noble-vm-tmp.*/
+alpine-vm-*/
+/tmp/alpine-vm-tmp.*/
 
 # Any .qcow2 files that might be generated
 *.qcow2
