@@ -5,6 +5,7 @@ IMG_URL="https://cloud-images.ubuntu.com/noble/20260216/noble-server-cloudimg-am
 IMG_FILE="noble-server-cloudimg-amd64.img"
 ISO_FILE="noble-cloud-init.iso"
 SSH_BASE_PORT=2222
+DEFAULT_DISK_SIZE="5G"
 
 # --- Check and install genisoimage ---
 install_genisoimage() {
@@ -26,11 +27,38 @@ install_genisoimage() {
     fi
 }
 
+# --- Check and install qemu-img if needed ---
+install_qemu_img() {
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "[INSTALL] Installing qemu-utils via apt..."
+        apt-get update -qq && apt-get install -y -qq qemu-utils
+    elif command -v apk >/dev/null 2>&1; then
+        echo "[INSTALL] Installing qemu-img via apk..."
+        apk add --no-cache qemu-img
+    elif command -v yum >/dev/null 2>&1; then
+        echo "[INSTALL] Installing qemu-img via yum..."
+        yum install -y -q qemu-img
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "[INSTALL] Installing qemu-img via dnf..."
+        dnf install -y -q qemu-img
+    else
+        echo "ERROR: No supported package manager found. Install qemu-img manually."
+        exit 1
+    fi
+}
+
 if ! command -v genisoimage >/dev/null 2>&1; then
     echo "[CHECK] genisoimage not found, installing..."
     install_genisoimage
 else
     echo "[CHECK] genisoimage already installed"
+fi
+
+if ! command -v qemu-img >/dev/null 2>&1; then
+    echo "[CHECK] qemu-img not found, installing..."
+    install_qemu_img
+else
+    echo "[CHECK] qemu-img already installed"
 fi
 
 # --- Functions ---
@@ -51,6 +79,18 @@ find_available_port() {
     
     echo "ERROR: No available ports found between ${start_port} and $((start_port + max_attempts - 1))"
     return 1
+}
+
+resize_disk() {
+    local disk_path="$1"
+    local target_size="$2"
+    
+    echo "[RESIZE] Resizing disk to: ${target_size}"
+    qemu-img resize "${disk_path}" "${target_size}" || {
+        echo "ERROR: Failed to resize disk image"
+        exit 1
+    }
+    echo "[RESIZE] Disk resized successfully to ${target_size}"
 }
 
 create_cloud_init_iso() {
@@ -172,6 +212,7 @@ run_vm() {
 # --- Main Logic ---
 CUSTOM_PORT=""
 VM_NAME=""
+DISK_SIZE="${DEFAULT_DISK_SIZE}"
 
 # Parse arguments
 while [ $# -gt 0 ]; do
@@ -182,6 +223,15 @@ while [ $# -gt 0 ]; do
                 shift 2
             else
                 echo "ERROR: --port requires a valid number"
+                exit 1
+            fi
+            ;;
+        --size)
+            if [ -n "$2" ]; then
+                DISK_SIZE="$2"
+                shift 2
+            else
+                echo "ERROR: --size requires a valid size (e.g., 5G, 10G)"
                 exit 1
             fi
             ;;
@@ -243,6 +293,9 @@ if [ -z "$VM_NAME" ]; then
     echo "[TEMP MODE] Copying base image..."
     cp "${BASE_DIR}/${IMG_FILE}" "${TMPDIR}/${IMG_FILE}"
     
+    # Resize disk before first use
+    resize_disk "${TMPDIR}/${IMG_FILE}" "${DISK_SIZE}"
+    
     # Create cloud-init ISO
     create_cloud_init_iso "${TMPDIR}"
     
@@ -269,8 +322,11 @@ else
     if [ ! -f "${VMDIR}/${IMG_FILE}" ]; then
         echo "[PERSISTENT MODE] Copying base image..."
         cp "${BASE_DIR}/${IMG_FILE}" "${VMDIR}/${IMG_FILE}"
+        
+        # Resize disk only on first creation
+        resize_disk "${VMDIR}/${IMG_FILE}" "${DISK_SIZE}"
     else
-        echo "[PERSISTENT MODE] Using existing disk image"
+        echo "[PERSISTENT MODE] Using existing disk image (size preserved)"
     fi
     
     # Ensure cloud-init ISO exists (creates if missing, even on resume)
