@@ -18,6 +18,8 @@ SSH_BASE_PORT=2222
 DEFAULT_DISK_SIZE="5G"
 DEFAULT_MEMORY="2048"  # Will be auto-adjusted based on host RAM and OS
 ALPINE_DEFAULT_MEMORY="256"  # Alpine runs well with minimal memory
+MAX_RETRY_ATTEMPTS=18  # Maximum retry attempts for port conflicts
+RETRY_DELAY_SECONDS=3  # Delay between retries (will try for ~2.5 minutes with these settings)
 
 # --- Helper: Show help message ---
 show_help() {
@@ -39,6 +41,8 @@ OPTIONS:
   --size SIZE         Disk size (default: 5G, ex: 10G, 20G)
   --memory MB         RAM in MB (auto-calculated if omitted)
   --no-kvm            Disable KVM acceleration
+  --retry-attempts N  Max retry attempts on port conflict (default: ${MAX_RETRY_ATTEMPTS})
+  --retry-delay N     Delay between retries in seconds (default: ${RETRY_DELAY_SECONDS})
   -h, --help          Show this help
 
 EXAMPLES:
@@ -48,6 +52,7 @@ EXAMPLES:
   bash qemu.sh --ubuntu web --size 10G   # Ubuntu, persistent, 10G disk
   bash qemu.sh --port 2222 --memory 4096 # Custom port & memory
   bash qemu.sh --no-kvm                  # Force software emulation
+  bash qemu.sh --retry-attempts 20       # More retries for busy environments
 
 ACCESS:  ssh root@localhost -p PORT  (password: 123)
 
@@ -338,6 +343,32 @@ find_available_port() {
     return 1
 }
 
+# --- Helper: Test if a specific port can be bound ---
+test_port_binding() {
+    local port="$1"
+    local timeout=2
+    
+    # Try to actually bind to the port temporarily to verify it's free
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$timeout" nc -l -p "$port" 2>/dev/null &
+    else
+        nc -l -p "$port" 2>/dev/null &
+    fi
+    local nc_pid=$!
+    sleep 0.5
+    
+    if kill -0 "$nc_pid" 2>/dev/null; then
+        # Port is bindable
+        kill "$nc_pid" 2>/dev/null
+        wait "$nc_pid" 2>/dev/null
+        return 0
+    else
+        # Port is in use
+        wait "$nc_pid" 2>/dev/null
+        return 1
+    fi
+}
+
 resize_disk() {
     local disk_path="$1"
     local target_size="$2"
@@ -421,10 +452,10 @@ METAEOF
     fi
 }
 
-run_vm() {
+run_vm_with_retry() {
     local img_path="$1"
     local iso_path="$2"
-    local ssh_port="$3"
+    local initial_port="$3"
     local vm_memory="$4"
     local use_kvm="$5"
     
@@ -453,34 +484,121 @@ run_vm() {
         exit 1
     fi
     
-    echo "[VM] Starting QEMU with:"
-    echo "  OS:    ${SELECTED_OS}"
-    echo "  Disk:  ${img_path}"
-    echo "  ISO:   ${iso_path}"
-    echo "  RAM:   ${vm_memory}MB"
-    echo "  Port:  localhost:${ssh_port} -> VM:22"
-    if [ "$use_kvm" = "true" ]; then
-        echo "  KVM:   enabled"
-    else
-        echo "  KVM:   disabled (using emulation)"
-    fi
-    
-    # Build QEMU command
-    set -- \
-        -drive file="${img_path}",format=qcow2,if=virtio \
-        -cdrom "${iso_path}" \
-        -m "${vm_memory}" \
-        -netdev user,id=net0,hostfwd=tcp::"${ssh_port}"-:22 \
-        -device virtio-net,netdev=net0 \
-        -nographic
+    # Build QEMU command arguments (without port)
+    local qemu_args="-drive file=${img_path},format=qcow2,if=virtio"
+    qemu_args="${qemu_args} -cdrom ${iso_path}"
+    qemu_args="${qemu_args} -m ${vm_memory}"
+    qemu_args="${qemu_args} -device virtio-net,netdev=net0"
+    qemu_args="${qemu_args} -nographic"
     
     # Add KVM if available and requested
     if [ "$use_kvm" = "true" ]; then
-        set -- "$@" -enable-kvm
+        qemu_args="${qemu_args} -enable-kvm"
     fi
     
-    # Execute QEMU
-    qemu-system-x86_64 "$@"
+    local attempt=1
+    local current_port="$initial_port"
+    
+    while [ "$attempt" -le "$MAX_RETRY_ATTEMPTS" ]; do
+        echo "[RETRY] Attempt ${attempt}/${MAX_RETRY_ATTEMPTS} with port ${current_port}"
+        
+        echo "[VM] Starting QEMU with:"
+        echo "  OS:    ${SELECTED_OS}"
+        echo "  Disk:  ${img_path}"
+        echo "  ISO:   ${iso_path}"
+        echo "  RAM:   ${vm_memory}MB"
+        echo "  Port:  localhost:${current_port} -> VM:22"
+        if [ "$use_kvm" = "true" ]; then
+            echo "  KVM:   enabled"
+        else
+            echo "  KVM:   disabled (using emulation)"
+        fi
+        
+        # Verify port is still free before attempting (with actual bind test)
+        local port_available=false
+        if test_port_binding "$current_port"; then
+            port_available=true
+        fi
+        
+        if [ "$port_available" = "true" ]; then
+            # Try to run QEMU with this port
+            qemu-system-x86_64 \
+                -drive file="${img_path}",format=qcow2,if=virtio \
+                -cdrom "${iso_path}" \
+                -m "${vm_memory}" \
+                -netdev user,id=net0,hostfwd=tcp::"${current_port}"-:22 \
+                -device virtio-net,netdev=net0 \
+                -nographic \
+                $([ "$use_kvm" = "true" ] && echo "-enable-kvm") \
+                2>/tmp/qemu_error_$$.log
+            
+            local qemu_exit_code=$?
+            
+            # Check if the error was port-related
+            if [ $qemu_exit_code -ne 0 ] && [ -f /tmp/qemu_error_$$.log ]; then
+                if grep -q "Could not set up host forward" /tmp/qemu_error_$$.log; then
+                    echo "[RETRY] Port ${current_port} binding failed (race condition), retrying..."
+                    rm -f /tmp/qemu_error_$$.log
+                    
+                    if [ "$attempt" -lt "$MAX_RETRY_ATTEMPTS" ]; then
+                        # Find a new available port
+                        local new_port=$(find_available_port $((current_port + 1)))
+                        if [ $? -eq 0 ]; then
+                            echo "[RETRY] Found new port: ${new_port}"
+                            current_port="$new_port"
+                        else
+                            echo "[RETRY] No alternative ports available"
+                            attempt="$MAX_RETRY_ATTEMPTS"  # Force exit
+                        fi
+                        
+                        echo "[RETRY] Waiting ${RETRY_DELAY_SECONDS}s before next attempt..."
+                        sleep "$RETRY_DELAY_SECONDS"
+                        attempt=$((attempt + 1))
+                        continue
+                    else
+                        echo "ERROR: Failed to start VM after ${MAX_RETRY_ATTEMPTS} attempts"
+                        echo "Last error: Port binding conflict"
+                        rm -f /tmp/qemu_error_$$.log
+                        return 1
+                    fi
+                else
+                    # Some other error occurred
+                    echo "ERROR: QEMU failed with error:"
+                    cat /tmp/qemu_error_$$.log
+                    rm -f /tmp/qemu_error_$$.log
+                    return 1
+                fi
+            fi
+            
+            # QEMU started successfully or exited normally
+            rm -f /tmp/qemu_error_$$.log
+            return $qemu_exit_code
+        else
+            echo "[RETRY] Port ${current_port} is not available (bind test failed), finding new port..."
+            
+            if [ "$attempt" -lt "$MAX_RETRY_ATTEMPTS" ]; then
+                # Find a new available port
+                local new_port=$(find_available_port $((current_port + 1)))
+                if [ $? -eq 0 ]; then
+                    echo "[RETRY] Found new port: ${new_port}"
+                    current_port="$new_port"
+                else
+                    echo "[RETRY] No alternative ports available"
+                    attempt="$MAX_RETRY_ATTEMPTS"  # Force exit
+                fi
+                
+                echo "[RETRY] Waiting ${RETRY_DELAY_SECONDS}s before next attempt..."
+                sleep "$RETRY_DELAY_SECONDS"
+                attempt=$((attempt + 1))
+            else
+                echo "ERROR: Failed to start VM after ${MAX_RETRY_ATTEMPTS} attempts"
+                echo "Last error: Port ${current_port} not available"
+                return 1
+            fi
+        fi
+    done
+    
+    return 1
 }
 
 # --- Main Logic ---
@@ -544,13 +662,31 @@ while [ $# -gt 0 ]; do
             NO_KVM="true"
             shift
             ;;
+        --retry-attempts)
+            if [ -n "$2" ] && [ "$2" -eq "$2" ] 2>/dev/null; then
+                MAX_RETRY_ATTEMPTS="$2"
+                shift 2
+            else
+                echo "ERROR: --retry-attempts requires a valid number"
+                exit 1
+            fi
+            ;;
+        --retry-delay)
+            if [ -n "$2" ] && [ "$2" -eq "$2" ] 2>/dev/null; then
+                RETRY_DELAY_SECONDS="$2"
+                shift 2
+            else
+                echo "ERROR: --retry-delay requires a valid number in seconds"
+                exit 1
+            fi
+            ;;
         *)
             if [ -z "$VM_NAME" ] && [ "${1#--}" = "$1" ]; then
                 VM_NAME="$1"
                 shift
             else
                 echo "ERROR: Unknown argument: $1"
-                echo "Usage: $0 [--alpine|--ubuntu] [vm-name] [--port N] [--size SIZE] [--memory MB] [--no-kvm]"
+                echo "Usage: $0 [--alpine|--ubuntu] [vm-name] [--port N] [--size SIZE] [--memory MB] [--no-kvm] [--retry-attempts N] [--retry-delay SECONDS]"
                 echo "Try: $0 --help for more information"
                 exit 1
             fi
@@ -644,8 +780,8 @@ if [ -z "$VM_NAME" ]; then
     # Create cloud-init ISO
     create_cloud_init_iso "${TMPDIR}"
     
-    # Run VM
-    run_vm "${TMPDIR}/${IMG_FILE}" "${TMPDIR}/${ISO_FILE}" "${SSH_PORT}" "${VM_MEMORY}" "${USE_KVM}"
+    # Run VM with retry logic
+    run_vm_with_retry "${TMPDIR}/${IMG_FILE}" "${TMPDIR}/${ISO_FILE}" "${SSH_PORT}" "${VM_MEMORY}" "${USE_KVM}"
     
     # Cleanup
     echo "[TEMP MODE] Cleaning up temporary files..."
@@ -677,7 +813,7 @@ else
     # Ensure cloud-init ISO exists (creates if missing, even on resume)
     create_cloud_init_iso "${VMDIR}"
     
-    # Run VM with persistent data
-    run_vm "${VMDIR}/${IMG_FILE}" "${VMDIR}/${ISO_FILE}" "${SSH_PORT}" "${VM_MEMORY}" "${USE_KVM}"
+    # Run VM with retry logic and persistent data
+    run_vm_with_retry "${VMDIR}/${IMG_FILE}" "${VMDIR}/${ISO_FILE}" "${SSH_PORT}" "${VM_MEMORY}" "${USE_KVM}"
     echo "[PERSISTENT MODE] VM data preserved in: ${VMDIR}"
 fi
