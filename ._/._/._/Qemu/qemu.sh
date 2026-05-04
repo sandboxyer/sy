@@ -18,6 +18,42 @@ SSH_BASE_PORT=2222
 DEFAULT_DISK_SIZE="5G"
 DEFAULT_MEMORY="2048"  # Will be auto-adjusted based on host RAM
 
+# --- Helper: Show help message ---
+show_help() {
+    cat << 'HELPEOF'
+QEMU VM Launcher - Multiple OS Quick Start
+===========================================
+
+USAGE: bash qemu.sh [OS] [NAME] [OPTIONS]
+
+OS:
+  --alpine            Alpine Linux 3.23 (default)
+  --ubuntu            Ubuntu Server 24.04
+
+NAME:
+  myvm                Persistent VM (omit for temporary/auto-destroy)
+
+OPTIONS:
+  --port N            SSH port (default: 2222, auto-finds free)
+  --size SIZE         Disk size (default: 5G, ex: 10G, 20G)
+  --memory MB         RAM in MB (auto-calculated if omitted)
+  --no-kvm            Disable KVM acceleration
+  -h, --help          Show this help
+
+EXAMPLES:
+  bash qemu.sh                           # Alpine, temp, auto-destroy
+  bash qemu.sh dev                       # Alpine, persistent as "dev"
+  bash qemu.sh --ubuntu                  # Ubuntu, temp
+  bash qemu.sh --ubuntu web --size 10G   # Ubuntu, persistent, 10G disk
+  bash qemu.sh --port 2222 --memory 4096 # Custom port & memory
+  bash qemu.sh --no-kvm                  # Force software emulation
+
+ACCESS:  ssh root@localhost -p PORT  (password: 123)
+
+HELPEOF
+    exit 0
+}
+
 # --- OS Definitions (Add new OS here following this pattern) ---
 # Format:
 #   OS_NAME|img_url|img_filename|iso_filename|default_password|hostname_prefix
@@ -415,6 +451,9 @@ CUSTOM_MEMORY=""
 # Parse arguments
 while [ $# -gt 0 ]; do
     case "$1" in
+        -h|--help|-help|--h)
+            show_help
+            ;;
         --alpine)
             SELECTED_OS="alpine"
             shift
@@ -470,6 +509,7 @@ while [ $# -gt 0 ]; do
             else
                 echo "ERROR: Unknown argument: $1"
                 echo "Usage: $0 [--alpine|--ubuntu] [vm-name] [--port N] [--size SIZE] [--memory MB] [--no-kvm]"
+                echo "Try: $0 --help for more information"
                 exit 1
             fi
             ;;
