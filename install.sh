@@ -21,24 +21,69 @@ MAIN_SOURCE_DIR="$REPO_DIR"                         # Root of your project files
 # DEB_SERVER_DIR="$REPO_DIR/deb-packages-server"    # Uncomment for server-specific debs
 # ARCHIVE_DIR="$REPO_DIR/archives"                  # Uncomment if using archives like pm2
 
+# =============================================================================
 # NODE.JS COMMAND MAPPING (REQUIRED - define your commands)
+# =============================================================================
 # Using space-separated lists for ash compatibility (no associative arrays)
 NODE_ENTRY_POINTS_SRC="SyManager.js ._/SyPM.js ._/SyDB.js pkg-cli.js ._/._/._/Packager/Pack.js"
 NODE_ENTRY_POINTS_CMD="sy sypm sydb pkg pack"
 
+# =============================================================================
+# SHELL SCRIPT COMMAND MAPPING (OPTIONAL - for .sh files with bash→ash fallback)
+# =============================================================================
+# Format: Space-separated pairs of (source_file command_name)
+# Example: SHELL_SCRIPTS_SRC="scripts/deploy.sh scripts/backup.sh"
+#          SHELL_SCRIPTS_CMD="deploy backup"
+#
+# Each shell script automatically gets:
+#   - Bash detection with automatic ash fallback
+#   - Working directory control (caller/global)
+#   - Full argument passthrough
+#   - Wrapper in $INSTALL_DIR/wrappers/
+#   - Global symlink in $BIN_DIR/
+#
+# To add a new shell command:
+#   1. Add source and command name above
+#   2. Add working directory in get_command_working_dir() below
+#   3. Run installer
+#
+SHELL_SCRIPTS_SRC="./._/._/._/Qemu/qemu.sh"    # ← Add your .sh script paths here
+SHELL_SCRIPTS_CMD="qemu"    # ← Add your command names here
+
+# =============================================================================
 # COMMAND WORKING DIRECTORY CONFIGURATION
-# Set to "caller" to use the directory where command was called from
-# Set to "global" to use the installation directory (default)
+# =============================================================================
+# WORKING DIRECTORY TYPES:
+#   "global"  - Execute from installation directory ($INSTALL_DIR)
+#   "caller"  - Execute from user's current working directory (where command was called)
+#   "file"    - Execute from the directory containing the script file itself
+#
 # Using case statements for ash compatibility
 get_command_working_dir() {
     command="$1"
     case "$command" in
+        # =====================================================================
+        # NODE.JS COMMANDS
+        # =====================================================================
         "sy") echo "global" ;;
         "sypm") echo "caller" ;;
         "sydb") echo "global" ;;
         "pkg") echo "caller" ;;
         "pack") echo "caller" ;;
         "git-config") echo "global" ;;
+        "qemu") echo "file" ;;        # ← NEW: Runs from script's own directory
+        
+        # =====================================================================
+        # SHELL SCRIPT COMMANDS - ADD YOURS HERE
+        # =====================================================================
+        # Example:
+        # "deploy") echo "global" ;;
+        # "backup") echo "caller" ;;
+        # "monitor") echo "file" ;;     # ← Can also use "file" for shell scripts
+        
+        # =====================================================================
+        # DEFAULT
+        # =====================================================================
         *) echo "global" ;;
     esac
 }
@@ -83,17 +128,38 @@ show_help() {
     echo "  --nodejs         Same as --node"
     echo
     echo "Commands will be created for:"
+    
+    # Display Node.js commands
     for cmd in $NODE_ENTRY_POINTS_CMD; do
         echo "  $cmd"
     done
+    
+    # Display Shell script commands
+    if [ -n "$SHELL_SCRIPTS_CMD" ]; then
+        for cmd in $SHELL_SCRIPTS_CMD; do
+            echo "  $cmd (shell script)"
+        done
+    fi
+    
     echo "  wsave"
     echo "  git-config"
     echo
     echo "Working directory configuration:"
+    
+    # Display working directories for Node.js commands
     for cmd in $NODE_ENTRY_POINTS_CMD; do
         working_dir=$(get_command_working_dir "$cmd")
         echo "  $cmd: $working_dir"
     done
+    
+    # Display working directories for Shell commands
+    if [ -n "$SHELL_SCRIPTS_CMD" ]; then
+        for cmd in $SHELL_SCRIPTS_CMD; do
+            working_dir=$(get_command_working_dir "$cmd")
+            echo "  $cmd: $working_dir (bash→ash fallback)"
+        done
+    fi
+    
     echo "  git-config: global"
     echo
     echo "pkg command features:"
@@ -567,11 +633,23 @@ remove_links() {
         [ -L "$dest_path" ] && rm -f "$dest_path"
     done
     
+    # Remove shell script command links
+    if [ -n "$SHELL_SCRIPTS_CMD" ]; then
+        echo "$SHELL_SCRIPTS_CMD" | tr ' ' '\n' | while read cmd; do
+            [ -z "$cmd" ] && continue
+            dest_path="$BIN_DIR/$cmd"
+            [ -L "$dest_path" ] && rm -f "$dest_path"
+        done
+    fi
+    
     # Remove wsave link
     [ -L "$BIN_DIR/wsave" ] && rm -f "$BIN_DIR/wsave"
     
     # Remove git-config link
     [ -L "$BIN_DIR/git-config" ] && rm -f "$BIN_DIR/git-config"
+    
+    # Clean up shell wrappers
+    [ -d "$INSTALL_DIR/wrappers" ] && rm -rf "$INSTALL_DIR/wrappers"
 }
 
 preserve_files_from_backup() {
@@ -1082,6 +1160,123 @@ EOF
     log_message "Created git-config command that finds Git.js dynamically"
 }
 
+create_shell_command_links() {
+    install_dir="$1"
+    
+    # Skip if no shell scripts configured
+    [ -z "$SHELL_SCRIPTS_SRC" ] && return 0
+    
+    log_message "Creating shell script command wrappers with bash→ash fallback..."
+    
+    # Process each pair: source_file command_name
+    src_idx=1
+    for src in $SHELL_SCRIPTS_SRC; do
+        # Find matching command name by position
+        cmd_idx=1
+        command_name=""
+        for cmd in $SHELL_SCRIPTS_CMD; do
+            [ "$cmd_idx" = "$src_idx" ] && command_name="$cmd" && break
+            cmd_idx=$((cmd_idx + 1))
+        done
+        src_idx=$((src_idx + 1))
+        
+        [ -z "$command_name" ] && continue
+        
+        src_path="$install_dir/$src"
+        
+        # Validate source file exists
+        if [ ! -f "$src_path" ]; then
+            log_message "Warning: Shell script source not found: $src_path"
+            continue
+        fi
+        
+        chmod +x "$src_path" 2>/dev/null || true
+        working_dir=$(get_command_working_dir "$command_name")
+        
+        # Create wrapper directory
+        wrapper_dir="$install_dir/wrappers"
+        mkdir -p "$wrapper_dir"
+        
+        # =====================================================================
+        # STEP 1: Create shell wrapper with bash→ash→sh fallback
+        # =====================================================================
+        shell_wrapper="$wrapper_dir/${command_name}.sh"
+        
+        cat > "$shell_wrapper" << 'SHELL_FALLBACK_EOF'
+#!/bin/sh
+# =====================================================================
+# AUTO-GENERATED SHELL WRAPPER
+# Provides automatic bash → ash → sh fallback
+# =====================================================================
+if command -v bash >/dev/null 2>&1; then
+    exec bash "SCRIPT_PATH_PLACEHOLDER" "$@"
+elif command -v ash >/dev/null 2>&1; then
+    exec ash "SCRIPT_PATH_PLACEHOLDER" "$@"
+else
+    exec sh "SCRIPT_PATH_PLACEHOLDER" "$@"
+fi
+SHELL_FALLBACK_EOF
+        
+        # Insert actual script path
+        sed -i "s|SCRIPT_PATH_PLACEHOLDER|${src_path}|g" "$shell_wrapper"
+        chmod +x "$shell_wrapper"
+        
+        # =====================================================================
+        # STEP 2: Create public command wrapper with working directory logic
+        # =====================================================================
+        command_wrapper="$wrapper_dir/$command_name"
+        
+        case "$working_dir" in
+            "caller")
+                # Mode: Execute from user's current directory
+                cat > "$command_wrapper" << CALLER_MODE
+#!/bin/sh
+# Command: $command_name
+# Type: Shell script (bash→ash fallback)
+# Working directory: caller's current directory
+exec "$shell_wrapper" "\$@"
+CALLER_MODE
+                ;;
+            "file")
+                # Mode: Execute from script file's own directory
+                cat > "$command_wrapper" << FILE_MODE
+#!/bin/sh
+# Command: $command_name
+# Type: Shell script (bash→ash fallback)
+# Working directory: script file location
+cd "\$(dirname "$src_path")" || exit 1
+exec "$shell_wrapper" "\$@"
+FILE_MODE
+                ;;
+            *)
+                # Mode: Execute from installation directory (default)
+                cat > "$command_wrapper" << GLOBAL_MODE
+#!/bin/sh
+# Command: $command_name
+# Type: Shell script (bash→ash fallback)
+# Working directory: $install_dir
+cd "$install_dir" || exit 1
+exec "$shell_wrapper" "\$@"
+GLOBAL_MODE
+                ;;
+        esac
+        
+        chmod +x "$command_wrapper"
+        
+        # =====================================================================
+        # STEP 3: Create global symlink in $BIN_DIR
+        # =====================================================================
+        [ -L "$BIN_DIR/$command_name" ] && rm -f "$BIN_DIR/$command_name"
+        ln -sf "$command_wrapper" "$BIN_DIR/$command_name"
+        
+        log_message "Created shell command: $command_name (bash→ash) [dir: $working_dir]"
+    done
+}
+
+# =============================================================================
+# MAIN COMMAND LINK CREATION
+# =============================================================================
+
 create_command_links() {
     install_dir="$1"
     
@@ -1128,21 +1323,33 @@ create_command_links() {
             mkdir -p "$(dirname "$wrapper_path")"
             
             # Create wrapper based on working directory configuration
-            if [ "$working_dir" = "caller" ]; then
-                # Use caller's current directory
-                cat > "$wrapper_path" <<EOF
+            case "$working_dir" in
+                "caller")
+                    # Use caller's current directory
+                    cat > "$wrapper_path" <<EOF
 #!/bin/sh
 # Working directory: caller's current directory
 exec node "$src_path" "\$@"
 EOF
-            else
-                # Use global installation directory (default)
-                cat > "$wrapper_path" <<EOF
+                    ;;
+                "file")
+                    # Use the directory containing the script file
+                    cat > "$wrapper_path" <<EOF
+#!/bin/sh
+# Working directory: script file location
+cd "\$(dirname "$src_path")" || exit 1
+exec node "$src_path" "\$@"
+EOF
+                    ;;
+                *)
+                    # Use global installation directory (default)
+                    cat > "$wrapper_path" <<EOF
 #!/bin/sh
 cd "$install_dir" || exit 1
 exec node "$src_path" "\$@"
 EOF
-            fi
+                    ;;
+            esac
             
             chmod +x "$wrapper_path"
             [ -L "$dest_path" ] && rm -f "$dest_path"
@@ -1153,6 +1360,9 @@ EOF
         
         idx=$((idx + 1))
     done
+    
+    # Create shell script commands (bash→ash fallback)
+    create_shell_command_links "$install_dir"
 }
 
 cleanup() {
@@ -1227,6 +1437,14 @@ echo "Available commands:"
 for cmd in $NODE_ENTRY_POINTS_CMD; do
     echo "  $cmd"
 done
+
+# Display shell script commands if configured
+if [ -n "$SHELL_SCRIPTS_CMD" ]; then
+    for cmd in $SHELL_SCRIPTS_CMD; do
+        echo "  $cmd"
+    done
+fi
+
 echo "  wsave"
 echo "  git-config"
 
@@ -1236,6 +1454,15 @@ for cmd in $NODE_ENTRY_POINTS_CMD; do
     working_dir=$(get_command_working_dir "$cmd")
     echo "  $cmd: $working_dir"
 done
+
+# Display shell command working directories if configured
+if [ -n "$SHELL_SCRIPTS_CMD" ]; then
+    for cmd in $SHELL_SCRIPTS_CMD; do
+        working_dir=$(get_command_working_dir "$cmd")
+        echo "  $cmd: $working_dir (bash→ash fallback)"
+    done
+fi
+
 echo "  git-config: global"
 
 printf "\n"
@@ -1280,6 +1507,13 @@ printf "\n"
 echo "Note: pkg works from any directory. 'pkg start' ensures package.json has version 0.0.1 and type:module"
 echo "Note: pack works from any directory and supports multiple paths as arguments"
 echo "Note: git-config finds Git.js anywhere in the installation tree"
+
+# Display shell command notes if configured
+if [ -n "$SHELL_SCRIPTS_CMD" ]; then
+    printf "\n"
+    echo "Shell script commands use automatic bash→ash fallback for maximum compatibility"
+    echo "Each .sh script is wrapped to detect and use the best available shell interpreter"
+fi
 
 printf "\n"
 if [ "$LOCAL_DIR_MODE" = true ]; then
