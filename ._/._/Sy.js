@@ -94,11 +94,13 @@ class Sy extends SyAPP.Func() {
                 }
                 
                 this.Button(uid,{name : ' '})
-               this.SideButton(uid,{name : this.TextColor.orange('＋ New'),jumpTo: 1,props : {new_app : true}})
-               this.SideButton(uid,{name : this.TextColor.orange('📁 Load')})
-                this.SideButton(uid,{name : this.TextColor.orange('🌐 Connect')})
-                this.Button(uid,{name : ' '})
-                this.SideButton(uid,{name : this.TextColor.orange('      ')})
+                await this.DropDown(uid,'droptype',async () => {
+                  
+                    this.Buttons(uid,[{name : this.TextColor.brightGreen('App')},{name : this.TextColor.orange('App(alpine)')},{name : this.TextColor.orange('App(ubuntu)')}])
+                },{up_buttontext : '＋ New',up_emoji : '',down_buttontext : this.TextColor.pink(' New'),horizontal : true})
+            //   this.Button(uid,{name : this.TextColor.orange('＋ New'),jumpTo: 1,props : {new_app : true}})
+               
+                this.Button(uid,' ')
                 this.SideButton(uid,{name:'⚙️  Config',path : 'config'})
 
 
