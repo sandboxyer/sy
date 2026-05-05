@@ -10,6 +10,8 @@
 #   bash qemu.sh --ubuntu myvm                # Ubuntu, persistent mode
 #   bash qemu.sh myvm --size 10G --port 2222  # Alpine, persistent, custom settings
 #   bash qemu.sh --ubuntu --size 15G          # Ubuntu, temporary, 15G disk
+#   bash qemu.sh --cpu 2                      # Alpine, temporary, 2 CPU cores
+#   bash qemu.sh --ubuntu --cpu 4 --memory 4096 # Ubuntu, 4 cores, 4GB RAM
 # ============================================================================
 
 # --- Default Configuration ---
@@ -20,6 +22,7 @@ DEFAULT_MEMORY="2048"  # Will be auto-adjusted based on host RAM and OS
 ALPINE_DEFAULT_MEMORY="256"  # Alpine runs well with minimal memory
 MAX_RETRY_ATTEMPTS=18  # Maximum retry attempts for port conflicts
 RETRY_DELAY_SECONDS=3  # Delay between retries (will try for ~2.5 minutes with these settings)
+DEFAULT_CPU_CORES=1    # Default number of CPU cores
 
 # --- Helper: Show help message ---
 show_help() {
@@ -40,6 +43,7 @@ OPTIONS:
   --port N            SSH port (default: 2222, auto-finds free)
   --size SIZE         Disk size (default: 5G, ex: 10G, 20G)
   --memory MB         RAM in MB (auto-calculated if omitted)
+  --cpu N             Number of CPU cores (default: 1, auto-capped to host max)
   --no-kvm            Disable KVM acceleration
   --retry-attempts N  Max retry attempts on port conflict (default: ${MAX_RETRY_ATTEMPTS})
   --retry-delay N     Delay between retries in seconds (default: ${RETRY_DELAY_SECONDS})
@@ -51,6 +55,8 @@ EXAMPLES:
   bash qemu.sh --ubuntu                  # Ubuntu, temp
   bash qemu.sh --ubuntu web --size 10G   # Ubuntu, persistent, 10G disk
   bash qemu.sh --port 2222 --memory 4096 # Custom port & memory
+  bash qemu.sh --cpu 2                   # Alpine with 2 CPU cores
+  bash qemu.sh --ubuntu --cpu 4 --memory 4096 # Ubuntu, 4 cores, 4GB RAM
   bash qemu.sh --no-kvm                  # Force software emulation
   bash qemu.sh --retry-attempts 20       # More retries for busy environments
 
@@ -106,6 +112,44 @@ get_os_config() {
             exit 1
             ;;
     esac
+}
+
+# --- Helper: Get host CPU core count ---
+get_host_cpu_cores() {
+    # Try multiple methods to get the number of CPU cores
+    if command -v nproc >/dev/null 2>&1; then
+        nproc --all
+    elif [ -f /proc/cpuinfo ]; then
+        grep -c "^processor" /proc/cpuinfo
+    elif command -v sysctl >/dev/null 2>&1; then
+        # macOS
+        sysctl -n hw.ncpu 2>/dev/null || echo "1"
+    else
+        # Safe fallback
+        echo "1"
+    fi
+}
+
+# --- Helper: Validate and cap CPU cores ---
+validate_cpu_cores() {
+    local requested_cores="$1"
+    local host_cores=$(get_host_cpu_cores)
+    
+    # Validate input is a positive integer
+    if ! [ "$requested_cores" -eq "$requested_cores" ] 2>/dev/null || [ "$requested_cores" -lt 1 ]; then
+        echo "ERROR: Invalid CPU core count: $requested_cores (must be positive integer)" >&2
+        exit 1
+    fi
+    
+    # Cap to host maximum
+    if [ "$requested_cores" -gt "$host_cores" ]; then
+        echo "[CPU] Requested ${requested_cores} cores exceeds host maximum (${host_cores})" >&2
+        echo "[CPU] Falling back to host maximum: ${host_cores} cores" >&2
+        echo "$host_cores"
+    else
+        echo "[CPU] Using ${requested_cores} CPU core(s) (host has ${host_cores})" >&2
+        echo "$requested_cores"
+    fi
 }
 
 # --- Helper: Get available system memory in MB ---
@@ -479,6 +523,7 @@ run_vm_with_retry() {
     local initial_port="$3"
     local vm_memory="$4"
     local use_kvm="$5"
+    local cpu_cores="$6"
     
     # Convert to absolute paths safely
     if [ -d "$(dirname "$img_path")" ]; then
@@ -509,6 +554,7 @@ run_vm_with_retry() {
     local qemu_args="-drive file=${img_path},format=qcow2,if=virtio"
     qemu_args="${qemu_args} -cdrom ${iso_path}"
     qemu_args="${qemu_args} -m ${vm_memory}"
+    qemu_args="${qemu_args} -smp ${cpu_cores}"
     qemu_args="${qemu_args} -device virtio-net,netdev=net0"
     qemu_args="${qemu_args} -nographic"
     
@@ -528,6 +574,7 @@ run_vm_with_retry() {
         echo "  Disk:  ${img_path}"
         echo "  ISO:   ${iso_path}"
         echo "  RAM:   ${vm_memory}MB"
+        echo "  CPU:   ${cpu_cores} core(s)"
         echo "  Port:  localhost:${current_port} -> VM:22"
         if [ "$use_kvm" = "true" ]; then
             echo "  KVM:   enabled"
@@ -547,6 +594,7 @@ run_vm_with_retry() {
                 -drive file="${img_path}",format=qcow2,if=virtio \
                 -cdrom "${iso_path}" \
                 -m "${vm_memory}" \
+                -smp "${cpu_cores}" \
                 -netdev user,id=net0,hostfwd=tcp::"${current_port}"-:22 \
                 -device virtio-net,netdev=net0 \
                 -nographic \
@@ -628,6 +676,7 @@ CUSTOM_PORT=""
 VM_NAME=""
 DISK_SIZE="${DEFAULT_DISK_SIZE}"
 CUSTOM_MEMORY=""
+CUSTOM_CPU_CORES=""  # Initialize as empty (will use default if not specified)
 
 # Parse arguments
 while [ $# -gt 0 ]; do
@@ -679,6 +728,15 @@ while [ $# -gt 0 ]; do
                 exit 1
             fi
             ;;
+        --cpu)
+            if [ -n "$2" ] && [ "$2" -eq "$2" ] 2>/dev/null; then
+                CUSTOM_CPU_CORES="$2"
+                shift 2
+            else
+                echo "ERROR: --cpu requires a valid number"
+                exit 1
+            fi
+            ;;
         --no-kvm)
             NO_KVM="true"
             shift
@@ -707,7 +765,7 @@ while [ $# -gt 0 ]; do
                 shift
             else
                 echo "ERROR: Unknown argument: $1"
-                echo "Usage: $0 [--alpine|--ubuntu] [vm-name] [--port N] [--size SIZE] [--memory MB] [--no-kvm] [--retry-attempts N] [--retry-delay SECONDS]"
+                echo "Usage: $0 [--alpine|--ubuntu] [vm-name] [--port N] [--size SIZE] [--memory MB] [--cpu N] [--no-kvm] [--retry-attempts N] [--retry-delay SECONDS]"
                 echo "Try: $0 --help for more information"
                 exit 1
             fi
@@ -729,6 +787,14 @@ else
     else
         USE_KVM="false"
     fi
+fi
+
+# Validate and set CPU cores
+if [ -n "$CUSTOM_CPU_CORES" ]; then
+    VM_CPU_CORES=$(validate_cpu_cores "$CUSTOM_CPU_CORES")
+else
+    VM_CPU_CORES="$DEFAULT_CPU_CORES"
+    echo "[CPU] Using default CPU cores: ${VM_CPU_CORES} (host has $(get_host_cpu_cores))"
 fi
 
 # Calculate VM memory based on host availability and OS type
@@ -802,7 +868,7 @@ if [ -z "$VM_NAME" ]; then
     create_cloud_init_iso "${TMPDIR}"
     
     # Run VM with retry logic
-    run_vm_with_retry "${TMPDIR}/${IMG_FILE}" "${TMPDIR}/${ISO_FILE}" "${SSH_PORT}" "${VM_MEMORY}" "${USE_KVM}"
+    run_vm_with_retry "${TMPDIR}/${IMG_FILE}" "${TMPDIR}/${ISO_FILE}" "${SSH_PORT}" "${VM_MEMORY}" "${USE_KVM}" "${VM_CPU_CORES}"
     
     # Cleanup
     echo "[TEMP MODE] Cleaning up temporary files..."
@@ -835,6 +901,6 @@ else
     create_cloud_init_iso "${VMDIR}"
     
     # Run VM with retry logic and persistent data
-    run_vm_with_retry "${VMDIR}/${IMG_FILE}" "${VMDIR}/${ISO_FILE}" "${SSH_PORT}" "${VM_MEMORY}" "${USE_KVM}"
+    run_vm_with_retry "${VMDIR}/${IMG_FILE}" "${VMDIR}/${ISO_FILE}" "${SSH_PORT}" "${VM_MEMORY}" "${USE_KVM}" "${VM_CPU_CORES}"
     echo "[PERSISTENT MODE] VM data preserved in: ${VMDIR}"
 fi
