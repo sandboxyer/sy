@@ -152,6 +152,18 @@ validate_cpu_cores() {
     fi
 }
 
+# --- Helper: Get total system memory in MB ---
+get_total_memory_mb() {
+    if [ -f /proc/meminfo ]; then
+        awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null
+    elif command -v sysctl >/dev/null 2>&1; then
+        # macOS
+        sysctl -n hw.memsize 2>/dev/null | awk '{print int($1/1024/1024)}'
+    else
+        echo "0"
+    fi
+}
+
 # --- Helper: Get available system memory in MB ---
 get_available_memory_mb() {
     # Try multiple methods to get available memory
@@ -183,51 +195,42 @@ calculate_vm_memory() {
     local requested_memory="$1"
     local os_type="$2"
     local available_mem=$(get_available_memory_mb)
+    local total_mem=$(get_total_memory_mb)
     
-    echo "[MEMORY] Host available memory: ${available_mem}MB" >&2
+    echo "[MEMORY] Host total memory: ${total_mem}MB, available: ${available_mem}MB" >&2
     
-    # Determine OS-specific default memory
-    local os_default_memory
-    if [ "$os_type" = "alpine" ]; then
-        os_default_memory="$ALPINE_DEFAULT_MEMORY"
-    else
-        os_default_memory="$DEFAULT_MEMORY"
-    fi
-    
-    # If specific memory requested, try to honor it
+    # If specific memory requested, honor it exactly (only validate against total system memory)
     if [ -n "$requested_memory" ] && [ "$requested_memory" -gt 0 ]; then
-        if [ "$requested_memory" -lt "$available_mem" ]; then
-            # Leave at least 512MB for host
-            local host_reserve=512
-            local max_vm_mem=$((available_mem - host_reserve))
-            if [ "$requested_memory" -le "$max_vm_mem" ]; then
-                echo "[MEMORY] Using requested memory: ${requested_memory}MB" >&2
-                echo "$requested_memory"
-                return 0
-            else
-                echo "[MEMORY] Requested memory (${requested_memory}MB) too high, adjusting to ${max_vm_mem}MB" >&2
-                echo "$max_vm_mem"
-                return 0
-            fi
-        else
-            echo "ERROR: Requested memory (${requested_memory}MB) exceeds available memory (${available_mem}MB)" >&2
+        # Only check against total system memory
+        if [ "$total_mem" -gt 0 ] && [ "$requested_memory" -gt "$total_mem" ]; then
+            echo "ERROR: Requested memory (${requested_memory}MB) exceeds total system memory (${total_mem}MB)" >&2
             exit 1
         fi
+        
+        # Warn if requested exceeds currently available (but still allow it)
+        if [ "$requested_memory" -gt "$available_mem" ]; then
+            echo "[WARNING] Requested memory (${requested_memory}MB) exceeds currently available memory (${available_mem}MB)" >&2
+            echo "[WARNING] VM may use swap or fail if memory cannot be allocated" >&2
+        fi
+        
+        echo "[MEMORY] Using requested memory: ${requested_memory}MB" >&2
+        echo "$requested_memory"
+        return 0
     fi
     
-    # Auto-calculate based on available memory and OS type
+    # Auto-calculate based on available memory and OS type (only when no custom memory specified)
     local vm_memory
     
     # For Alpine, we can be much more conservative
     if [ "$os_type" = "alpine" ]; then
         if [ "$available_mem" -ge 8192 ]; then
-            vm_memory="$os_default_memory"  # Alpine runs fine on 256MB even with plenty of RAM
+            vm_memory="$ALPINE_DEFAULT_MEMORY"  # Alpine runs fine on 256MB even with plenty of RAM
             echo "[MEMORY] Alpine selected, using minimal memory: ${vm_memory}MB" >&2
         elif [ "$available_mem" -ge 2048 ]; then
-            vm_memory="$os_default_memory"  # 256MB is enough for Alpine
+            vm_memory="$ALPINE_DEFAULT_MEMORY"  # 256MB is enough for Alpine
             echo "[MEMORY] Alpine selected, using minimal memory: ${vm_memory}MB" >&2
         elif [ "$available_mem" -ge 1024 ]; then
-            vm_memory="$os_default_memory"  # 256MB still possible
+            vm_memory="$ALPINE_DEFAULT_MEMORY"  # 256MB still possible
             echo "[MEMORY] Alpine selected, using minimal memory: ${vm_memory}MB" >&2
         elif [ "$available_mem" -ge 512 ]; then
             vm_memory=256   # 256MB minimum for Alpine
