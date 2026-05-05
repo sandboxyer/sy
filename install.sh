@@ -88,10 +88,72 @@ get_command_working_dir() {
     esac
 }
 
-# PRESERVATION WHITELIST (OPTIONAL - files to keep during updates)
-PRESERVATION_WHITELIST=""
-# To add files/directories, use space-separated list:
-# PRESERVATION_WHITELIST="config data models user-settings.json"
+# =============================================================================
+# PRESERVATION WHITELIST - Files/Directories to keep during updates
+# =============================================================================
+# FORMAT: Space-separated list of patterns
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ HOW TO USE - ALL CASES EXPLAINED                                        │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+# CASE 1: Preserve a FILE by its FULL RELATIVE PATH
+#   Just put the exact file path from installation root
+#   Example: "config/database.json"
+#   Example: "._/._/._/Qemu/qemu.sh"
+#   Example: "data/cache/index.db"
+#   → Matches that EXACT file only
+#
+# CASE 2: Preserve a DIRECTORY by its FULL RELATIVE PATH
+#   Put the directory path ending with /
+#   Example: "config/"
+#   Example: "._/._/._/Qemu/"
+#   Example: "data/"
+#   → Matches ALL files inside that directory (recursively)
+#
+# CASE 3: Preserve files by FILENAME PATTERN (anywhere in tree)
+#   Format: "startpattern_endpattern"
+#   Uses underscore (_) as separator between START and END of filename
+#
+#   3a. Match START of filename:
+#       "qemu_"     → ANY file starting with "qemu" anywhere
+#       "filestart_ → ANY file starting with "filestart" anywhere
+#       Example: "qemu_" matches: qemu.sh, qemu.conf, qemu-custom, dir/qemu.xyz
+#
+#   3b. Match END of filename (ignoring extension):
+#       "_sh"       → ANY file ending with "sh" (not counting .extension)
+#       "_json"     → ANY file ending with "json" (not counting .extension)
+#       Example: "_json" matches: test.json, config.json, data.json
+#       Example: "_sh" matches: qemu.sh, run.sh, deploy.sh
+#       IMPORTANT: "_json" does NOT require .json extension,
+#                  it matches filename ending in "json", with or without extension
+#
+#   3c. Match START AND END of filename:
+#       "qemu_sh"   → Files starting with "qemu" AND ending with "sh"
+#       "filestart_customname" → Files starting with "filestart" AND ending with "customname"
+#       Example: "qemu_sh" matches: qemu.sh, qemu-custom.sh, qemu_sh
+#       Example: "app_conf" matches: app.conf, app-config.conf, app_conf
+#
+#   3d. Match START only (no underscore):
+#       "qemu"      → ANY file starting with "qemu"
+#       "filestart" → ANY file starting with "filestart"
+#       Example: "qemu" matches: qemu.sh, qemu.conf, qemu-anything, qemu
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ PUT YOUR PATTERNS HERE (space-separated):                               │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
+PRESERVATION_WHITELIST="alpine-cloudinit noble-server-cloudimg noble-vm alpine-vm"
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ REAL EXAMPLES (uncomment the one you need):                             │
+# └─────────────────────────────────────────────────────────────────────────┘
+# PRESERVATION_WHITELIST="._/._/._/Qemu/qemu.sh"
+# PRESERVATION_WHITELIST="._/._/._/Qemu/"
+# PRESERVATION_WHITELIST="qemu_"
+# PRESERVATION_WHITELIST="_json _sh _conf"
+# PRESERVATION_WHITELIST="filestart_customname"
+# PRESERVATION_WHITELIST="._/._/._/Qemu/ _json qemu_ config/database.json"
 
 # =============================================================================
 # ADVANCED CONFIGURATION (Usually don't need changes)
@@ -613,20 +675,136 @@ remove_links() {
     [ -d "$INSTALL_DIR/wrappers" ] && rm -rf "$INSTALL_DIR/wrappers"
 }
 
+# =============================================================================
+# PRESERVATION PATTERN MATCHING
+# =============================================================================
+# Check if a path matches any preservation pattern
+# Handles: exact file paths, directory paths, directory name patterns, and filename patterns
+#
+matches_pattern() {
+    rel_path="$1"      # Relative path from installation root (e.g., "._/._/._/Qemu/qemu.sh")
+    pattern="$2"       # Pattern to match against
+    
+    filename=$(basename "$rel_path")
+    dirname=$(dirname "$rel_path")
+    
+    # CASE 1: Pattern ends with / → EXACT DIRECTORY path
+    # Example: "config/" matches config/ and everything inside
+    case "$pattern" in
+        */)
+            case "$rel_path" in
+                "${pattern}"*) return 0 ;;
+            esac
+            return 1
+            ;;
+    esac
+    
+    # CASE 2: Pattern contains / → EXACT FILE path
+    # Example: "._/._/._/Qemu/qemu.sh" matches only that exact file
+    case "$pattern" in
+        */*)
+            [ "$rel_path" = "$pattern" ] && return 0
+            return 1
+            ;;
+    esac
+    
+    # CASE 3: DIRECTORY NAME pattern (check if ANY directory in path starts with pattern)
+    # Walk up the path checking each directory component
+    check_path="$rel_path"
+    while [ "$check_path" != "." ] && [ -n "$check_path" ]; do
+        check_dir=$(basename "$check_path")
+        case "$check_dir" in
+            "${pattern}"*)
+                return 0
+                ;;
+        esac
+        check_path=$(dirname "$check_path")
+    done
+    
+    # CASE 4: FILENAME pattern
+    # Uses underscore as separator: "start_end", "start_", "_end", or "word"
+    case "$pattern" in
+        *_*)
+            start="${pattern%_*}"
+            end="${pattern#*_}"
+            
+            if [ -n "$start" ] && [ -n "$end" ]; then
+                # 4c: BOTH start AND end → "start_end"
+                base="${filename%.*}"
+                case "$base" in
+                    "${start}"*"${end}") return 0 ;;
+                esac
+                case "$filename" in
+                    "${start}"*"${end}") return 0 ;;
+                esac
+            elif [ -n "$start" ]; then
+                # 4a: START only → "start_"
+                case "$filename" in
+                    "${start}"*) return 0 ;;
+                esac
+            else
+                # 4b: END only → "_end"
+                base="${filename%.*}"
+                case "$base" in
+                    *"${end}") return 0 ;;
+                esac
+                case "$filename" in
+                    *"${end}") return 0 ;;
+                esac
+            fi
+            ;;
+        *)
+            # 4d: No underscore - match BOTH filename AND directory name starting with pattern
+            case "$filename" in
+                "${pattern}"*) return 0 ;;
+            esac
+            ;;
+    esac
+    
+    return 1
+}
+
 preserve_files_from_backup() {
     [ "$PRESERVE_DATA" = false ] && return 0
     [ ! -d "$BACKUP_DIR" ] && return 0
+    [ -z "$PRESERVATION_WHITELIST" ] && return 0
 
-    log_message "Restoring preserved files..."
-    for item in $PRESERVATION_WHITELIST; do
-        source_path="$BACKUP_DIR/$item"
-        dest_path="$INSTALL_DIR/$item"
+    log_message "Restoring preserved files with duplicate detection..."
+    log_message "Active patterns: $PRESERVATION_WHITELIST"
+    
+    # Walk through ALL files AND directories in backup
+    find "$BACKUP_DIR" \( -type f -o -type d \) 2>/dev/null | while IFS= read -r source_path; do
+        rel_path="${source_path#$BACKUP_DIR/}"
+        [ -z "$rel_path" ] && continue
         
-        if [ -e "$source_path" ]; then
-            mkdir -p "$(dirname "$dest_path")"
-            [ -e "$dest_path" ] && rm -rf "$dest_path"
-            mv -f "$source_path" "$dest_path" 2>/dev/null || true
-        fi
+        # Skip the root directory itself
+        [ "$source_path" = "$BACKUP_DIR" ] && continue
+        
+        # Check against each pattern
+        for pattern in $PRESERVATION_WHITELIST; do
+            if matches_pattern "$rel_path" "$pattern"; then
+                dest_path="$INSTALL_DIR/$rel_path"
+                
+                if [ -d "$source_path" ]; then
+                    # It's a directory - just ensure it exists
+                    if [ ! -d "$dest_path" ]; then
+                        mkdir -p "$dest_path"
+                        log_message "  [DIR] Preserved directory: $rel_path"
+                    fi
+                else
+                    # It's a file
+                    if [ -e "$dest_path" ]; then
+                        log_message "  [KEEP] $rel_path (exists in both, keeping backup version)"
+                        rm -rf "$dest_path"
+                    else
+                        log_message "  [RESTORE] $rel_path (only in backup)"
+                    fi
+                    mkdir -p "$(dirname "$dest_path")"
+                    cp -pr "$source_path" "$dest_path" 2>/dev/null || true
+                fi
+                break
+            fi
+        done
     done
     
     rm -rf "$BACKUP_DIR"
