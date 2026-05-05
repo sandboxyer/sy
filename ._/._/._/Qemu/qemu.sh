@@ -17,7 +17,7 @@
 # --- Default Configuration ---
 DEFAULT_OS="alpine"
 SSH_BASE_PORT=2222
-DEFAULT_DISK_SIZE="5G"
+DEFAULT_DISK_SIZE="10G"
 DEFAULT_MEMORY="2048"  # Will be auto-adjusted based on host RAM and OS
 ALPINE_DEFAULT_MEMORY="256"  # Alpine runs well with minimal memory
 MAX_RETRY_ATTEMPTS=18  # Maximum retry attempts for port conflicts
