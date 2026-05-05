@@ -12,6 +12,8 @@
 #   bash qemu.sh --ubuntu --size 15G          # Ubuntu, temporary, 15G disk
 #   bash qemu.sh --cpu 2                      # Alpine, temporary, 2 CPU cores
 #   bash qemu.sh --ubuntu --cpu 4 --memory 4096 # Ubuntu, 4 cores, 4GB RAM
+#   bash qemu.sh list                         # List all saved VMs
+#   bash qemu.sh delete <vm-name>             # Delete a saved VM
 # ============================================================================
 
 # --- Default Configuration ---
@@ -49,6 +51,10 @@ OPTIONS:
   --retry-delay N     Delay between retries in seconds (default: ${RETRY_DELAY_SECONDS})
   -h, --help          Show this help
 
+COMMANDS:
+  list                List all saved persistent VMs
+  delete <vm-name>    Delete a saved persistent VM
+
 EXAMPLES:
   bash qemu.sh                           # Alpine, temp, auto-destroy
   bash qemu.sh dev                       # Alpine, persistent as "dev"
@@ -59,11 +65,98 @@ EXAMPLES:
   bash qemu.sh --ubuntu --cpu 4 --memory 4096 # Ubuntu, 4 cores, 4GB RAM
   bash qemu.sh --no-kvm                  # Force software emulation
   bash qemu.sh --retry-attempts 20       # More retries for busy environments
+  bash qemu.sh list                      # List all saved VMs
+  bash qemu.sh delete myvm               # Delete persistent VM "myvm"
 
 ACCESS:  ssh root@localhost -p PORT  (password: 123)
 
 HELPEOF
     exit 0
+}
+
+# --- Helper: List all saved VMs ---
+list_vms() {
+    local found=0
+    echo "[VM LIST] Scanning for saved VMs..."
+    
+    for vm_dir in *-vm-*; do
+        if [ -d "$vm_dir" ]; then
+            # Extract OS prefix and VM name from directory name
+            local os_prefix="${vm_dir%%-vm-*}"
+            local vm_name="${vm_dir#*-vm-}"
+            
+            # Find the disk image file
+            local img_file=""
+            if [ -f "$vm_dir/alpine-cloudinit.qcow2" ]; then
+                img_file="alpine-cloudinit.qcow2"
+            elif [ -f "$vm_dir/noble-server-cloudimg-amd64.img" ]; then
+                img_file="noble-server-cloudimg-amd64.img"
+            fi
+            
+            # Get disk size if image exists
+            local disk_size="unknown"
+            if [ -n "$img_file" ] && [ -f "$vm_dir/$img_file" ]; then
+                disk_size=$(qemu-img info "$vm_dir/$img_file" 2>/dev/null | awk '/^virtual size:/ {print $3, $4}' || echo "unknown")
+            fi
+            
+            # Get cloud-init ISO timestamp if exists
+            local created="unknown"
+            if [ -f "$vm_dir/alpine-cloud-init.iso" ] || [ -f "$vm_dir/noble-cloud-init.iso" ]; then
+                local iso_file=$(ls "$vm_dir"/*-cloud-init.iso 2>/dev/null | head -1)
+                if [ -n "$iso_file" ]; then
+                    created=$(stat -c '%Y' "$iso_file" 2>/dev/null || stat -f '%m' "$iso_file" 2>/dev/null)
+                    if [ "$created" != "unknown" ] && [ -n "$created" ]; then
+                        created=$(date -d "@$created" "+%Y-%m-%d %H:%M" 2>/dev/null || date -r "$created" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "unknown")
+                    fi
+                fi
+            fi
+            
+            printf "%-20s os=%-8s disk=%-12s created=%-16s dir=%s\n" \
+                "$vm_name" "$os_prefix" "$disk_size" "$created" "$vm_dir"
+            found=1
+        fi
+    done
+    
+    if [ "$found" -eq 0 ]; then
+        echo "[VM LIST] No saved VMs found."
+    fi
+}
+
+# --- Helper: Delete a saved VM ---
+delete_vm() {
+    local vm_name="$1"
+    local deleted=0
+    
+    if [ -z "$vm_name" ]; then
+        echo "ERROR: VM name required for delete command"
+        echo "Usage: $0 delete <vm-name>"
+        exit 1
+    fi
+    
+    echo "[DELETE] Searching for VM: $vm_name"
+    
+    for vm_dir in *-vm-"$vm_name"; do
+        if [ -d "$vm_dir" ]; then
+            echo "[DELETE] Found VM directory: $vm_dir"
+            echo "[DELETE] This will permanently delete all data in: $vm_dir"
+            printf "[DELETE] Are you sure? (y/N): "
+            read -r confirm
+            if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+                rm -rf "$vm_dir"
+                echo "[DELETE] VM '$vm_name' has been deleted successfully."
+                deleted=1
+            else
+                echo "[DELETE] Deletion cancelled."
+                exit 0
+            fi
+        fi
+    done
+    
+    if [ "$deleted" -eq 0 ]; then
+        echo "ERROR: No VM found with name: $vm_name"
+        echo "Use '$0 list' to see all saved VMs"
+        exit 1
+    fi
 }
 
 # --- OS Definitions (Add new OS here following this pattern) ---
@@ -759,6 +852,20 @@ while [ $# -gt 0 ]; do
                 shift 2
             else
                 echo "ERROR: --retry-delay requires a valid number in seconds"
+                exit 1
+            fi
+            ;;
+        list)
+            list_vms
+            exit 0
+            ;;
+        delete)
+            if [ -n "$2" ] && [ "${2#--}" = "$2" ]; then
+                delete_vm "$2"
+                exit 0
+            else
+                echo "ERROR: delete requires a VM name"
+                echo "Usage: $0 delete <vm-name>"
                 exit 1
             fi
             ;;
