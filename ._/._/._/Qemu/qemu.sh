@@ -2,7 +2,6 @@
 
 # ============================================================================
 # QEMU VM Launcher - Unified Script for Multiple OS
-#   v2.1 - Fixed concurrent IP allocation & Ubuntu password digest
 # ============================================================================
 
 # --- Default Configuration ---
@@ -26,7 +25,7 @@ VM_IP_START=10
 VM_IP_END=99
 
 # --- IP Lock Directory (per‑IP atomic reservation) ---
-IP_LOCK_DIR="/tmp/qemu_vm_ip_locks"   # each IP gets a sub‑directory here
+IP_LOCK_DIR="/tmp/qemu_vm_ip_locks"
 mkdir -p "$IP_LOCK_DIR" 2>/dev/null
 
 # --- Helper: Show help message ---
@@ -677,22 +676,18 @@ setup_bridge_network() {
     return 0
 }
 
-# --- NEW: Atomic per‑IP reservation using directories ---
-# Attempts to reserve an IP for the given VM name.
-# Returns: echo "IP" on success, returns 1 on failure.
+# --- Atomic per‑IP reservation using directories ---
 reserve_vm_ip() {
     local vm_name="$1"
     local candidate=""
     local lock_dir=""
     
-    # Try IPs in range; mkdir is atomic – first to create it wins
     local ip_num="$VM_IP_START"
     while [ "$ip_num" -le "$VM_IP_END" ]; do
         candidate="${VM_IP_PREFIX}${ip_num}"
         lock_dir="${IP_LOCK_DIR}/ip_${candidate}"
         
         if mkdir "$lock_dir" 2>/dev/null; then
-            # Successfully reserved this IP. Store reserve info.
             echo "${vm_name}=${candidate}" >> "/tmp/qemu_vm_ips.txt" 2>/dev/null
             echo "[NET] Reserved IP: ${candidate} for VM ${vm_name}" >&2
             echo "$candidate"
@@ -711,7 +706,6 @@ release_vm_ip() {
     if [ -n "$ip" ]; then
         local lock_dir="${IP_LOCK_DIR}/ip_${ip}"
         rmdir "$lock_dir" 2>/dev/null
-        # Also clean the record file (best effort)
         sed -i "/=${ip}$/d" "/tmp/qemu_vm_ips.txt" 2>/dev/null
     fi
 }
@@ -904,12 +898,12 @@ resize_disk() {
     echo "[RESIZE] Disk resized successfully to ${target_size}"
 }
 
-# --- Improved password hash generator (fixes Ubuntu root login) ---
+# --- Generate password hash for cloud-init ---
 generate_password_hash() {
     local pass="$1"
     local hash=""
     
-    # Try python3 (crypt) first – widely available and reliable
+    # Python3 method - most reliable
     if command -v python3 >/dev/null 2>&1; then
         hash=$(python3 -c "import crypt; print(crypt.crypt('${pass}', crypt.mksalt(crypt.METHOD_SHA512)))" 2>/dev/null)
         if [ -n "$hash" ]; then
@@ -918,7 +912,7 @@ generate_password_hash() {
         fi
     fi
     
-    # Try mkpasswd (from package 'whois')
+    # mkpasswd method
     if command -v mkpasswd >/dev/null 2>&1; then
         hash=$(echo "${pass}" | mkpasswd --method=sha-512 --stdin 2>/dev/null)
         if [ -n "$hash" ]; then
@@ -927,7 +921,7 @@ generate_password_hash() {
         fi
     fi
     
-    # Try openssl passwd (fallback)
+    # openssl method
     if command -v openssl >/dev/null 2>&1; then
         hash=$(echo "${pass}" | openssl passwd -6 -stdin 2>/dev/null)
         if [ -n "$hash" ]; then
@@ -976,17 +970,9 @@ METAEOF
     # Generate a solid password hash
     local pass_hash=$(generate_password_hash "$DEFAULT_PASSWORD")
     
-    # Common SSH configuration for root login
-    local ssh_write_files='write_files:
-  - path: /etc/ssh/sshd_config.d/99-enable-root-login.conf
-    content: |
-      PermitRootLogin yes
-      PasswordAuthentication yes
-    permissions: "0644"
-    owner: root:root'
-    
     # Network and user-data differ by OS
     if [ "$os_type" = "ubuntu" ]; then
+        # UBUNTU: Use chpasswd with list format for reliable root password
         if [ -n "$vm_ip" ]; then
             # Ubuntu static IP (netplan)
             cat > network-config << NETEOF
@@ -1014,22 +1000,26 @@ ethernets:
 NETEOF
         fi
         
+        # CRITICAL FIX: Use chpasswd list format instead of direct password hash
         cat > user-data << CLOUDEOF
 #cloud-config
-password: ${pass_hash}
-chpasswd:
-  expire: False
-ssh_pwauth: True
-
-# Enable root login
-users:
-  - name: ${CLOUD_USER}
-    lock_passwd: false
-    passwd: ${pass_hash}
-
+ssh_pwauth: true
 disable_root: false
 
-${ssh_write_files}
+# Set root password directly
+chpasswd:
+  list: |
+    root:${DEFAULT_PASSWORD}
+  expire: False
+
+# Enable root login via SSH
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-enable-root-login.conf
+    content: |
+      PermitRootLogin yes
+      PasswordAuthentication yes
+    permissions: "0644"
+    owner: root:root
 
 # Run network commands on first boot
 runcmd:
@@ -1038,7 +1028,7 @@ runcmd:
   - systemctl restart networking 2>/dev/null || service networking restart 2>/dev/null || true
 CLOUDEOF
     else
-        # Alpine
+        # ALPINE: Original working configuration
         if [ -n "$vm_ip" ]; then
             cat > network-config << NETEOF
 version: 2
@@ -1073,7 +1063,13 @@ ssh_pwauth: True
 user: ${CLOUD_USER}
 disable_root: false
 
-${ssh_write_files}
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-enable-root-login.conf
+    content: |
+      PermitRootLogin yes
+      PasswordAuthentication yes
+    permissions: "0644"
+    owner: root:root
 
 runcmd:
   - echo "nameserver 8.8.8.8" > /etc/resolv.conf
@@ -1176,19 +1172,16 @@ run_vm_with_retry() {
             cat /tmp/qemu_error_$$.log >&2
             rm -f /tmp/qemu_error_$$.log
             delete_tap_interface "$tap_name"
-            # Release bridge IP reservation (bridge failed, so fallback doesn't need it)
             release_vm_ip "$vm_ip"
             use_bridge="false"
-            # Fall through to port forwarding below
         else
             rm -f /tmp/qemu_error_$$.log
             delete_tap_interface "$tap_name"
-            # The EXIT trap will release IP lock for us
             return $qemu_exit_code
         fi
     fi
     
-    # Port forwarding mode (fallback or explicit)
+    # Port forwarding mode
     local attempt=1
     local current_port="$initial_port"
     
@@ -1400,7 +1393,6 @@ if [ "$NO_BRIDGE" = "true" ]; then
     USE_BRIDGE="false"
 else
     if setup_bridge_network; then
-        # Unique identifier for IP reservation
         vm_identifier="${VM_NAME:-temp-$$}"
         
         # Reserve IP atomically via directory lock
