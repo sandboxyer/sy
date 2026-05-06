@@ -972,13 +972,13 @@ METAEOF
     
     # Network and user-data differ by OS
     if [ "$os_type" = "ubuntu" ]; then
-        # UBUNTU: Use chpasswd with list format for reliable root password
+        # UBUNTU: Use correct interface name (ens3)
         if [ -n "$vm_ip" ]; then
-            # Ubuntu static IP (netplan)
+            # Ubuntu static IP (netplan) with correct interface name
             cat > network-config << NETEOF
 version: 2
 ethernets:
-  eth0:
+  ens3:
     dhcp4: false
     addresses:
       - ${vm_ip}/24
@@ -990,17 +990,18 @@ ethernets:
         - 8.8.8.8
         - 1.1.1.1
 NETEOF
-            echo "[ISO] Ubuntu static IP configured: ${vm_ip}/24"
+            echo "[ISO] Ubuntu static IP configured: ${vm_ip}/24 on interface ens3"
         else
+            # Ubuntu DHCP with correct interface name
             cat > network-config << NETEOF
 version: 2
 ethernets:
-  eth0:
+  ens3:
     dhcp4: true
 NETEOF
         fi
         
-        # CRITICAL FIX: Use chpasswd list format instead of direct password hash
+        # Use chpasswd list format for reliable root password
         cat > user-data << CLOUDEOF
 #cloud-config
 ssh_pwauth: true
@@ -1021,7 +1022,10 @@ write_files:
     permissions: "0644"
     owner: root:root
 
-# Run network commands on first boot
+# Ensure network interface is up and apply configuration
+bootcmd:
+  - ip link set ens3 up
+
 runcmd:
   - netplan apply
   - systemctl restart ssh 2>/dev/null || service ssh restart 2>/dev/null || true
