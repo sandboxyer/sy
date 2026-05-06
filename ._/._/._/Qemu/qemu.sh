@@ -2,29 +2,32 @@
 
 # ============================================================================
 # QEMU VM Launcher - Unified Script for Multiple OS
-# ============================================================================
-# Usage:
-#   bash qemu.sh                              # Alpine, temporary mode (default)
-#   bash qemu.sh myvm                         # Alpine, persistent mode
-#   bash qemu.sh --ubuntu                     # Ubuntu, temporary mode
-#   bash qemu.sh --ubuntu myvm                # Ubuntu, persistent mode
-#   bash qemu.sh myvm --size 10G --port 2222  # Alpine, persistent, custom settings
-#   bash qemu.sh --ubuntu --size 15G          # Ubuntu, temporary, 15G disk
-#   bash qemu.sh --cpu 2                      # Alpine, temporary, 2 CPU cores
-#   bash qemu.sh --ubuntu --cpu 4 --memory 4096 # Ubuntu, 4 cores, 4GB RAM
-#   bash qemu.sh list                         # List all saved VMs
-#   bash qemu.sh delete <vm-name>             # Delete a saved VM
+#   v2.1 - Fixed concurrent IP allocation & Ubuntu password digest
 # ============================================================================
 
 # --- Default Configuration ---
 DEFAULT_OS="alpine"
 SSH_BASE_PORT=2222
 DEFAULT_DISK_SIZE="10G"
-DEFAULT_MEMORY="2048"  # Will be auto-adjusted based on host RAM and OS
-ALPINE_DEFAULT_MEMORY="256"  # Alpine runs well with minimal memory
-MAX_RETRY_ATTEMPTS=18  # Maximum retry attempts for port conflicts
-RETRY_DELAY_SECONDS=3  # Delay between retries (will try for ~2.5 minutes with these settings)
-DEFAULT_CPU_CORES=1    # Default number of CPU cores
+DEFAULT_MEMORY="2048"
+ALPINE_DEFAULT_MEMORY="256"
+MAX_RETRY_ATTEMPTS=18
+RETRY_DELAY_SECONDS=3
+DEFAULT_CPU_CORES=1
+
+# --- Network Configuration ---
+BRIDGE_NAME="qemubr0"
+TAP_PREFIX="qemutap"
+BRIDGE_IP="10.10.10.1"
+BRIDGE_NETMASK="255.255.255.0"
+BRIDGE_SUBNET="10.10.10.0/24"
+VM_IP_PREFIX="10.10.10."
+VM_IP_START=10
+VM_IP_END=99
+
+# --- IP Lock Directory (per‑IP atomic reservation) ---
+IP_LOCK_DIR="/tmp/qemu_vm_ip_locks"   # each IP gets a sub‑directory here
+mkdir -p "$IP_LOCK_DIR" 2>/dev/null
 
 # --- Helper: Show help message ---
 show_help() {
@@ -47,28 +50,18 @@ OPTIONS:
   --memory MB         RAM in MB (auto-calculated if omitted)
   --cpu N             Number of CPU cores (default: 1, auto-capped to host max)
   --no-kvm            Disable KVM acceleration
-  --retry-attempts N  Max retry attempts on port conflict (default: ${MAX_RETRY_ATTEMPTS})
-  --retry-delay N     Delay between retries in seconds (default: ${RETRY_DELAY_SECONDS})
+  --no-bridge         Force port forwarding (disable bridge/networking)
+  --retry-attempts N  Max retry attempts on port conflict (default: 18)
+  --retry-delay N     Delay between retries in seconds (default: 3)
   -h, --help          Show this help
 
 COMMANDS:
   list                List all saved persistent VMs
   delete <vm-name>    Delete a saved persistent VM
 
-EXAMPLES:
-  bash qemu.sh                           # Alpine, temp, auto-destroy
-  bash qemu.sh dev                       # Alpine, persistent as "dev"
-  bash qemu.sh --ubuntu                  # Ubuntu, temp
-  bash qemu.sh --ubuntu web --size 10G   # Ubuntu, persistent, 10G disk
-  bash qemu.sh --port 2222 --memory 4096 # Custom port & memory
-  bash qemu.sh --cpu 2                   # Alpine with 2 CPU cores
-  bash qemu.sh --ubuntu --cpu 4 --memory 4096 # Ubuntu, 4 cores, 4GB RAM
-  bash qemu.sh --no-kvm                  # Force software emulation
-  bash qemu.sh --retry-attempts 20       # More retries for busy environments
-  bash qemu.sh list                      # List all saved VMs
-  bash qemu.sh delete myvm               # Delete persistent VM "myvm"
-
 ACCESS:  ssh root@localhost -p PORT  (password: 123)
+         OR if bridge networking is available:
+         ssh root@VM_IP  (password: 123)
 
 HELPEOF
     exit 0
@@ -81,11 +74,9 @@ list_vms() {
     
     for vm_dir in *-vm-*; do
         if [ -d "$vm_dir" ]; then
-            # Extract OS prefix and VM name from directory name
             local os_prefix="${vm_dir%%-vm-*}"
             local vm_name="${vm_dir#*-vm-}"
             
-            # Find the disk image file
             local img_file=""
             if [ -f "$vm_dir/alpine-cloudinit.qcow2" ]; then
                 img_file="alpine-cloudinit.qcow2"
@@ -93,13 +84,11 @@ list_vms() {
                 img_file="noble-server-cloudimg-amd64.img"
             fi
             
-            # Get disk size if image exists
             local disk_size="unknown"
             if [ -n "$img_file" ] && [ -f "$vm_dir/$img_file" ]; then
                 disk_size=$(qemu-img info "$vm_dir/$img_file" 2>/dev/null | awk '/^virtual size:/ {print $3, $4}' || echo "unknown")
             fi
             
-            # Get cloud-init ISO timestamp if exists
             local created="unknown"
             if [ -f "$vm_dir/alpine-cloud-init.iso" ] || [ -f "$vm_dir/noble-cloud-init.iso" ]; then
                 local iso_file=$(ls "$vm_dir"/*-cloud-init.iso 2>/dev/null | head -1)
@@ -111,8 +100,18 @@ list_vms() {
                 fi
             fi
             
-            printf "%-20s os=%-8s disk=%-12s created=%-16s dir=%s\n" \
-                "$vm_name" "$os_prefix" "$disk_size" "$created" "$vm_dir"
+            local vm_ip=""
+            if [ -f "/tmp/qemu_vm_ips.txt" ]; then
+                vm_ip=$(grep "^${vm_name}=" "/tmp/qemu_vm_ips.txt" 2>/dev/null | cut -d'=' -f2)
+            fi
+            
+            local ip_info=""
+            if [ -n "$vm_ip" ]; then
+                ip_info=" ip=${vm_ip}"
+            fi
+            
+            printf "%-20s os=%-8s disk=%-12s created=%-16s dir=%s%s\n" \
+                "$vm_name" "$os_prefix" "$disk_size" "$created" "$vm_dir" "$ip_info"
             found=1
         fi
     done
@@ -143,6 +142,12 @@ delete_vm() {
             read -r confirm
             if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
                 rm -rf "$vm_dir"
+                # Release any still‑held IP lock
+                local ip_to_release=$(grep "^${vm_name}=" "/tmp/qemu_vm_ips.txt" 2>/dev/null | cut -d'=' -f2)
+                if [ -n "$ip_to_release" ]; then
+                    rmdir "${IP_LOCK_DIR}/ip_${ip_to_release}" 2>/dev/null
+                    sed -i "/^${vm_name}=/d" "/tmp/qemu_vm_ips.txt" 2>/dev/null
+                fi
                 echo "[DELETE] VM '$vm_name' has been deleted successfully."
                 deleted=1
             else
@@ -159,18 +164,7 @@ delete_vm() {
     fi
 }
 
-# --- OS Definitions (Add new OS here following this pattern) ---
-# Format:
-#   OS_NAME|img_url|img_filename|iso_filename|default_password|hostname_prefix
-# 
-# Available OS definitions:
-#   alpine  - Alpine Linux 3.23.4 (cloud-init, BIOS)
-#   ubuntu  - Ubuntu Server 24.04 Noble (cloud-init)
-#   debian  - Debian 12 Bookworm (cloud-init) [EXAMPLE - adjust URL as needed]
-#   fedora  - Fedora 40 Cloud (cloud-init) [EXAMPLE - adjust URL as needed]
-#
-# To add a new OS, just add a new case in get_os_config() function below
-
+# --- OS Definitions ---
 get_os_config() {
     local os="$1"
     case "$os" in
@@ -180,7 +174,8 @@ get_os_config() {
             ISO_FILE="alpine-cloud-init.iso"
             DEFAULT_PASSWORD="123"
             HOSTNAME_PREFIX="alpine"
-            CLOUD_USER="root"  # Alpine uses root by default for cloud-init
+            CLOUD_USER="root"
+            OS_TYPE="alpine"
             ;;
         ubuntu)
             IMG_URL="https://cloud-images.ubuntu.com/noble/20260216/noble-server-cloudimg-amd64.img"
@@ -189,16 +184,8 @@ get_os_config() {
             DEFAULT_PASSWORD="123"
             HOSTNAME_PREFIX="noble"
             CLOUD_USER="root"
+            OS_TYPE="ubuntu"
             ;;
-        # Example: Add more OS definitions here
-        # debian)
-        #     IMG_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
-        #     IMG_FILE="debian-cloudimg.qcow2"
-        #     ISO_FILE="debian-cloud-init.iso"
-        #     DEFAULT_PASSWORD="123"
-        #     HOSTNAME_PREFIX="debian"
-        #     CLOUD_USER="root"
-        #     ;;
         *)
             echo "ERROR: Unknown OS type: $os"
             echo "Supported OS: alpine, ubuntu"
@@ -209,16 +196,13 @@ get_os_config() {
 
 # --- Helper: Get host CPU core count ---
 get_host_cpu_cores() {
-    # Try multiple methods to get the number of CPU cores
     if command -v nproc >/dev/null 2>&1; then
         nproc --all
     elif [ -f /proc/cpuinfo ]; then
         grep -c "^processor" /proc/cpuinfo
     elif command -v sysctl >/dev/null 2>&1; then
-        # macOS
         sysctl -n hw.ncpu 2>/dev/null || echo "1"
     else
-        # Safe fallback
         echo "1"
     fi
 }
@@ -228,13 +212,11 @@ validate_cpu_cores() {
     local requested_cores="$1"
     local host_cores=$(get_host_cpu_cores)
     
-    # Validate input is a positive integer
     if ! [ "$requested_cores" -eq "$requested_cores" ] 2>/dev/null || [ "$requested_cores" -lt 1 ]; then
         echo "ERROR: Invalid CPU core count: $requested_cores (must be positive integer)" >&2
         exit 1
     fi
     
-    # Cap to host maximum
     if [ "$requested_cores" -gt "$host_cores" ]; then
         echo "[CPU] Requested ${requested_cores} cores exceeds host maximum (${host_cores})" >&2
         echo "[CPU] Falling back to host maximum: ${host_cores} cores" >&2
@@ -250,7 +232,6 @@ get_total_memory_mb() {
     if [ -f /proc/meminfo ]; then
         awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null
     elif command -v sysctl >/dev/null 2>&1; then
-        # macOS
         sysctl -n hw.memsize 2>/dev/null | awk '{print int($1/1024/1024)}'
     else
         echo "0"
@@ -259,26 +240,21 @@ get_total_memory_mb() {
 
 # --- Helper: Get available system memory in MB ---
 get_available_memory_mb() {
-    # Try multiple methods to get available memory
     if [ -f /proc/meminfo ]; then
-        # Linux: Get MemAvailable (preferred) or fallback to MemFree + Buffers + Cached
         local mem_available=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null)
         if [ -n "$mem_available" ] && [ "$mem_available" -gt 0 ]; then
             echo "$mem_available"
             return 0
         fi
-        # Fallback calculation
         local mem_free=$(awk '/^MemFree:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null)
         local buffers=$(awk '/^Buffers:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null)
         local cached=$(awk '/^Cached:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null)
         echo $((mem_free + buffers + cached))
     elif command -v vm_stat >/dev/null 2>&1; then
-        # macOS
         local page_size=$(vm_stat | awk '/page size/ {print $8}')
         local free_pages=$(vm_stat | awk '/Pages free/ {print $3}' | tr -d '.')
         echo $((free_pages * page_size / 1024 / 1024))
     else
-        # Last resort: assume 4096 MB available
         echo "4096"
     fi
 }
@@ -292,18 +268,14 @@ calculate_vm_memory() {
     
     echo "[MEMORY] Host total memory: ${total_mem}MB, available: ${available_mem}MB" >&2
     
-    # If specific memory requested, honor it exactly (only validate against total system memory)
     if [ -n "$requested_memory" ] && [ "$requested_memory" -gt 0 ]; then
-        # Only check against total system memory
         if [ "$total_mem" -gt 0 ] && [ "$requested_memory" -gt "$total_mem" ]; then
             echo "ERROR: Requested memory (${requested_memory}MB) exceeds total system memory (${total_mem}MB)" >&2
             exit 1
         fi
         
-        # Warn if requested exceeds currently available (but still allow it)
         if [ "$requested_memory" -gt "$available_mem" ]; then
             echo "[WARNING] Requested memory (${requested_memory}MB) exceeds currently available memory (${available_mem}MB)" >&2
-            echo "[WARNING] VM may use swap or fail if memory cannot be allocated" >&2
         fi
         
         echo "[MEMORY] Using requested memory: ${requested_memory}MB" >&2
@@ -311,29 +283,27 @@ calculate_vm_memory() {
         return 0
     fi
     
-    # Auto-calculate based on available memory and OS type (only when no custom memory specified)
     local vm_memory
     
-    # For Alpine, we can be much more conservative
     if [ "$os_type" = "alpine" ]; then
         if [ "$available_mem" -ge 8192 ]; then
-            vm_memory="$ALPINE_DEFAULT_MEMORY"  # Alpine runs fine on 256MB even with plenty of RAM
+            vm_memory="$ALPINE_DEFAULT_MEMORY"
             echo "[MEMORY] Alpine selected, using minimal memory: ${vm_memory}MB" >&2
         elif [ "$available_mem" -ge 2048 ]; then
-            vm_memory="$ALPINE_DEFAULT_MEMORY"  # 256MB is enough for Alpine
+            vm_memory="$ALPINE_DEFAULT_MEMORY"
             echo "[MEMORY] Alpine selected, using minimal memory: ${vm_memory}MB" >&2
         elif [ "$available_mem" -ge 1024 ]; then
-            vm_memory="$ALPINE_DEFAULT_MEMORY"  # 256MB still possible
+            vm_memory="$ALPINE_DEFAULT_MEMORY"
             echo "[MEMORY] Alpine selected, using minimal memory: ${vm_memory}MB" >&2
         elif [ "$available_mem" -ge 512 ]; then
-            vm_memory=256   # 256MB minimum for Alpine
+            vm_memory=256
             echo "[MEMORY] Low memory, Alpine using minimum: ${vm_memory}MB" >&2
         elif [ "$available_mem" -ge 384 ]; then
-            vm_memory=192   # Alpine can run on very little
+            vm_memory=192
             echo "[MEMORY] Very low memory! Alpine using absolute minimum: ${vm_memory}MB" >&2
             echo "[WARNING] VM may be unstable with only ${vm_memory}MB RAM" >&2
         elif [ "$available_mem" -ge 256 ]; then
-            vm_memory=128   # Alpine absolute minimum
+            vm_memory=128
             echo "[MEMORY] Extremely low memory! Alpine using bare minimum: ${vm_memory}MB" >&2
             echo "[WARNING] VM will be severely limited with only ${vm_memory}MB RAM" >&2
         else
@@ -342,22 +312,21 @@ calculate_vm_memory() {
             exit 1
         fi
     else
-        # For Ubuntu and other OS, use standard memory allocation
         if [ "$available_mem" -ge 8192 ]; then
-            vm_memory=4096  # 4GB for VMs when host has 8GB+
+            vm_memory=4096
             echo "[MEMORY] High memory detected, allocating: ${vm_memory}MB" >&2
         elif [ "$available_mem" -ge 4096 ]; then
-            vm_memory=2048  # 2GB for VMs when host has 4-8GB
+            vm_memory=2048
             echo "[MEMORY] Moderate memory detected, allocating: ${vm_memory}MB" >&2
         elif [ "$available_mem" -ge 2048 ]; then
-            vm_memory=1024  # 1GB for VMs when host has 2-4GB
+            vm_memory=1024
             echo "[MEMORY] Limited memory detected, allocating: ${vm_memory}MB" >&2
         elif [ "$available_mem" -ge 1024 ]; then
-            vm_memory=512   # 512MB for VMs when host has 1-2GB
+            vm_memory=512
             echo "[MEMORY] Low memory detected, allocating minimal: ${vm_memory}MB" >&2
             echo "[WARNING] Ubuntu may struggle with only ${vm_memory}MB RAM" >&2
         elif [ "$available_mem" -ge 512 ]; then
-            vm_memory=256   # 256MB absolute minimum for non-Alpine
+            vm_memory=256
             echo "[MEMORY] Very low memory! Allocating absolute minimum: ${vm_memory}MB" >&2
             echo "[WARNING] VM may be unstable with only ${vm_memory}MB RAM" >&2
         else
@@ -381,6 +350,405 @@ check_kvm() {
     fi
 }
 
+# ============================================================================
+# NETWORK BRIDGE SETUP - Multiple methods for maximum compatibility
+# ============================================================================
+
+# --- Universal helper: run command with privilege escalation if needed ---
+net_cmd() {
+    if [ "$(id -u)" = "0" ]; then
+        eval "$@" 2>/dev/null
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@" 2>/dev/null
+    else
+        eval "$@" 2>/dev/null
+    fi
+}
+
+# --- Check if we have sufficient privileges ---
+check_net_privileges() {
+    if [ "$(id -u)" = "0" ]; then
+        return 0
+    fi
+    
+    if command -v sudo >/dev/null 2>&1; then
+        if sudo -n true 2>/dev/null; then
+            return 0
+        fi
+        echo "[NET] Bridge setup requires root privileges (sudo may ask for password)"
+        if sudo true 2>/dev/null; then
+            return 0
+        fi
+    fi
+    
+    echo "[NET] Insufficient privileges for network setup"
+    return 1
+}
+
+# --- Check TUN/TAP availability ---
+check_tun_available() {
+    if [ -c /dev/net/tun ]; then
+        return 0
+    fi
+    
+    net_cmd modprobe tun 2>/dev/null && sleep 0.5
+    
+    if [ -c /dev/net/tun ]; then
+        return 0
+    fi
+    
+    if [ -f /proc/modules ] && grep -q "^tun" /proc/modules 2>/dev/null; then
+        return 0
+    fi
+    
+    return 1
+}
+
+# --- Check available bridge method ---
+detect_bridge_method() {
+    # Method 1: brctl (bridge-utils) - MOST RELIABLE on older systems
+    if command -v brctl >/dev/null 2>&1; then
+        local test_bridge="qemutest_$$"
+        if net_cmd brctl addbr "$test_bridge" 2>/dev/null; then
+            net_cmd brctl delbr "$test_bridge" 2>/dev/null
+            echo "brctl"
+            return 0
+        fi
+    fi
+    
+    # Method 2: Modern ip command with bridge support
+    if command -v ip >/dev/null 2>&1; then
+        local test_bridge="qemutest_$$"
+        if net_cmd ip link add name "$test_bridge" type bridge 2>/dev/null; then
+            net_cmd ip link delete "$test_bridge" 2>/dev/null
+            echo "ip-bridge"
+            return 0
+        fi
+    fi
+    
+    # Method 3: Just TAP interface
+    if check_tun_available; then
+        if command -v tunctl >/dev/null 2>&1; then
+            local test_tap="qemutest_$$"
+            if net_cmd tunctl -t "$test_tap" 2>/dev/null; then
+                net_cmd tunctl -d "$test_tap" 2>/dev/null
+                echo "tap-only"
+                return 0
+            fi
+        elif command -v ip >/dev/null 2>&1; then
+            local test_tap="qemutest_$$"
+            if net_cmd ip tuntap add dev "$test_tap" mode tap 2>/dev/null; then
+                net_cmd ip tuntap del dev "$test_tap" mode tap 2>/dev/null
+                echo "tap-only"
+                return 0
+            fi
+        fi
+    fi
+    
+    echo "none"
+    return 1
+}
+
+# --- Create TAP interface ---
+create_tap_interface() {
+    local tap_name="$1"
+    
+    if command -v tunctl >/dev/null 2>&1; then
+        if net_cmd tunctl -t "$tap_name" 2>/dev/null; then
+            net_cmd ip link set "$tap_name" up 2>/dev/null
+            return 0
+        fi
+    fi
+    
+    if command -v ip >/dev/null 2>&1; then
+        if net_cmd ip tuntap add dev "$tap_name" mode tap 2>/dev/null; then
+            net_cmd ip link set "$tap_name" up 2>/dev/null
+            return 0
+        fi
+    fi
+    
+    if command -v openvpn >/dev/null 2>&1 && net_cmd openvpn --mktun --dev "$tap_name" 2>/dev/null; then
+        net_cmd ip link set "$tap_name" up 2>/dev/null
+        return 0
+    fi
+    
+    return 1
+}
+
+# --- Delete TAP interface ---
+delete_tap_interface() {
+    local tap_name="$1"
+    
+    if command -v tunctl >/dev/null 2>&1; then
+        net_cmd tunctl -d "$tap_name" 2>/dev/null && return 0
+    fi
+    
+    if command -v ip >/dev/null 2>&1; then
+        net_cmd ip tuntap del dev "$tap_name" mode tap 2>/dev/null && return 0
+    fi
+    
+    if command -v openvpn >/dev/null 2>&1; then
+        net_cmd openvpn --rmtun --dev "$tap_name" 2>/dev/null && return 0
+    fi
+    
+    return 1
+}
+
+# --- Setup bridge using brctl method ---
+setup_bridge_brctl() {
+    echo "[NET] Setting up bridge using 'brctl' command..."
+    
+    if ip link show "$BRIDGE_NAME" >/dev/null 2>&1; then
+        echo "[NET] Bridge ${BRIDGE_NAME} already exists"
+        net_cmd ip link set "$BRIDGE_NAME" up 2>/dev/null || net_cmd ifconfig "$BRIDGE_NAME" up 2>/dev/null
+        
+        if ! ip addr show "$BRIDGE_NAME" 2>/dev/null | grep -q "$BRIDGE_IP"; then
+            echo "[NET] Adding IP ${BRIDGE_IP} to existing bridge"
+            net_cmd ip addr add "${BRIDGE_IP}/24" dev "$BRIDGE_NAME" 2>/dev/null || \
+            net_cmd ifconfig "$BRIDGE_NAME" "${BRIDGE_IP}" netmask "${BRIDGE_NETMASK}" 2>/dev/null
+        fi
+        return 0
+    fi
+    
+    echo "[NET] Creating bridge ${BRIDGE_NAME}..."
+    if ! net_cmd brctl addbr "$BRIDGE_NAME"; then
+        echo "[NET] Failed to create bridge with brctl"
+        return 1
+    fi
+    
+    net_cmd brctl stp "$BRIDGE_NAME" off 2>/dev/null
+    net_cmd brctl setfd "$BRIDGE_NAME" 0 2>/dev/null
+    
+    if ! net_cmd ip addr add "${BRIDGE_IP}/24" dev "$BRIDGE_NAME" 2>/dev/null; then
+        if ! net_cmd ifconfig "$BRIDGE_NAME" "${BRIDGE_IP}" netmask "${BRIDGE_NETMASK}" up 2>/dev/null; then
+            echo "[NET] Failed to assign IP to bridge"
+            net_cmd brctl delbr "$BRIDGE_NAME" 2>/dev/null
+            return 1
+        fi
+    fi
+    
+    if ! net_cmd ip link set "$BRIDGE_NAME" up 2>/dev/null; then
+        if ! net_cmd ifconfig "$BRIDGE_NAME" up 2>/dev/null; then
+            echo "[NET] Failed to bring bridge up"
+            net_cmd brctl delbr "$BRIDGE_NAME" 2>/dev/null
+            return 1
+        fi
+    fi
+    
+    echo "[NET] Bridge created successfully: ${BRIDGE_NAME}"
+    return 0
+}
+
+# --- Setup bridge using ip method ---
+setup_bridge_ip() {
+    echo "[NET] Setting up bridge using 'ip' command..."
+    
+    if ip link show "$BRIDGE_NAME" >/dev/null 2>&1; then
+        echo "[NET] Bridge ${BRIDGE_NAME} already exists"
+        net_cmd ip link set "$BRIDGE_NAME" up 2>/dev/null
+        if ! ip addr show "$BRIDGE_NAME" 2>/dev/null | grep -q "$BRIDGE_IP"; then
+            net_cmd ip addr add "${BRIDGE_IP}/24" dev "$BRIDGE_NAME" 2>/dev/null
+        fi
+        return 0
+    fi
+    
+    if net_cmd ip link add name "$BRIDGE_NAME" type bridge 2>/dev/null; then
+        net_cmd ip addr add "${BRIDGE_IP}/24" dev "$BRIDGE_NAME" 2>/dev/null
+        net_cmd ip link set "$BRIDGE_NAME" up 2>/dev/null
+        return 0
+    fi
+    
+    if command -v brctl >/dev/null 2>&1; then
+        echo "[NET] 'ip' bridge creation failed, trying 'brctl' instead..."
+        if setup_bridge_brctl; then
+            return 0
+        fi
+    fi
+    
+    echo "[NET] All bridge creation methods failed"
+    return 1
+}
+
+# --- Add interface to bridge ---
+add_to_bridge() {
+    local bridge="$1"
+    local tap="$2"
+    local method="$3"
+    
+    case "$method" in
+        ip-bridge)
+            net_cmd ip link set "$tap" master "$bridge" 2>/dev/null
+            ;;
+        brctl)
+            net_cmd brctl addif "$bridge" "$tap" 2>/dev/null
+            ;;
+        *)
+            net_cmd ip link set "$tap" master "$bridge" 2>/dev/null || \
+            net_cmd brctl addif "$bridge" "$tap" 2>/dev/null
+            ;;
+    esac
+}
+
+# --- Setup NAT for internet access ---
+setup_nat() {
+    net_cmd sh -c "echo 1 > /proc/sys/net/ipv4/ip_forward" 2>/dev/null
+    
+    if ! command -v iptables >/dev/null 2>&1; then
+        echo "[NET] iptables not available, VMs will have local network only"
+        return 0
+    fi
+    
+    local out_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+    if [ -z "$out_iface" ]; then
+        out_iface=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $8}' | head -1)
+    fi
+    
+    if [ -n "$out_iface" ]; then
+        if ! net_cmd iptables -t nat -C POSTROUTING -s "${BRIDGE_SUBNET}" -o "${out_iface}" -j MASQUERADE 2>/dev/null; then
+            net_cmd iptables -t nat -A POSTROUTING -s "${BRIDGE_SUBNET}" -o "${out_iface}" -j MASQUERADE 2>/dev/null
+        fi
+    else
+        if ! net_cmd iptables -t nat -C POSTROUTING -s "${BRIDGE_SUBNET}" -j MASQUERADE 2>/dev/null; then
+            net_cmd iptables -t nat -A POSTROUTING -s "${BRIDGE_SUBNET}" -j MASQUERADE 2>/dev/null
+        fi
+    fi
+    
+    net_cmd iptables -C FORWARD -i "$BRIDGE_NAME" -j ACCEPT 2>/dev/null || \
+    net_cmd iptables -A FORWARD -i "$BRIDGE_NAME" -j ACCEPT 2>/dev/null
+    
+    net_cmd iptables -C FORWARD -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null || \
+    net_cmd iptables -A FORWARD -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null
+    
+    net_cmd iptables -C FORWARD -i "$BRIDGE_NAME" -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null || \
+    net_cmd iptables -A FORWARD -i "$BRIDGE_NAME" -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null
+    
+    echo "[NET] NAT configured for internet access"
+}
+
+# --- Main bridge setup orchestration ---
+setup_bridge_network() {
+    echo "[NET] Attempting to set up bridge networking..."
+    
+    if ! check_net_privileges; then
+        echo "[NET] Will use port forwarding instead"
+        return 1
+    fi
+    
+    if ! check_tun_available; then
+        echo "[NET] TUN/TAP not available, will use port forwarding"
+        return 1
+    fi
+    
+    bridge_method=$(detect_bridge_method)
+    if [ "$bridge_method" = "none" ]; then
+        echo "[NET] No bridge utilities found, will use port forwarding"
+        return 1
+    fi
+    
+    echo "[NET] Using bridge method: ${bridge_method}"
+    
+    case "$bridge_method" in
+        ip-bridge)
+            setup_bridge_ip || return 1
+            ;;
+        brctl)
+            setup_bridge_brctl || return 1
+            ;;
+        tap-only)
+            echo "[NET] Using TAP-only mode"
+            if ! create_tap_interface "${TAP_PREFIX}0"; then
+                echo "[NET] Failed to create TAP interface"
+                return 1
+            fi
+            BRIDGE_NAME="${TAP_PREFIX}0"
+            net_cmd ip addr add "${BRIDGE_IP}/24" dev "$BRIDGE_NAME" 2>/dev/null
+            net_cmd ip link set "$BRIDGE_NAME" up 2>/dev/null
+            ;;
+    esac
+    
+    if ! ip link show "$BRIDGE_NAME" >/dev/null 2>&1; then
+        echo "[NET] Bridge interface not found after setup"
+        return 1
+    fi
+    
+    setup_nat
+    
+    echo "[NET] Bridge network ready: ${BRIDGE_NAME} (${BRIDGE_IP}/24)"
+    return 0
+}
+
+# --- NEW: Atomic per‑IP reservation using directories ---
+# Attempts to reserve an IP for the given VM name.
+# Returns: echo "IP" on success, returns 1 on failure.
+reserve_vm_ip() {
+    local vm_name="$1"
+    local candidate=""
+    local lock_dir=""
+    
+    # Try IPs in range; mkdir is atomic – first to create it wins
+    local ip_num="$VM_IP_START"
+    while [ "$ip_num" -le "$VM_IP_END" ]; do
+        candidate="${VM_IP_PREFIX}${ip_num}"
+        lock_dir="${IP_LOCK_DIR}/ip_${candidate}"
+        
+        if mkdir "$lock_dir" 2>/dev/null; then
+            # Successfully reserved this IP. Store reserve info.
+            echo "${vm_name}=${candidate}" >> "/tmp/qemu_vm_ips.txt" 2>/dev/null
+            echo "[NET] Reserved IP: ${candidate} for VM ${vm_name}" >&2
+            echo "$candidate"
+            return 0
+        fi
+        ip_num=$((ip_num + 1))
+    done
+    
+    echo "[NET] No available IPs in range ${VM_IP_PREFIX}${VM_IP_START}-${VM_IP_END}" >&2
+    return 1
+}
+
+# --- Release a previously reserved IP ---
+release_vm_ip() {
+    local ip="$1"
+    if [ -n "$ip" ]; then
+        local lock_dir="${IP_LOCK_DIR}/ip_${ip}"
+        rmdir "$lock_dir" 2>/dev/null
+        # Also clean the record file (best effort)
+        sed -i "/=${ip}$/d" "/tmp/qemu_vm_ips.txt" 2>/dev/null
+    fi
+}
+
+# --- Generate unique TAP name ---
+generate_tap_name() {
+    local vm_identifier="$1"
+    local max_length=15
+    
+    local hash=$(echo "$vm_identifier" | md5sum 2>/dev/null | cut -c1-6 || echo "$vm_identifier" | cksum 2>/dev/null | cut -d' ' -f1 | head -c6)
+    
+    local base_name="${TAP_PREFIX}_${hash}"
+    local tap_name=$(echo "$base_name" | cut -c1-${max_length})
+    
+    echo "$tap_name"
+}
+
+# --- Create VM TAP interface ---
+create_vm_tap() {
+    local tap_name="$1"
+    
+    if ip link show "$tap_name" >/dev/null 2>&1; then
+        echo "[NET] TAP interface ${tap_name} already exists, removing first"
+        delete_tap_interface "$tap_name"
+    fi
+    
+    if ! create_tap_interface "$tap_name"; then
+        return 1
+    fi
+    
+    if [ "$BRIDGE_NAME" != "$tap_name" ]; then
+        add_to_bridge "$BRIDGE_NAME" "$tap_name" "$bridge_method"
+    fi
+    
+    return 0
+}
+
 # --- Smart installation helper for apt-based systems ---
 smart_apt_install() {
     local package="$1"
@@ -388,13 +756,11 @@ smart_apt_install() {
     
     echo "[INSTALL] Installing ${display_name} via apt..."
     
-    # First try: Install without updating package lists (much faster if cache is recent)
     if apt-get install -y -qq "$package" 2>/dev/null; then
         echo "[INSTALL] ${display_name} installed successfully (no update needed)"
         return 0
     fi
     
-    # Second try: Update package lists and retry (only if first attempt failed)
     echo "[INSTALL] Direct install failed, updating package lists and retrying..."
     if apt-get update -qq && apt-get install -y -qq "$package"; then
         echo "[INSTALL] ${display_name} installed successfully (after update)"
@@ -504,12 +870,10 @@ find_available_port() {
     return 1
 }
 
-# --- Helper: Test if a specific port can be bound ---
 test_port_binding() {
     local port="$1"
     local timeout=2
     
-    # Try to actually bind to the port temporarily to verify it's free
     if command -v timeout >/dev/null 2>&1; then
         timeout "$timeout" nc -l -p "$port" 2>/dev/null &
     else
@@ -519,12 +883,10 @@ test_port_binding() {
     sleep 0.5
     
     if kill -0 "$nc_pid" 2>/dev/null; then
-        # Port is bindable
         kill "$nc_pid" 2>/dev/null
         wait "$nc_pid" 2>/dev/null
         return 0
     else
-        # Port is in use
         wait "$nc_pid" 2>/dev/null
         return 1
     fi
@@ -542,58 +904,192 @@ resize_disk() {
     echo "[RESIZE] Disk resized successfully to ${target_size}"
 }
 
+# --- Improved password hash generator (fixes Ubuntu root login) ---
+generate_password_hash() {
+    local pass="$1"
+    local hash=""
+    
+    # Try python3 (crypt) first – widely available and reliable
+    if command -v python3 >/dev/null 2>&1; then
+        hash=$(python3 -c "import crypt; print(crypt.crypt('${pass}', crypt.mksalt(crypt.METHOD_SHA512)))" 2>/dev/null)
+        if [ -n "$hash" ]; then
+            echo "$hash"
+            return 0
+        fi
+    fi
+    
+    # Try mkpasswd (from package 'whois')
+    if command -v mkpasswd >/dev/null 2>&1; then
+        hash=$(echo "${pass}" | mkpasswd --method=sha-512 --stdin 2>/dev/null)
+        if [ -n "$hash" ]; then
+            echo "$hash"
+            return 0
+        fi
+    fi
+    
+    # Try openssl passwd (fallback)
+    if command -v openssl >/dev/null 2>&1; then
+        hash=$(echo "${pass}" | openssl passwd -6 -stdin 2>/dev/null)
+        if [ -n "$hash" ]; then
+            echo "$hash"
+            return 0
+        fi
+    fi
+    
+    echo "ERROR: No tool found to generate a SHA-512 password hash." >&2
+    echo "Please install python3, whois (mkpasswd), or openssl." >&2
+    exit 1
+}
+
+# --- Create cloud-init ISO with OS-specific network configuration ---
 create_cloud_init_iso() {
     local target_dir="$1"
+    local vm_ip="$2"  # static IP for bridge mode (empty for DHCP)
+    local os_type="$3"
     
-    # Convert to absolute path
     target_dir=$(cd "$target_dir" 2>/dev/null && pwd || echo "$target_dir")
     local iso_path="${target_dir}/${ISO_FILE}"
     
-    # Skip if ISO already exists
     if [ -f "${iso_path}" ]; then
         echo "[ISO] Cloud-init ISO already exists, skipping creation"
         return 0
     fi
     
-    echo "[ISO] Creating cloud-init ISO..."
+    echo "[ISO] Creating cloud-init ISO for ${os_type}..."
     local workdir="${target_dir}/cloud-init-source"
     mkdir -p "${workdir}"
     
     cd "${workdir}" || exit 1
-
-    cat > user-data << CLOUDEOF
+    
+    # Hostname
+    local vm_hostname="${HOSTNAME_PREFIX}-vm"
+    if [ -n "$vm_ip" ]; then
+        local ip_suffix=$(echo "$vm_ip" | cut -d'.' -f4)
+        vm_hostname="${HOSTNAME_PREFIX}-vm-${ip_suffix}"
+    fi
+    
+    cat > meta-data << METAEOF
+instance-id: ${vm_hostname}-$(date +%s)
+local-hostname: ${vm_hostname}
+METAEOF
+    
+    # Generate a solid password hash
+    local pass_hash=$(generate_password_hash "$DEFAULT_PASSWORD")
+    
+    # Common SSH configuration for root login
+    local ssh_write_files='write_files:
+  - path: /etc/ssh/sshd_config.d/99-enable-root-login.conf
+    content: |
+      PermitRootLogin yes
+      PasswordAuthentication yes
+    permissions: "0644"
+    owner: root:root'
+    
+    # Network and user-data differ by OS
+    if [ "$os_type" = "ubuntu" ]; then
+        if [ -n "$vm_ip" ]; then
+            # Ubuntu static IP (netplan)
+            cat > network-config << NETEOF
+version: 2
+ethernets:
+  eth0:
+    dhcp4: false
+    addresses:
+      - ${vm_ip}/24
+    routes:
+      - to: default
+        via: ${BRIDGE_IP}
+    nameservers:
+      addresses:
+        - 8.8.8.8
+        - 1.1.1.1
+NETEOF
+            echo "[ISO] Ubuntu static IP configured: ${vm_ip}/24"
+        else
+            cat > network-config << NETEOF
+version: 2
+ethernets:
+  eth0:
+    dhcp4: true
+NETEOF
+        fi
+        
+        cat > user-data << CLOUDEOF
 #cloud-config
-password: ${DEFAULT_PASSWORD}
+password: ${pass_hash}
 chpasswd:
   expire: False
 ssh_pwauth: True
 
 # Enable root login
+users:
+  - name: ${CLOUD_USER}
+    lock_passwd: false
+    passwd: ${pass_hash}
+
+disable_root: false
+
+${ssh_write_files}
+
+# Run network commands on first boot
+runcmd:
+  - netplan apply
+  - systemctl restart ssh 2>/dev/null || service ssh restart 2>/dev/null || true
+  - systemctl restart networking 2>/dev/null || service networking restart 2>/dev/null || true
+CLOUDEOF
+    else
+        # Alpine
+        if [ -n "$vm_ip" ]; then
+            cat > network-config << NETEOF
+version: 2
+ethernets:
+  eth0:
+    dhcp4: false
+    addresses:
+      - ${vm_ip}/24
+    gateway4: ${BRIDGE_IP}
+    nameservers:
+      addresses:
+        - 8.8.8.8
+        - 1.1.1.1
+NETEOF
+            echo "[ISO] Alpine static IP configured: ${vm_ip}/24"
+        else
+            cat > network-config << NETEOF
+version: 2
+ethernets:
+  eth0:
+    dhcp4: true
+NETEOF
+        fi
+        
+        cat > user-data << CLOUDEOF
+#cloud-config
+password: ${pass_hash}
+chpasswd:
+  expire: False
+ssh_pwauth: True
+
 user: ${CLOUD_USER}
 disable_root: false
 
-# Configure SSH for root login
-write_files:
-  - path: /etc/ssh/sshd_config.d/99-enable-root-login.conf
-    content: |
-      PermitRootLogin yes
-      PasswordAuthentication yes
-    permissions: '0644'
-    owner: root:root
+${ssh_write_files}
 
 runcmd:
+  - echo "nameserver 8.8.8.8" > /etc/resolv.conf
+  - echo "nameserver 1.1.1.1" >> /etc/resolv.conf
   - systemctl restart ssh 2>/dev/null || service ssh restart 2>/dev/null || /etc/init.d/sshd restart 2>/dev/null || true
+  - systemctl restart networking 2>/dev/null || service networking restart 2>/dev/null || /etc/init.d/networking restart 2>/dev/null || true
 CLOUDEOF
-
-    cat > meta-data << METAEOF
-instance-id: ${HOSTNAME_PREFIX}-cloudimg-$(date +%s)
-local-hostname: ${HOSTNAME_PREFIX}-vm
-METAEOF
-
-    # Use full path for output
-    genisoimage -output "${iso_path}" -volid cidata -joliet -rock user-data meta-data
+    fi
     
-    # Check if genisoimage succeeded
+    # Build ISO
+    if [ -f network-config ]; then
+        genisoimage -output "${iso_path}" -volid cidata -joliet -rock user-data meta-data network-config 2>/dev/null
+    else
+        genisoimage -output "${iso_path}" -volid cidata -joliet -rock user-data meta-data 2>/dev/null
+    fi
+    
     if [ $? -ne 0 ]; then
         echo "ERROR: genisoimage failed"
         cd "${target_dir}" || exit 1
@@ -601,7 +1097,6 @@ METAEOF
         exit 1
     fi
     
-    # Return to target directory and cleanup
     cd "${target_dir}" || exit 1
     rm -rf "${workdir}"
     
@@ -620,8 +1115,10 @@ run_vm_with_retry() {
     local vm_memory="$4"
     local use_kvm="$5"
     local cpu_cores="$6"
+    local use_bridge="$7"
+    local vm_ip="$8"
+    local tap_name="$9"
     
-    # Convert to absolute paths safely
     if [ -d "$(dirname "$img_path")" ]; then
         img_path=$(cd "$(dirname "$img_path")" && pwd)/$(basename "$img_path")
     else
@@ -634,11 +1131,8 @@ run_vm_with_retry() {
         iso_path="$(pwd)/${iso_path#./}"
     fi
     
-    # Verify files exist before running
     if [ ! -f "${img_path}" ]; then
         echo "ERROR: Disk image not found: ${img_path}"
-        echo "Current directory: $(pwd)"
-        echo "Expected image: ${img_path}"
         exit 1
     fi
     if [ ! -f "${iso_path}" ]; then
@@ -646,46 +1140,80 @@ run_vm_with_retry() {
         exit 1
     fi
     
-    # Build QEMU command arguments (without port)
-    local qemu_args="-drive file=${img_path},format=qcow2,if=virtio"
-    qemu_args="${qemu_args} -cdrom ${iso_path}"
-    qemu_args="${qemu_args} -m ${vm_memory}"
-    qemu_args="${qemu_args} -smp ${cpu_cores}"
-    qemu_args="${qemu_args} -device virtio-net,netdev=net0"
-    qemu_args="${qemu_args} -nographic"
-    
-    # Add KVM if available and requested
-    if [ "$use_kvm" = "true" ]; then
-        qemu_args="${qemu_args} -enable-kvm"
+    # Bridge mode
+    if [ "$use_bridge" = "true" ] && [ -n "$vm_ip" ]; then
+        echo "[VM] Starting QEMU with BRIDGE networking:"
+        echo "  OS:      ${SELECTED_OS}"
+        echo "  Disk:    ${img_path}"
+        echo "  RAM:     ${vm_memory}MB"
+        echo "  CPU:     ${cpu_cores} core(s)"
+        echo "  Network: Bridge ${BRIDGE_NAME}"
+        echo "  TAP:     ${tap_name}"
+        echo "  VM IP:   ${vm_ip}"
+        echo "  SSH:     ssh root@${vm_ip}"
+        if [ "$use_kvm" = "true" ]; then
+            echo "  KVM:     enabled"
+        else
+            echo "  KVM:     disabled"
+        fi
+        echo ""
+        
+        qemu-system-x86_64 \
+            -drive file="${img_path}",format=qcow2,if=virtio \
+            -cdrom "${iso_path}" \
+            -m "${vm_memory}" \
+            -smp "${cpu_cores}" \
+            -netdev tap,id=net0,ifname="${tap_name}",script=no,downscript=no \
+            -device virtio-net,netdev=net0 \
+            -nographic \
+            $([ "$use_kvm" = "true" ] && echo "-enable-kvm") \
+            2>/tmp/qemu_error_$$.log
+        
+        local qemu_exit_code=$?
+        
+        if [ $qemu_exit_code -ne 0 ] && [ -f /tmp/qemu_error_$$.log ]; then
+            echo "[NET] Bridge mode failed, falling back to port forwarding..."
+            cat /tmp/qemu_error_$$.log >&2
+            rm -f /tmp/qemu_error_$$.log
+            delete_tap_interface "$tap_name"
+            # Release bridge IP reservation (bridge failed, so fallback doesn't need it)
+            release_vm_ip "$vm_ip"
+            use_bridge="false"
+            # Fall through to port forwarding below
+        else
+            rm -f /tmp/qemu_error_$$.log
+            delete_tap_interface "$tap_name"
+            # The EXIT trap will release IP lock for us
+            return $qemu_exit_code
+        fi
     fi
     
+    # Port forwarding mode (fallback or explicit)
     local attempt=1
     local current_port="$initial_port"
     
     while [ "$attempt" -le "$MAX_RETRY_ATTEMPTS" ]; do
         echo "[RETRY] Attempt ${attempt}/${MAX_RETRY_ATTEMPTS} with port ${current_port}"
         
-        echo "[VM] Starting QEMU with:"
+        echo "[VM] Starting QEMU with port forwarding:"
         echo "  OS:    ${SELECTED_OS}"
         echo "  Disk:  ${img_path}"
-        echo "  ISO:   ${iso_path}"
         echo "  RAM:   ${vm_memory}MB"
         echo "  CPU:   ${cpu_cores} core(s)"
         echo "  Port:  localhost:${current_port} -> VM:22"
         if [ "$use_kvm" = "true" ]; then
             echo "  KVM:   enabled"
         else
-            echo "  KVM:   disabled (using emulation)"
+            echo "  KVM:   disabled"
         fi
+        echo ""
         
-        # Verify port is still free before attempting (with actual bind test)
         local port_available=false
         if test_port_binding "$current_port"; then
             port_available=true
         fi
         
         if [ "$port_available" = "true" ]; then
-            # Try to run QEMU with this port
             qemu-system-x86_64 \
                 -drive file="${img_path}",format=qcow2,if=virtio \
                 -cdrom "${iso_path}" \
@@ -699,65 +1227,45 @@ run_vm_with_retry() {
             
             local qemu_exit_code=$?
             
-            # Check if the error was port-related
             if [ $qemu_exit_code -ne 0 ] && [ -f /tmp/qemu_error_$$.log ]; then
                 if grep -q "Could not set up host forward" /tmp/qemu_error_$$.log; then
-                    echo "[RETRY] Port ${current_port} binding failed (race condition), retrying..."
                     rm -f /tmp/qemu_error_$$.log
-                    
                     if [ "$attempt" -lt "$MAX_RETRY_ATTEMPTS" ]; then
-                        # Find a new available port
                         local new_port=$(find_available_port $((current_port + 1)))
                         if [ $? -eq 0 ]; then
-                            echo "[RETRY] Found new port: ${new_port}"
                             current_port="$new_port"
                         else
-                            echo "[RETRY] No alternative ports available"
-                            attempt="$MAX_RETRY_ATTEMPTS"  # Force exit
+                            attempt="$MAX_RETRY_ATTEMPTS"
                         fi
-                        
-                        echo "[RETRY] Waiting ${RETRY_DELAY_SECONDS}s before next attempt..."
                         sleep "$RETRY_DELAY_SECONDS"
                         attempt=$((attempt + 1))
                         continue
                     else
-                        echo "ERROR: Failed to start VM after ${MAX_RETRY_ATTEMPTS} attempts"
-                        echo "Last error: Port binding conflict"
-                        rm -f /tmp/qemu_error_$$.log
+                        echo "ERROR: Failed after ${MAX_RETRY_ATTEMPTS} attempts"
                         return 1
                     fi
                 else
-                    # Some other error occurred
-                    echo "ERROR: QEMU failed with error:"
+                    echo "ERROR: QEMU failed:"
                     cat /tmp/qemu_error_$$.log
                     rm -f /tmp/qemu_error_$$.log
                     return 1
                 fi
             fi
             
-            # QEMU started successfully or exited normally
             rm -f /tmp/qemu_error_$$.log
             return $qemu_exit_code
         else
-            echo "[RETRY] Port ${current_port} is not available (bind test failed), finding new port..."
-            
             if [ "$attempt" -lt "$MAX_RETRY_ATTEMPTS" ]; then
-                # Find a new available port
                 local new_port=$(find_available_port $((current_port + 1)))
                 if [ $? -eq 0 ]; then
-                    echo "[RETRY] Found new port: ${new_port}"
                     current_port="$new_port"
                 else
-                    echo "[RETRY] No alternative ports available"
-                    attempt="$MAX_RETRY_ATTEMPTS"  # Force exit
+                    attempt="$MAX_RETRY_ATTEMPTS"
                 fi
-                
-                echo "[RETRY] Waiting ${RETRY_DELAY_SECONDS}s before next attempt..."
                 sleep "$RETRY_DELAY_SECONDS"
                 attempt=$((attempt + 1))
             else
-                echo "ERROR: Failed to start VM after ${MAX_RETRY_ATTEMPTS} attempts"
-                echo "Last error: Port ${current_port} not available"
+                echo "ERROR: Failed after ${MAX_RETRY_ATTEMPTS} attempts"
                 return 1
             fi
         fi
@@ -772,7 +1280,13 @@ CUSTOM_PORT=""
 VM_NAME=""
 DISK_SIZE="${DEFAULT_DISK_SIZE}"
 CUSTOM_MEMORY=""
-CUSTOM_CPU_CORES=""  # Initialize as empty (will use default if not specified)
+CUSTOM_CPU_CORES=""
+NO_KVM=""
+NO_BRIDGE=""
+USE_BRIDGE="false"
+VM_IP=""
+TAP_NAME=""
+bridge_method=""
 
 # Parse arguments
 while [ $# -gt 0 ]; do
@@ -788,15 +1302,6 @@ while [ $# -gt 0 ]; do
             SELECTED_OS="ubuntu"
             shift
             ;;
-        # Add more OS flags here as needed:
-        # --debian)
-        #     SELECTED_OS="debian"
-        #     shift
-        #     ;;
-        # --fedora)
-        #     SELECTED_OS="fedora"
-        #     shift
-        #     ;;
         --port)
             if [ -n "$2" ] && [ "$2" -eq "$2" ] 2>/dev/null; then
                 CUSTOM_PORT="$2"
@@ -837,6 +1342,10 @@ while [ $# -gt 0 ]; do
             NO_KVM="true"
             shift
             ;;
+        --no-bridge)
+            NO_BRIDGE="true"
+            shift
+            ;;
         --retry-attempts)
             if [ -n "$2" ] && [ "$2" -eq "$2" ] 2>/dev/null; then
                 MAX_RETRY_ATTEMPTS="$2"
@@ -865,7 +1374,6 @@ while [ $# -gt 0 ]; do
                 exit 0
             else
                 echo "ERROR: delete requires a VM name"
-                echo "Usage: $0 delete <vm-name>"
                 exit 1
             fi
             ;;
@@ -875,8 +1383,7 @@ while [ $# -gt 0 ]; do
                 shift
             else
                 echo "ERROR: Unknown argument: $1"
-                echo "Usage: $0 [--alpine|--ubuntu] [vm-name] [--port N] [--size SIZE] [--memory MB] [--cpu N] [--no-kvm] [--retry-attempts N] [--retry-delay SECONDS]"
-                echo "Try: $0 --help for more information"
+                echo "Try: $0 --help"
                 exit 1
             fi
             ;;
@@ -886,6 +1393,44 @@ done
 # Load OS configuration
 echo "[SETUP] Selected OS: ${SELECTED_OS}"
 get_os_config "$SELECTED_OS"
+
+# --- Network Setup ---
+if [ "$NO_BRIDGE" = "true" ]; then
+    echo "[NET] Bridge disabled by user (--no-bridge)"
+    USE_BRIDGE="false"
+else
+    if setup_bridge_network; then
+        # Unique identifier for IP reservation
+        vm_identifier="${VM_NAME:-temp-$$}"
+        
+        # Reserve IP atomically via directory lock
+        VM_IP=$(reserve_vm_ip "$vm_identifier")
+        if [ -n "$VM_IP" ]; then
+            TAP_NAME=$(generate_tap_name "${vm_identifier}-$(date +%s)")
+            if create_vm_tap "$TAP_NAME"; then
+                USE_BRIDGE="true"
+                echo ""
+                echo "=============================================================="
+                echo "  BRIDGE NETWORKING ENABLED"
+                echo "  VM IP: ${VM_IP}"
+                echo "  TAP:   ${TAP_NAME}"
+                echo "  SSH:   ssh root@${VM_IP}"
+                echo "=============================================================="
+                echo ""
+            else
+                echo "[NET] Failed to create TAP interface, releasing IP and using port forwarding"
+                release_vm_ip "$VM_IP"
+                VM_IP=""
+                USE_BRIDGE="false"
+            fi
+        else
+            echo "[NET] Could not assign an IP, using port forwarding"
+            USE_BRIDGE="false"
+        fi
+    else
+        USE_BRIDGE="false"
+    fi
+fi
 
 # Determine KVM usage
 if [ "$NO_KVM" = "true" ]; then
@@ -899,7 +1444,7 @@ else
     fi
 fi
 
-# Validate and set CPU cores
+# Validate CPU cores
 if [ -n "$CUSTOM_CPU_CORES" ]; then
     VM_CPU_CORES=$(validate_cpu_cores "$CUSTOM_CPU_CORES")
 else
@@ -907,110 +1452,101 @@ else
     echo "[CPU] Using default CPU cores: ${VM_CPU_CORES} (host has $(get_host_cpu_cores))"
 fi
 
-# Calculate VM memory based on host availability and OS type
-# Redirect stderr to stdout temporarily to capture the memory value
+# Calculate VM memory
 VM_MEMORY=$(calculate_vm_memory "$CUSTOM_MEMORY" "$SELECTED_OS" 2>&1)
 MEMORY_EXIT_CODE=$?
-# Display the informational messages that were on stderr
 echo "$VM_MEMORY" | while IFS= read -r line; do
     if echo "$line" | grep -qE '^\[MEMORY\]|^\[WARNING\]'; then
         echo "$line" >&2
     fi
 done
-# Get just the number (last line)
 VM_MEMORY=$(echo "$VM_MEMORY" | tail -n1)
-
 if [ "$MEMORY_EXIT_CODE" -ne 0 ]; then
     exit 1
 fi
 
-# Determine starting port for search
-if [ -n "$CUSTOM_PORT" ]; then
-    START_PORT="$CUSTOM_PORT"
-    echo "[PORT] Searching for available port starting from custom port: ${START_PORT}"
+# Port setup (only needed for non-bridge mode)
+if [ "$USE_BRIDGE" = "false" ]; then
+    if [ -n "$CUSTOM_PORT" ]; then
+        START_PORT="$CUSTOM_PORT"
+    else
+        START_PORT="$SSH_BASE_PORT"
+    fi
+    echo "[PORT] Searching for available port starting from: ${START_PORT}"
+    
+    SSH_PORT=$(find_available_port "$START_PORT")
+    if [ $? -ne 0 ]; then
+        echo "$SSH_PORT"
+        exit 1
+    fi
+    
+    echo "[PORT] Using: ${SSH_PORT}"
 else
-    START_PORT="$SSH_BASE_PORT"
-    echo "[PORT] Searching for available port starting from default port: ${START_PORT}"
+    SSH_PORT="$SSH_BASE_PORT"
 fi
 
-# Find available port with fallback
-SSH_PORT=$(find_available_port "$START_PORT")
-if [ $? -ne 0 ]; then
-    echo "$SSH_PORT"
-    exit 1
-fi
-
-if [ "$SSH_PORT" != "$START_PORT" ]; then
-    echo "[PORT] Port ${START_PORT} is in use, using fallback port: ${SSH_PORT}"
-else
-    echo "[PORT] Using port: ${SSH_PORT}"
-fi
-
-# Store the absolute path of the current directory
+# Store base directory
 BASE_DIR=$(pwd)
 
-# Ensure base image exists in current directory for reuse
+# Ensure base image exists
 if [ ! -f "${BASE_DIR}/${IMG_FILE}" ]; then
-    echo "[SETUP] Downloading ${SELECTED_OS} base cloud image (will be cached for future use)..."
+    echo "[SETUP] Downloading ${SELECTED_OS} base cloud image..."
     wget -q --show-progress "${IMG_URL}" -O "${BASE_DIR}/${IMG_FILE}" || {
         echo "ERROR: Failed to download image from ${IMG_URL}"
         exit 1
     }
-    echo "[SETUP] Base image cached as: ${BASE_DIR}/${IMG_FILE}"
+    echo "[SETUP] Base image cached: ${BASE_DIR}/${IMG_FILE}"
 else
     echo "[SETUP] Using cached base image: ${BASE_DIR}/${IMG_FILE}"
 fi
 
+# Cleanup function: releases IP lock and removes temporary files
+cleanup_vm() {
+    if [ "$USE_BRIDGE" = "true" ] && [ -n "$VM_IP" ]; then
+        release_vm_ip "$VM_IP"
+        delete_tap_interface "$TAP_NAME"
+    fi
+    
+    if [ -z "$VM_NAME" ] && [ -n "$TMPDIR" ]; then
+        echo "[TEMP MODE] Cleaning up temporary files..."
+        rm -rf "${TMPDIR}"
+    fi
+}
+trap cleanup_vm EXIT
+
 if [ -z "$VM_NAME" ]; then
-    # Temporary mode - everything in /tmp, destroyed after exit
+    # Temporary mode
     TMPDIR=$(mktemp -d /tmp/${HOSTNAME_PREFIX}-vm-tmp.XXXXXX)
     echo "[TEMP MODE] Using temporary directory: ${TMPDIR}"
     echo "[TEMP MODE] All data will be lost when VM shuts down"
     
-    # Copy base image to temporary directory
-    echo "[TEMP MODE] Copying base image..."
     cp "${BASE_DIR}/${IMG_FILE}" "${TMPDIR}/${IMG_FILE}"
-    
-    # Resize disk before first use
     resize_disk "${TMPDIR}/${IMG_FILE}" "${DISK_SIZE}"
     
-    # Create cloud-init ISO
-    create_cloud_init_iso "${TMPDIR}"
+    create_cloud_init_iso "${TMPDIR}" "$VM_IP" "$OS_TYPE"
     
-    # Run VM with retry logic
-    run_vm_with_retry "${TMPDIR}/${IMG_FILE}" "${TMPDIR}/${ISO_FILE}" "${SSH_PORT}" "${VM_MEMORY}" "${USE_KVM}" "${VM_CPU_CORES}"
-    
-    # Cleanup
-    echo "[TEMP MODE] Cleaning up temporary files..."
-    rm -rf "${TMPDIR}"
-    
+    run_vm_with_retry "${TMPDIR}/${IMG_FILE}" "${TMPDIR}/${ISO_FILE}" "${SSH_PORT}" "${VM_MEMORY}" "${USE_KVM}" "${VM_CPU_CORES}" "${USE_BRIDGE}" "${VM_IP}" "${TAP_NAME}"
 else
-    # Persistent mode - data survives between runs
+    # Persistent mode
     VMDIR="${BASE_DIR}/${HOSTNAME_PREFIX}-vm-${VM_NAME}"
     
     if [ ! -d "${VMDIR}" ]; then
-        # First run with this name - create directory and copy base image
         echo "[PERSISTENT MODE] Creating new VM: ${VM_NAME} at ${VMDIR}"
         mkdir -p "${VMDIR}"
     else
-        echo "[PERSISTENT MODE] Using existing VM directory: ${VM_NAME}"
+        echo "[PERSISTENT MODE] Using existing VM: ${VM_NAME}"
     fi
     
-    # Ensure disk image exists in the VM directory
     if [ ! -f "${VMDIR}/${IMG_FILE}" ]; then
         echo "[PERSISTENT MODE] Copying base image..."
         cp "${BASE_DIR}/${IMG_FILE}" "${VMDIR}/${IMG_FILE}"
-        
-        # Resize disk only on first creation
         resize_disk "${VMDIR}/${IMG_FILE}" "${DISK_SIZE}"
     else
         echo "[PERSISTENT MODE] Using existing disk image (size preserved)"
     fi
     
-    # Ensure cloud-init ISO exists (creates if missing, even on resume)
-    create_cloud_init_iso "${VMDIR}"
+    create_cloud_init_iso "${VMDIR}" "$VM_IP" "$OS_TYPE"
     
-    # Run VM with retry logic and persistent data
-    run_vm_with_retry "${VMDIR}/${IMG_FILE}" "${VMDIR}/${ISO_FILE}" "${SSH_PORT}" "${VM_MEMORY}" "${USE_KVM}" "${VM_CPU_CORES}"
+    run_vm_with_retry "${VMDIR}/${IMG_FILE}" "${VMDIR}/${ISO_FILE}" "${SSH_PORT}" "${VM_MEMORY}" "${USE_KVM}" "${VM_CPU_CORES}" "${USE_BRIDGE}" "${VM_IP}" "${TAP_NAME}"
     echo "[PERSISTENT MODE] VM data preserved in: ${VMDIR}"
 fi
