@@ -24,6 +24,15 @@ VM_IP_PREFIX="10.10.10."
 VM_IP_START=10
 VM_IP_END=99
 
+# NEW: Alternative subnet for nested VMs
+NESTED_BRIDGE_IP="10.10.11.1"
+NESTED_BRIDGE_NETMASK="255.255.255.0"
+NESTED_BRIDGE_SUBNET="10.10.11.0/24"
+NESTED_VM_IP_PREFIX="10.10.11."
+NESTED_VM_IP_START=10
+NESTED_VM_IP_END=99
+IS_NESTED="false"
+
 # --- IP Lock Directory (per‑IP atomic reservation) ---
 IP_LOCK_DIR="/tmp/qemu_vm_ip_locks"
 mkdir -p "$IP_LOCK_DIR" 2>/dev/null
@@ -597,9 +606,20 @@ setup_nat() {
         return 0
     fi
     
-    local out_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
-    if [ -z "$out_iface" ]; then
-        out_iface=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $8}' | head -1)
+    local out_iface=""
+    
+    if [ "$IS_NESTED" = "true" ]; then
+        # In nested mode, find our default route interface (to parent network)
+        out_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+        if [ -z "$out_iface" ]; then
+            out_iface=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $8}' | head -1)
+        fi
+        echo "[NET] Nested NAT: ${BRIDGE_SUBNET} -> ${out_iface} (parent network)"
+    else
+        out_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+        if [ -z "$out_iface" ]; then
+            out_iface=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $8}' | head -1)
+        fi
     fi
     
     if [ -n "$out_iface" ]; then
@@ -624,6 +644,16 @@ setup_nat() {
     echo "[NET] NAT configured for internet access"
 }
 
+# --- Detect if we're running inside a VM with our bridge subnet ---
+detect_nested_environment() {
+    if ip route show 2>/dev/null | grep -q "via ${BRIDGE_IP} "; then
+        echo "[NET] Detected nested environment (parent uses ${BRIDGE_SUBNET})"
+        return 0
+    fi
+    return 1
+}
+
+
 # --- Main bridge setup orchestration ---
 setup_bridge_network() {
     echo "[NET] Attempting to set up bridge networking..."
@@ -636,6 +666,19 @@ setup_bridge_network() {
     if ! check_tun_available; then
         echo "[NET] TUN/TAP not available, will use port forwarding"
         return 1
+    fi
+    
+    # Detect nested environment and switch to alternative subnet
+    if detect_nested_environment; then
+        IS_NESTED="true"
+        BRIDGE_NAME="qemubr1"
+        BRIDGE_IP="$NESTED_BRIDGE_IP"
+        BRIDGE_NETMASK="$NESTED_BRIDGE_NETMASK"
+        BRIDGE_SUBNET="$NESTED_BRIDGE_SUBNET"
+        VM_IP_PREFIX="$NESTED_VM_IP_PREFIX"
+        VM_IP_START="$NESTED_VM_IP_START"
+        VM_IP_END="$NESTED_VM_IP_END"
+        echo "[NET] Using nested subnet: ${BRIDGE_SUBNET}"
     fi
     
     bridge_method=$(detect_bridge_method)
@@ -668,6 +711,15 @@ setup_bridge_network() {
     if ! ip link show "$BRIDGE_NAME" >/dev/null 2>&1; then
         echo "[NET] Bridge interface not found after setup"
         return 1
+    fi
+    
+    # In nested mode, add a route to reach parent's network through the correct interface
+    if [ "$IS_NESTED" = "true" ]; then
+        # Find the interface that has the parent's subnet
+        local parent_iface=$(ip route show 2>/dev/null | grep "via ${NESTED_BRIDGE_IP%%1}1" | awk '{print $3}' | head -1 || ip route show default 2>/dev/null | awk '{print $5}')
+        if [ -n "$parent_iface" ]; then
+            echo "[NET] Setting up NAT for nested subnet via ${parent_iface}"
+        fi
     fi
     
     setup_nat
