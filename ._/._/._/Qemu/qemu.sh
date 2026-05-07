@@ -24,6 +24,15 @@ VM_IP_PREFIX="10.10.10."
 VM_IP_START=10
 VM_IP_END=99
 
+# NEW: Alternative subnet for nested VMs
+NESTED_BRIDGE_IP="10.10.11.1"
+NESTED_BRIDGE_NETMASK="255.255.255.0"
+NESTED_BRIDGE_SUBNET="10.10.11.0/24"
+NESTED_VM_IP_PREFIX="10.10.11."
+NESTED_VM_IP_START=10
+NESTED_VM_IP_END=99
+IS_NESTED="false"
+
 # --- IP Lock Directory (per‑IP atomic reservation) ---
 IP_LOCK_DIR="/tmp/qemu_vm_ip_locks"
 mkdir -p "$IP_LOCK_DIR" 2>/dev/null
@@ -590,39 +599,90 @@ add_to_bridge() {
 
 # --- Setup NAT for internet access ---
 setup_nat() {
-    net_cmd sh -c "echo 1 > /proc/sys/net/ipv4/ip_forward" 2>/dev/null
+    echo "[NET] Configuring NAT..."
     
     if ! command -v iptables >/dev/null 2>&1; then
         echo "[NET] iptables not available, VMs will have local network only"
         return 0
     fi
     
-    local out_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+    local out_iface=""
+    
+    # Find outbound interface
+    out_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
     if [ -z "$out_iface" ]; then
         out_iface=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $8}' | head -1)
     fi
     
-    if [ -n "$out_iface" ]; then
-        if ! net_cmd iptables -t nat -C POSTROUTING -s "${BRIDGE_SUBNET}" -o "${out_iface}" -j MASQUERADE 2>/dev/null; then
-            net_cmd iptables -t nat -A POSTROUTING -s "${BRIDGE_SUBNET}" -o "${out_iface}" -j MASQUERADE 2>/dev/null
+    if [ -z "$out_iface" ]; then
+        echo "[NET] WARNING: Could not detect outbound interface"
+        out_iface=$(ip link show 2>/dev/null | grep -E '^[0-9]+: (eth|ens|enp)' | head -1 | awk -F': ' '{print $2}')
+        if [ -z "$out_iface" ]; then
+            echo "[NET] ERROR: No network interface found"
+            return 1
         fi
-    else
-        if ! net_cmd iptables -t nat -C POSTROUTING -s "${BRIDGE_SUBNET}" -j MASQUERADE 2>/dev/null; then
-            net_cmd iptables -t nat -A POSTROUTING -s "${BRIDGE_SUBNET}" -j MASQUERADE 2>/dev/null
-        fi
+        echo "[NET] Using guessed interface: ${out_iface}"
     fi
     
-    net_cmd iptables -C FORWARD -i "$BRIDGE_NAME" -j ACCEPT 2>/dev/null || \
-    net_cmd iptables -A FORWARD -i "$BRIDGE_NAME" -j ACCEPT 2>/dev/null
+    echo "[NET] Outbound interface: ${out_iface}"
+    echo "[NET] Bridge subnet: ${BRIDGE_SUBNET}"
     
-    net_cmd iptables -C FORWARD -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null || \
-    net_cmd iptables -A FORWARD -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null
+    # CRITICAL: Enable IP forwarding using sysctl (more reliable than echo)
+    if command -v sysctl >/dev/null 2>&1; then
+        net_cmd sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+        net_cmd sysctl -w net.ipv4.conf.all.forwarding=1 >/dev/null 2>&1
+        net_cmd sysctl -w net.ipv4.conf.${out_iface}.forwarding=1 >/dev/null 2>&1
+        net_cmd sysctl -w net.ipv4.conf.${BRIDGE_NAME}.forwarding=1 >/dev/null 2>&1
+        echo "[NET] Enabled IP forwarding via sysctl"
+    else
+        # Fallback to echo with explicit sudo
+        if [ "$(id -u)" = "0" ]; then
+            echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null
+            echo 1 > /proc/sys/net/ipv4/conf/all/forwarding 2>/dev/null
+            echo 1 > /proc/sys/net/ipv4/conf/${out_iface}/forwarding 2>/dev/null
+            echo 1 > /proc/sys/net/ipv4/conf/${BRIDGE_NAME}/forwarding 2>/dev/null
+        else
+            sudo sh -c "echo 1 > /proc/sys/net/ipv4/ip_forward" 2>/dev/null
+            sudo sh -c "echo 1 > /proc/sys/net/ipv4/conf/all/forwarding" 2>/dev/null
+            sudo sh -c "echo 1 > /proc/sys/net/ipv4/conf/${out_iface}/forwarding" 2>/dev/null
+            sudo sh -c "echo 1 > /proc/sys/net/ipv4/conf/${BRIDGE_NAME}/forwarding" 2>/dev/null
+        fi
+        echo "[NET] Enabled IP forwarding via proc"
+    fi
     
-    net_cmd iptables -C FORWARD -i "$BRIDGE_NAME" -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null || \
-    net_cmd iptables -A FORWARD -i "$BRIDGE_NAME" -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null
+    # Verify forwarding is enabled
+    local ip_forward_status=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)
+    if [ "$ip_forward_status" != "1" ]; then
+        echo "[NET] WARNING: Failed to enable IP forwarding (status: ${ip_forward_status})"
+        echo "[NET] Try running manually: sudo sysctl -w net.ipv4.ip_forward=1"
+    else
+        echo "[NET] IP forwarding verified: enabled"
+    fi
+    
+    # Remove duplicate rules first to avoid clutter
+    net_cmd iptables -D FORWARD -i "$BRIDGE_NAME" -o "$out_iface" -j ACCEPT 2>/dev/null
+    net_cmd iptables -D FORWARD -i "$out_iface" -o "$BRIDGE_NAME" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+    net_cmd iptables -D FORWARD -i "$BRIDGE_NAME" -j ACCEPT 2>/dev/null
+    net_cmd iptables -D FORWARD -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null
+    net_cmd iptables -t nat -D POSTROUTING -s "${BRIDGE_SUBNET}" -o "${out_iface}" -j MASQUERADE 2>/dev/null
+    
+    # Add clean rules
+    net_cmd iptables -I FORWARD 1 -i "$BRIDGE_NAME" -o "$out_iface" -j ACCEPT 2>/dev/null
+    net_cmd iptables -I FORWARD 2 -i "$out_iface" -o "$BRIDGE_NAME" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+    net_cmd iptables -t nat -A POSTROUTING -s "${BRIDGE_SUBNET}" -o "${out_iface}" -j MASQUERADE 2>/dev/null
     
     echo "[NET] NAT configured for internet access"
 }
+
+# --- Detect if we're running inside a VM with our bridge subnet ---
+detect_nested_environment() {
+    if ip route show 2>/dev/null | grep -q "via ${BRIDGE_IP} "; then
+        echo "[NET] Detected nested environment (parent uses ${BRIDGE_SUBNET})"
+        return 0
+    fi
+    return 1
+}
+
 
 # --- Main bridge setup orchestration ---
 setup_bridge_network() {
@@ -636,6 +696,19 @@ setup_bridge_network() {
     if ! check_tun_available; then
         echo "[NET] TUN/TAP not available, will use port forwarding"
         return 1
+    fi
+    
+    # Detect nested environment and switch to alternative subnet
+    if detect_nested_environment; then
+        IS_NESTED="true"
+        BRIDGE_NAME="qemubr1"
+        BRIDGE_IP="$NESTED_BRIDGE_IP"
+        BRIDGE_NETMASK="$NESTED_BRIDGE_NETMASK"
+        BRIDGE_SUBNET="$NESTED_BRIDGE_SUBNET"
+        VM_IP_PREFIX="$NESTED_VM_IP_PREFIX"
+        VM_IP_START="$NESTED_VM_IP_START"
+        VM_IP_END="$NESTED_VM_IP_END"
+        echo "[NET] Using nested subnet: ${BRIDGE_SUBNET}"
     fi
     
     bridge_method=$(detect_bridge_method)
@@ -668,6 +741,15 @@ setup_bridge_network() {
     if ! ip link show "$BRIDGE_NAME" >/dev/null 2>&1; then
         echo "[NET] Bridge interface not found after setup"
         return 1
+    fi
+    
+    # In nested mode, add a route to reach parent's network through the correct interface
+    if [ "$IS_NESTED" = "true" ]; then
+        # Find the interface that has the parent's subnet
+        local parent_iface=$(ip route show 2>/dev/null | grep "via ${NESTED_BRIDGE_IP%%1}1" | awk '{print $3}' | head -1 || ip route show default 2>/dev/null | awk '{print $5}')
+        if [ -n "$parent_iface" ]; then
+            echo "[NET] Setting up NAT for nested subnet via ${parent_iface}"
+        fi
     fi
     
     setup_nat
