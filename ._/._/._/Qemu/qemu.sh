@@ -599,7 +599,7 @@ add_to_bridge() {
 
 # --- Setup NAT for internet access ---
 setup_nat() {
-    net_cmd sh -c "echo 1 > /proc/sys/net/ipv4/ip_forward" 2>/dev/null
+    echo "[NET] Configuring NAT..."
     
     if ! command -v iptables >/dev/null 2>&1; then
         echo "[NET] iptables not available, VMs will have local network only"
@@ -608,38 +608,68 @@ setup_nat() {
     
     local out_iface=""
     
-    if [ "$IS_NESTED" = "true" ]; then
-        # In nested mode, find our default route interface (to parent network)
-        out_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
-        if [ -z "$out_iface" ]; then
-            out_iface=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $8}' | head -1)
-        fi
-        echo "[NET] Nested NAT: ${BRIDGE_SUBNET} -> ${out_iface} (parent network)"
-    else
-        out_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
-        if [ -z "$out_iface" ]; then
-            out_iface=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $8}' | head -1)
-        fi
+    # Find outbound interface
+    out_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+    if [ -z "$out_iface" ]; then
+        out_iface=$(route -n 2>/dev/null | grep '^0.0.0.0' | awk '{print $8}' | head -1)
     fi
     
-    if [ -n "$out_iface" ]; then
-        if ! net_cmd iptables -t nat -C POSTROUTING -s "${BRIDGE_SUBNET}" -o "${out_iface}" -j MASQUERADE 2>/dev/null; then
-            net_cmd iptables -t nat -A POSTROUTING -s "${BRIDGE_SUBNET}" -o "${out_iface}" -j MASQUERADE 2>/dev/null
+    if [ -z "$out_iface" ]; then
+        echo "[NET] WARNING: Could not detect outbound interface"
+        out_iface=$(ip link show 2>/dev/null | grep -E '^[0-9]+: (eth|ens|enp)' | head -1 | awk -F': ' '{print $2}')
+        if [ -z "$out_iface" ]; then
+            echo "[NET] ERROR: No network interface found"
+            return 1
         fi
-    else
-        if ! net_cmd iptables -t nat -C POSTROUTING -s "${BRIDGE_SUBNET}" -j MASQUERADE 2>/dev/null; then
-            net_cmd iptables -t nat -A POSTROUTING -s "${BRIDGE_SUBNET}" -j MASQUERADE 2>/dev/null
-        fi
+        echo "[NET] Using guessed interface: ${out_iface}"
     fi
     
-    net_cmd iptables -C FORWARD -i "$BRIDGE_NAME" -j ACCEPT 2>/dev/null || \
-    net_cmd iptables -A FORWARD -i "$BRIDGE_NAME" -j ACCEPT 2>/dev/null
+    echo "[NET] Outbound interface: ${out_iface}"
+    echo "[NET] Bridge subnet: ${BRIDGE_SUBNET}"
     
-    net_cmd iptables -C FORWARD -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null || \
-    net_cmd iptables -A FORWARD -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null
+    # CRITICAL: Enable IP forwarding using sysctl (more reliable than echo)
+    if command -v sysctl >/dev/null 2>&1; then
+        net_cmd sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+        net_cmd sysctl -w net.ipv4.conf.all.forwarding=1 >/dev/null 2>&1
+        net_cmd sysctl -w net.ipv4.conf.${out_iface}.forwarding=1 >/dev/null 2>&1
+        net_cmd sysctl -w net.ipv4.conf.${BRIDGE_NAME}.forwarding=1 >/dev/null 2>&1
+        echo "[NET] Enabled IP forwarding via sysctl"
+    else
+        # Fallback to echo with explicit sudo
+        if [ "$(id -u)" = "0" ]; then
+            echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null
+            echo 1 > /proc/sys/net/ipv4/conf/all/forwarding 2>/dev/null
+            echo 1 > /proc/sys/net/ipv4/conf/${out_iface}/forwarding 2>/dev/null
+            echo 1 > /proc/sys/net/ipv4/conf/${BRIDGE_NAME}/forwarding 2>/dev/null
+        else
+            sudo sh -c "echo 1 > /proc/sys/net/ipv4/ip_forward" 2>/dev/null
+            sudo sh -c "echo 1 > /proc/sys/net/ipv4/conf/all/forwarding" 2>/dev/null
+            sudo sh -c "echo 1 > /proc/sys/net/ipv4/conf/${out_iface}/forwarding" 2>/dev/null
+            sudo sh -c "echo 1 > /proc/sys/net/ipv4/conf/${BRIDGE_NAME}/forwarding" 2>/dev/null
+        fi
+        echo "[NET] Enabled IP forwarding via proc"
+    fi
     
-    net_cmd iptables -C FORWARD -i "$BRIDGE_NAME" -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null || \
-    net_cmd iptables -A FORWARD -i "$BRIDGE_NAME" -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null
+    # Verify forwarding is enabled
+    local ip_forward_status=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)
+    if [ "$ip_forward_status" != "1" ]; then
+        echo "[NET] WARNING: Failed to enable IP forwarding (status: ${ip_forward_status})"
+        echo "[NET] Try running manually: sudo sysctl -w net.ipv4.ip_forward=1"
+    else
+        echo "[NET] IP forwarding verified: enabled"
+    fi
+    
+    # Remove duplicate rules first to avoid clutter
+    net_cmd iptables -D FORWARD -i "$BRIDGE_NAME" -o "$out_iface" -j ACCEPT 2>/dev/null
+    net_cmd iptables -D FORWARD -i "$out_iface" -o "$BRIDGE_NAME" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+    net_cmd iptables -D FORWARD -i "$BRIDGE_NAME" -j ACCEPT 2>/dev/null
+    net_cmd iptables -D FORWARD -o "$BRIDGE_NAME" -j ACCEPT 2>/dev/null
+    net_cmd iptables -t nat -D POSTROUTING -s "${BRIDGE_SUBNET}" -o "${out_iface}" -j MASQUERADE 2>/dev/null
+    
+    # Add clean rules
+    net_cmd iptables -I FORWARD 1 -i "$BRIDGE_NAME" -o "$out_iface" -j ACCEPT 2>/dev/null
+    net_cmd iptables -I FORWARD 2 -i "$out_iface" -o "$BRIDGE_NAME" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+    net_cmd iptables -t nat -A POSTROUTING -s "${BRIDGE_SUBNET}" -o "${out_iface}" -j MASQUERADE 2>/dev/null
     
     echo "[NET] NAT configured for internet access"
 }
