@@ -852,8 +852,19 @@ install_genisoimage() {
     if command -v apt-get >/dev/null 2>&1; then
         smart_apt_install "genisoimage" "genisoimage" || exit 1
     elif command -v apk >/dev/null 2>&1; then
-        echo "[INSTALL] Installing genisoimage via apk..."
-        apk add --no-cache genisoimage
+        echo "[INSTALL] Installing genisoimage (cdrkit) via apk..."
+        apk add --no-cache cdrkit 2>/dev/null || {
+            echo "[INSTALL] cdrkit not available, trying genisoimage..."
+            apk add --no-cache genisoimage 2>/dev/null || {
+                echo "ERROR: Failed to install genisoimage/cdrkit via apk"
+                exit 1
+            }
+        }
+        # Verify genisoimage is now available
+        if ! command -v genisoimage >/dev/null 2>&1; then
+            echo "ERROR: genisoimage still not found after apk installation"
+            exit 1
+        fi
     elif command -v yum >/dev/null 2>&1; then
         echo "[INSTALL] Installing genisoimage via yum..."
         yum install -y -q genisoimage
@@ -1017,7 +1028,6 @@ generate_password_hash() {
     exit 1
 }
 
-# --- Create cloud-init ISO with OS-specific network configuration ---
 create_cloud_init_iso() {
     local target_dir="$1"
     local vm_ip="$2"  # static IP for bridge mode (empty for DHCP)
@@ -1569,10 +1579,24 @@ BASE_DIR=$(pwd)
 # Ensure base image exists
 if [ ! -f "${BASE_DIR}/${IMG_FILE}" ]; then
     echo "[SETUP] Downloading ${SELECTED_OS} base cloud image..."
-    wget -q --show-progress "${IMG_URL}" -O "${BASE_DIR}/${IMG_FILE}" || {
-        echo "ERROR: Failed to download image from ${IMG_URL}"
-        exit 1
-    }
+    
+    # Use compatible wget options based on OS
+    if [ "$SELECTED_OS" = "alpine" ]; then
+        # Alpine/BusyBox wget doesn't support --show-progress
+        wget -q -O "${BASE_DIR}/${IMG_FILE}" "${IMG_URL}" 2>&1 || {
+            # Try with progress display using different method
+            wget -O "${BASE_DIR}/${IMG_FILE}" "${IMG_URL}" 2>&1 || {
+                echo "ERROR: Failed to download image from ${IMG_URL}"
+                exit 1
+            }
+        }
+    else
+        # Ubuntu and other systems with full wget
+        wget -q --show-progress "${IMG_URL}" -O "${BASE_DIR}/${IMG_FILE}" || {
+            echo "ERROR: Failed to download image from ${IMG_URL}"
+            exit 1
+        }
+    fi
     echo "[SETUP] Base image cached: ${BASE_DIR}/${IMG_FILE}"
 else
     echo "[SETUP] Using cached base image: ${BASE_DIR}/${IMG_FILE}"
