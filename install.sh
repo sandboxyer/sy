@@ -47,8 +47,8 @@ NODE_ENTRY_POINTS_CMD="sy sypm sydb pkg pack"
 #   2. Add working directory in get_command_working_dir() below
 #   3. Run installer
 #
-SHELL_SCRIPTS_SRC="./._/._/._/Qemu/qemu.sh"    # ← Add your .sh script paths here
-SHELL_SCRIPTS_CMD="qemu"    # ← Add your command names here
+SHELL_SCRIPTS_SRC="./._/._/._/Qemu/qemu.sh ._/._/._/Util/lay.sh"    # ← Add your .sh script paths here
+SHELL_SCRIPTS_CMD="qemu lay"    # ← Add your command names here
 
 # =============================================================================
 # COMMAND WORKING DIRECTORY CONFIGURATION
@@ -71,7 +71,8 @@ get_command_working_dir() {
         "pkg") echo "caller" ;;
         "pack") echo "caller" ;;
         "git-config") echo "global" ;;
-        "qemu") echo "file" ;;        # ← NEW: Runs from script's own directory
+        "qemu") echo "file" ;;
+        "lay") echo "caller" ;;   
         
         # =====================================================================
         # SHELL SCRIPT COMMANDS - ADD YOURS HERE
