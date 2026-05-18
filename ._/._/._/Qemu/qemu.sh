@@ -37,6 +37,13 @@ IS_NESTED="false"
 IP_LOCK_DIR="/tmp/qemu_vm_ip_locks"
 mkdir -p "$IP_LOCK_DIR" 2>/dev/null
 
+# --- Download lock directory (prevents concurrent downloads) ---
+DOWNLOAD_LOCK_DIR="/tmp/qemu_vm_download_locks"
+mkdir -p "$DOWNLOAD_LOCK_DIR" 2>/dev/null
+
+# --- Cleanup tracking for partial downloads ---
+PARTIAL_DOWNLOAD_PID_FILE="/tmp/qemu_vm_download_pid_$$"
+
 # --- Helper: Show help message ---
 show_help() {
     cat << 'HELPEOF'
@@ -356,6 +363,230 @@ check_kvm() {
         echo "[KVM] KVM not available, falling back to software emulation (slower)"
         return 1
     fi
+}
+
+# ============================================================================
+# ROBUST DOWNLOAD HANDLING - Prevents partial/corrupt downloads
+# ============================================================================
+
+# --- Acquire download lock to prevent concurrent downloads of same file ---
+acquire_download_lock() {
+    local file_name="$1"
+    local lock_dir="${DOWNLOAD_LOCK_DIR}/${file_name}.lock"
+    local max_wait=120  # Maximum seconds to wait for lock
+    local waited=0
+    local stale_removal_attempted=0
+    
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+        if [ $waited -ge $max_wait ]; then
+            echo "ERROR: Timeout waiting for download lock after ${max_wait}s" >&2
+            echo "If another download is stuck, manually remove: ${lock_dir}" >&2
+            exit 1
+        fi
+        
+        # Check if the process holding the lock is still alive
+        if [ -f "${lock_dir}/pid" ]; then
+            local lock_pid=$(cat "${lock_dir}/pid" 2>/dev/null)
+            if [ -n "$lock_pid" ]; then
+                if ! kill -0 "$lock_pid" 2>/dev/null; then
+                    # Only attempt stale removal once per wait cycle
+                    if [ $stale_removal_attempted -eq 0 ]; then
+                        echo "[DOWNLOAD] Stale lock detected (PID ${lock_pid} is dead), removing..." >&2
+                        rm -f "${lock_dir}/pid" 2>/dev/null
+                        rmdir "$lock_dir" 2>/dev/null
+                        stale_removal_attempted=1
+                        continue
+                    fi
+                fi
+            fi
+        else
+            # Lock directory exists but no PID file - try to remove it
+            if [ $stale_removal_attempted -eq 0 ]; then
+                echo "[DOWNLOAD] Stale lock without PID file detected, removing..." >&2
+                rmdir "$lock_dir" 2>/dev/null
+                stale_removal_attempted=1
+                continue
+            fi
+        fi
+        
+        # Reset stale removal flag after each attempt
+        stale_removal_attempted=0
+        
+        sleep 1
+        waited=$((waited + 1))
+        if [ $((waited % 10)) -eq 0 ]; then
+            echo "[DOWNLOAD] Waiting for another download to complete... (${waited}s)" >&2
+        fi
+    done
+    
+    # Store our PID in the lock
+    echo "$$" > "${lock_dir}/pid"
+    echo "$lock_dir"
+}
+
+# --- Release download lock ---
+release_download_lock() {
+    local lock_dir="$1"
+    if [ -n "$lock_dir" ] && [ -d "$lock_dir" ]; then
+        rm -f "${lock_dir}/pid" 2>/dev/null
+        rmdir "$lock_dir" 2>/dev/null
+    fi
+}
+
+# --- Verify downloaded file integrity ---
+verify_download_integrity() {
+    local file_path="$1"
+    
+    # Check if file exists and has non-zero size
+    if [ ! -f "$file_path" ]; then
+        echo "[VERIFY] File does not exist: ${file_path}"
+        return 1
+    fi
+    
+    local file_size=$(stat -c%s "$file_path" 2>/dev/null || stat -f%z "$file_path" 2>/dev/null || echo "0")
+    
+    if [ "$file_size" -eq 0 ]; then
+        echo "[VERIFY] File is empty: ${file_path}"
+        return 1
+    fi
+    
+    # For qcow2 images, verify with qemu-img
+    if echo "$file_path" | grep -qE '\.qcow2$|\.img$'; then
+        if command -v qemu-img >/dev/null 2>&1; then
+            if qemu-img check "$file_path" >/dev/null 2>&1; then
+                echo "[VERIFY] Image file verified: ${file_path} (${file_size} bytes)"
+                return 0
+            else
+                echo "[VERIFY] Corrupt image file detected: ${file_path}"
+                return 1
+            fi
+        fi
+    fi
+    
+    # For other files, just check minimum size (1MB for cloud images)
+    if [ "$file_size" -lt 1048576 ]; then
+        echo "[VERIFY] File too small, likely partial download: ${file_path} (${file_size} bytes)"
+        return 1
+    fi
+    
+    echo "[VERIFY] File verified: ${file_path} (${file_size} bytes)"
+    return 0
+}
+
+# --- Cleanup partial download ---
+cleanup_partial_download() {
+    local file_path="$1"
+    local temp_path="${file_path}.partial"
+    
+    echo "[CLEANUP] Removing partial/corrupt downloads..."
+    
+    if [ -f "$file_path" ]; then
+        if ! verify_download_integrity "$file_path"; then
+            echo "[CLEANUP] Removing corrupt file: ${file_path}"
+            rm -f "$file_path"
+        fi
+    fi
+    
+    if [ -f "$temp_path" ]; then
+        echo "[CLEANUP] Removing temporary download: ${temp_path}"
+        rm -f "$temp_path"
+    fi
+}
+
+# --- Download with resume support and integrity verification ---
+download_with_integrity() {
+    local url="$1"
+    local output_path="$2"
+    local temp_path="${output_path}.partial"
+    local max_retries=3
+    local retry_count=0
+    
+    # Check if we have a valid completed download
+    if [ -f "$output_path" ] && verify_download_integrity "$output_path"; then
+        echo "[DOWNLOAD] Valid file already exists: ${output_path}"
+        return 0
+    fi
+    
+    # Cleanup any existing partial/corrupt files
+    cleanup_partial_download "$output_path"
+    
+    echo "[DOWNLOAD] Starting download: ${url}"
+    echo "[DOWNLOAD] Output: ${output_path}"
+    
+    # Try download with resume support
+    while [ $retry_count -lt $max_retries ]; do
+        retry_count=$((retry_count + 1))
+        
+        if [ $retry_count -gt 1 ]; then
+            echo "[DOWNLOAD] Retry attempt ${retry_count}/${max_retries}..."
+            sleep 2
+        fi
+        
+        # Use wget with resume support for partial downloads
+        if [ -f "$temp_path" ]; then
+            echo "[DOWNLOAD] Resuming previous partial download..."
+        fi
+        
+        # Download to temporary file first
+        if wget -c -O "$temp_path" "$url" 2>&1; then
+            echo "[DOWNLOAD] Download completed, verifying integrity..."
+            
+            # Verify the downloaded file
+            if [ -f "$temp_path" ] && [ -s "$temp_path" ]; then
+                # Move to final location
+                mv "$temp_path" "$output_path"
+                
+                if verify_download_integrity "$output_path"; then
+                    echo "[DOWNLOAD] Download successful and verified"
+                    return 0
+                else
+                    echo "[DOWNLOAD] Download verification failed, cleaning up..."
+                    rm -f "$output_path"
+                fi
+            else
+                echo "[DOWNLOAD] Download failed or file is empty"
+                rm -f "$temp_path"
+            fi
+        else
+            local wget_exit=$?
+            echo "[DOWNLOAD] wget failed with exit code: ${wget_exit}"
+            
+            # Clean up on failure (except for partial downloads we might resume)
+            if [ $wget_exit -ne 0 ] && [ $wget_exit -ne 1 ]; then
+                rm -f "$temp_path"
+            fi
+        fi
+    done
+    
+    echo "ERROR: Failed to download ${url} after ${max_retries} attempts"
+    return 1
+}
+
+# --- Signal handler for clean interrupt during download ---
+setup_download_signal_handlers() {
+    # Save current trap handlers
+    local old_int=$(trap -p INT 2>/dev/null | sed "s/trap -- '\(.*\)' INT/\1/")
+    local old_term=$(trap -p TERM 2>/dev/null | sed "s/trap -- '\(.*\)' TERM/\1/")
+    
+    # Set cleanup handler for downloads
+    trap 'handle_download_interrupt' INT TERM
+}
+
+# --- Handle interrupt during download ---
+handle_download_interrupt() {
+    echo ""
+    echo "[INTERRUPT] Download interrupted by user"
+    echo "[INTERRUPT] Cleaning up partial downloads..."
+    
+    # Clean up any partial downloads
+    if [ -n "$CURRENT_DOWNLOAD_FILE" ]; then
+        rm -f "${CURRENT_DOWNLOAD_FILE}.partial" 2>/dev/null
+        rm -f "${CURRENT_DOWNLOAD_FILE}" 2>/dev/null
+        echo "[INTERRUPT] Removed partial download: ${CURRENT_DOWNLOAD_FILE}"
+    fi
+    
+    echo "[INTERRUPT] Exiting..."
+    exit 130
 }
 
 # ============================================================================
@@ -1376,6 +1607,8 @@ USE_BRIDGE="false"
 VM_IP=""
 TAP_NAME=""
 bridge_method=""
+CURRENT_DOWNLOAD_FILE=""  # Track current download for interrupt handler
+DOWNLOAD_LOCK_DIR_PATH=""  # Track download lock directory
 
 # Parse arguments
 while [ $# -gt 0 ]; do
@@ -1576,34 +1809,74 @@ fi
 # Store base directory
 BASE_DIR=$(pwd)
 
-# Ensure base image exists
+# Ensure base image exists with robust download handling
 if [ ! -f "${BASE_DIR}/${IMG_FILE}" ]; then
-    echo "[SETUP] Downloading ${SELECTED_OS} base cloud image..."
+    echo "[SETUP] Base image not found, preparing download..."
     
-    # Use compatible wget options based on OS
-    if [ "$SELECTED_OS" = "alpine" ]; then
-        # Alpine/BusyBox wget doesn't support --show-progress
-        wget -q -O "${BASE_DIR}/${IMG_FILE}" "${IMG_URL}" 2>&1 || {
-            # Try with progress display using different method
-            wget -O "${BASE_DIR}/${IMG_FILE}" "${IMG_URL}" 2>&1 || {
-                echo "ERROR: Failed to download image from ${IMG_URL}"
-                exit 1
-            }
-        }
-    else
-        # Ubuntu and other systems with full wget
-        wget -q --show-progress "${IMG_URL}" -O "${BASE_DIR}/${IMG_FILE}" || {
-            echo "ERROR: Failed to download image from ${IMG_URL}"
-            exit 1
-        }
+    # Set up signal handlers for clean interrupt during download
+    setup_download_signal_handlers
+    
+    # Acquire download lock to prevent concurrent downloads
+    DOWNLOAD_LOCK_DIR_PATH=$(acquire_download_lock "${IMG_FILE}")
+    
+    # Set current download file for interrupt handler
+    CURRENT_DOWNLOAD_FILE="${BASE_DIR}/${IMG_FILE}"
+    
+    # Download with integrity verification
+    if ! download_with_integrity "${IMG_URL}" "${BASE_DIR}/${IMG_FILE}"; then
+        echo "ERROR: Failed to download base image"
+        release_download_lock "$DOWNLOAD_LOCK_DIR_PATH"
+        exit 1
     fi
+    
+    # Release download lock
+    release_download_lock "$DOWNLOAD_LOCK_DIR_PATH"
+    DOWNLOAD_LOCK_DIR_PATH=""
+    CURRENT_DOWNLOAD_FILE=""
+    
     echo "[SETUP] Base image cached: ${BASE_DIR}/${IMG_FILE}"
 else
-    echo "[SETUP] Using cached base image: ${BASE_DIR}/${IMG_FILE}"
+    # Verify existing image integrity
+    echo "[SETUP] Checking existing base image..."
+    if ! verify_download_integrity "${BASE_DIR}/${IMG_FILE}"; then
+        echo "[SETUP] Existing base image is corrupt, removing and re-downloading..."
+        rm -f "${BASE_DIR}/${IMG_FILE}"
+        rm -f "${BASE_DIR}/${IMG_FILE}.partial"
+        
+        # Set up signal handlers for clean interrupt during download
+        setup_download_signal_handlers
+        
+        # Acquire download lock
+        DOWNLOAD_LOCK_DIR_PATH=$(acquire_download_lock "${IMG_FILE}")
+        
+        # Set current download file for interrupt handler
+        CURRENT_DOWNLOAD_FILE="${BASE_DIR}/${IMG_FILE}"
+        
+        # Re-download
+        if ! download_with_integrity "${IMG_URL}" "${BASE_DIR}/${IMG_FILE}"; then
+            echo "ERROR: Failed to download base image"
+            release_download_lock "$DOWNLOAD_LOCK_DIR_PATH"
+            exit 1
+        fi
+        
+        # Release download lock
+        release_download_lock "$DOWNLOAD_LOCK_DIR_PATH"
+        DOWNLOAD_LOCK_DIR_PATH=""
+        CURRENT_DOWNLOAD_FILE=""
+        
+        echo "[SETUP] Base image re-downloaded successfully: ${BASE_DIR}/${IMG_FILE}"
+    else
+        echo "[SETUP] Using cached base image: ${BASE_DIR}/${IMG_FILE}"
+    fi
 fi
 
 # Cleanup function: releases IP lock and removes temporary files
 cleanup_vm() {
+    # Release download lock if we still hold it
+    if [ -n "$DOWNLOAD_LOCK_DIR_PATH" ]; then
+        release_download_lock "$DOWNLOAD_LOCK_DIR_PATH"
+    fi
+    
     if [ "$USE_BRIDGE" = "true" ] && [ -n "$VM_IP" ]; then
         release_vm_ip "$VM_IP"
         delete_tap_interface "$TAP_NAME"
