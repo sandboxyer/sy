@@ -65,86 +65,872 @@ function getFileContent(filePath, commitHash = null) {
     }
 }
 
-// Simplified code structure analyzer
+// Enhanced multi-language code structure analyzer
 function analyzeFileStructure(filePath, commitHash = null) {
     const content = getFileContent(filePath, commitHash);
     if (!content) return null;
     
     const lines = content.split('\n');
+    const ext = path.extname(filePath).toLowerCase();
     
     const structure = {
         totalLines: lines.length,
         emptyLines: 0,
         commentLines: 0,
         codeLines: 0,
-        blocks: [],
-        definitions: [],
-        includes: [],
-        sections: [],
-        variables: []
+        imports: [],
+        exports: [],
+        functions: [],
+        classes: [],
+        interfaces: [],
+        types: [],
+        enums: [],
+        constants: [],
+        variables: [],
+        controlStructures: [],
+        decorators: [],
+        errorHandlers: [],
+        asyncStructures: [],
+        reactComponents: [],
+        hooks: [],
+        testSuites: [],
+        databaseQueries: [],
+        apiEndpoints: [],
+        complexity: {
+            cyclomaticComplexity: 1,
+            nestingDepth: 0,
+            maxNestingDepth: 0
+        },
+        dependencies: new Set(),
+        languageFeatures: new Set()
     };
+    
+    let currentNestingDepth = 0;
+    let inMultilineComment = false;
+    let inString = false;
+    let stringChar = '';
+    let inTemplateLiteral = false;
+    let bracketStack = [];
     
     lines.forEach((line, index) => {
         const trimmed = line.trim();
         const lineNum = index + 1;
+        let lineProcessed = false;
         
+        // Track nesting depth
+        const openBraces = (trimmed.match(/[{[(]/g) || []).length;
+        const closeBraces = (trimmed.match(/[}\])]/g) || []).length;
+        currentNestingDepth += openBraces - closeBraces;
+        structure.complexity.maxNestingDepth = Math.max(structure.complexity.maxNestingDepth, currentNestingDepth);
+        
+        // Handle multiline comments
+        if (inMultilineComment) {
+            structure.commentLines++;
+            if (trimmed.includes('*/')) {
+                inMultilineComment = false;
+            }
+            return;
+        }
+        
+        // Check for multiline comment start
+        if (trimmed.startsWith('/*') || trimmed.startsWith('/**')) {
+            structure.commentLines++;
+            if (!trimmed.includes('*/')) {
+                inMultilineComment = true;
+            }
+            return;
+        }
+        
+        // Empty lines
         if (trimmed === '') {
             structure.emptyLines++;
             return;
         }
         
-        // Comment detection
-        if (trimmed.startsWith('//') || trimmed.startsWith('#') || trimmed.startsWith(';') || 
-            trimmed.startsWith('/*') || trimmed.startsWith('*') || trimmed.startsWith('--')) {
+        // Single line comments
+        if (trimmed.startsWith('//') || trimmed.startsWith('#') || 
+            trimmed.startsWith(';') || trimmed.startsWith('--') ||
+            trimmed.startsWith('<!--')) {
             structure.commentLines++;
             return;
         }
         
-        // Import detection
-        if (trimmed.startsWith('import ') || trimmed.startsWith('require(') || 
-            trimmed.startsWith('from ') || trimmed.includes('require(')) {
-            structure.includes.push({
-                line: lineNum,
-                type: 'import',
-                content: trimmed.substring(0, 100)
-            });
-            structure.codeLines++;
+        // Language-specific comment detection
+        if (detectLanguageComment(trimmed, ext)) {
+            structure.commentLines++;
             return;
         }
         
-        // Function detection
-        const funcMatch = trimmed.match(/(?:function|def|func|fn)\s+(\w+)/);
-        if (funcMatch) {
-            structure.blocks.push({
-                line: lineNum,
-                type: 'function',
-                name: funcMatch[1],
-                content: trimmed.substring(0, 100)
-            });
-            structure.codeLines++;
+        // Shebang line
+        if (lineNum === 1 && trimmed.startsWith('#!')) {
+            structure.commentLines++;
             return;
         }
         
-        // Class detection
-        const classMatch = trimmed.match(/class\s+(\w+)/);
-        if (classMatch) {
-            structure.definitions.push({
-                line: lineNum,
-                type: 'class',
-                name: classMatch[1],
-                content: trimmed.substring(0, 100)
-            });
+        // Import/Require detection (multi-language)
+        const importInfo = detectImport(trimmed, lineNum, ext);
+        if (importInfo) {
+            structure.imports.push(importInfo);
+            if (importInfo.module) structure.dependencies.add(importInfo.module);
             structure.codeLines++;
-            return;
+            lineProcessed = true;
         }
         
-        structure.codeLines++;
+        // Export detection
+        const exportInfo = detectExport(trimmed, lineNum, ext);
+        if (exportInfo) {
+            structure.exports.push(exportInfo);
+            structure.codeLines++;
+            lineProcessed = true;
+        }
+        
+        // Decorator/Annotation detection
+        const decoratorInfo = detectDecorator(trimmed, lineNum);
+        if (decoratorInfo) {
+            structure.decorators.push(decoratorInfo);
+            structure.languageFeatures.add('decorators');
+        }
+        
+        // Function detection (multi-language)
+        const funcInfo = detectFunction(trimmed, lineNum, ext);
+        if (funcInfo) {
+            structure.functions.push(funcInfo);
+            structure.codeLines++;
+            structure.complexity.cyclomaticComplexity++;
+            lineProcessed = true;
+            if (funcInfo.isAsync) {
+                structure.asyncStructures.push({ line: lineNum, type: 'async_function', name: funcInfo.name });
+            }
+        }
+        
+        // Arrow function detection
+        const arrowFuncInfo = detectArrowFunction(trimmed, lineNum);
+        if (arrowFuncInfo) {
+            structure.functions.push(arrowFuncInfo);
+            structure.codeLines++;
+            structure.complexity.cyclomaticComplexity++;
+            lineProcessed = true;
+            if (arrowFuncInfo.isAsync) {
+                structure.asyncStructures.push({ line: lineNum, type: 'async_arrow', name: arrowFuncInfo.name });
+            }
+        }
+        
+        // Class detection (multi-language)
+        const classInfo = detectClass(trimmed, lineNum, ext);
+        if (classInfo) {
+            structure.classes.push(classInfo);
+            structure.codeLines++;
+            structure.complexity.cyclomaticComplexity++;
+            lineProcessed = true;
+        }
+        
+        // Interface/Trait detection
+        const interfaceInfo = detectInterface(trimmed, lineNum, ext);
+        if (interfaceInfo) {
+            structure.interfaces.push(interfaceInfo);
+            structure.codeLines++;
+            lineProcessed = true;
+        }
+        
+        // Type definition detection
+        const typeInfo = detectTypeDefinition(trimmed, lineNum);
+        if (typeInfo) {
+            structure.types.push(typeInfo);
+            structure.codeLines++;
+            lineProcessed = true;
+        }
+        
+        // Enum detection
+        const enumInfo = detectEnum(trimmed, lineNum);
+        if (enumInfo) {
+            structure.enums.push(enumInfo);
+            structure.codeLines++;
+            lineProcessed = true;
+        }
+        
+        // Constant detection
+        const constInfo = detectConstant(trimmed, lineNum, ext);
+        if (constInfo) {
+            structure.constants.push(constInfo);
+            structure.codeLines++;
+            lineProcessed = true;
+        }
+        
+        // Variable declaration
+        const varInfo = detectVariable(trimmed, lineNum);
+        if (varInfo && !lineProcessed) {
+            structure.variables.push(varInfo);
+            structure.codeLines++;
+            lineProcessed = true;
+        }
+        
+        // Control structure detection
+        const controlInfo = detectControlStructure(trimmed, lineNum);
+        if (controlInfo) {
+            structure.controlStructures.push(controlInfo);
+            structure.complexity.cyclomaticComplexity++;
+            structure.codeLines++;
+            lineProcessed = true;
+        }
+        
+        // Error handling detection
+        const errorInfo = detectErrorHandling(trimmed, lineNum);
+        if (errorInfo) {
+            structure.errorHandlers.push(errorInfo);
+            structure.codeLines++;
+            lineProcessed = true;
+        }
+        
+        // Async/Await/Promise detection
+        const asyncInfo = detectAsyncPattern(trimmed, lineNum);
+        if (asyncInfo) {
+            structure.asyncStructures.push(asyncInfo);
+        }
+        
+        // React component detection
+        const reactInfo = detectReactComponent(trimmed, lineNum);
+        if (reactInfo) {
+            structure.reactComponents.push(reactInfo);
+            structure.codeLines++;
+            lineProcessed = true;
+        }
+        
+        // React Hook detection
+        const hookInfo = detectReactHook(trimmed, lineNum);
+        if (hookInfo) {
+            structure.hooks.push(hookInfo);
+            structure.codeLines++;
+            lineProcessed = true;
+        }
+        
+        // Test suite detection
+        const testInfo = detectTestSuite(trimmed, lineNum);
+        if (testInfo) {
+            structure.testSuites.push(testInfo);
+            structure.codeLines++;
+            lineProcessed = true;
+        }
+        
+        // Database query detection
+        const dbInfo = detectDatabaseQuery(trimmed, lineNum);
+        if (dbInfo) {
+            structure.databaseQueries.push(dbInfo);
+            structure.codeLines++;
+            lineProcessed = true;
+        }
+        
+        // API endpoint detection
+        const apiInfo = detectApiEndpoint(trimmed, lineNum);
+        if (apiInfo) {
+            structure.apiEndpoints.push(apiInfo);
+            structure.codeLines++;
+            lineProcessed = true;
+        }
+        
+        if (!lineProcessed) {
+            structure.codeLines++;
+        }
+        
+        // Track language features
+        detectLanguageFeatures(trimmed, structure.languageFeatures);
     });
+    
+    // Convert Set to Array for JSON serialization
+    structure.dependencies = Array.from(structure.dependencies);
+    structure.languageFeatures = Array.from(structure.languageFeatures);
     
     return structure;
 }
 
-// Calculate file detail map data
+// Helper detection functions for multi-language support
+function detectLanguageComment(line, ext) {
+    // Python docstring
+    if ((ext === '.py' || ext === '.pyw') && (line.startsWith('"""') || line.startsWith("'''"))) return true;
+    // Ruby =begin
+    if (ext === '.rb' && line.startsWith('=begin')) return true;
+    // Lua
+    if (ext === '.lua' && line.startsWith('--[[')) return true;
+    // Haskell
+    if (ext === '.hs' && line.startsWith('{-')) return true;
+    return false;
+}
+
+function detectImport(line, lineNum, ext) {
+    const patterns = [
+        // JavaScript/TypeScript imports
+        { regex: /^(?:import\s+(?:[\w*\s{},]*)\s+from\s+['"]([^'"]+)['"])/, type: 'es6_import', module: 1 },
+        { regex: /^(?:import\s+['"]([^'"]+)['"])/, type: 'es6_side_effect', module: 1 },
+        { regex: /^(?:const\s+[\w{}\s,]*=\s*require\s*\(['"]([^'"]+)['"]\))/, type: 'require', module: 1 },
+        { regex: /^(?:let\s+[\w{}\s,]*=\s*require\s*\(['"]([^'"]+)['"]\))/, type: 'require', module: 1 },
+        { regex: /^(?:var\s+[\w{}\s,]*=\s*require\s*\(['"]([^'"]+)['"]\))/, type: 'require', module: 1 },
+        // Python imports
+        { regex: /^(?:from\s+(\S+)\s+import\s+)/, type: 'python_import', module: 1 },
+        { regex: /^(?:import\s+(\S+))/, type: 'python_import', module: 1 },
+        // Java/Kotlin imports
+        { regex: /^(?:import\s+(?:static\s+)?(\S+))/, type: 'java_import', module: 1 },
+        // C# using
+        { regex: /^(?:using\s+(?:static\s+)?(\S+))/, type: 'csharp_using', module: 1 },
+        // Ruby require
+        { regex: /^(?:require\s+['"]([^'"]+)['"])/, type: 'ruby_require', module: 1 },
+        // PHP use/require/include
+        { regex: /^(?:use\s+(\S+))/, type: 'php_use', module: 1 },
+        { regex: /^(?:require(?:_once)?\s*\(?['"]([^'"]+)['"]\)?)/, type: 'php_require', module: 1 },
+        { regex: /^(?:include(?:_once)?\s*\(?['"]([^'"]+)['"]\)?)/, type: 'php_include', module: 1 },
+        // Go imports
+        { regex: /^(?:import\s+["']([^"']+)["'])/, type: 'go_import', module: 1 },
+        // Rust use
+        { regex: /^(?:use\s+(\S+))/, type: 'rust_use', module: 1 },
+        // C/C++ includes
+        { regex: /^(?:#include\s+[<"]([^>"]+)[>"])/, type: 'c_include', module: 1 },
+    ];
+    
+    for (const pattern of patterns) {
+        const match = line.match(pattern.regex);
+        if (match) {
+            return {
+                line: lineNum,
+                type: pattern.type,
+                content: line.substring(0, 150),
+                module: match[pattern.module]?.split('/').pop()?.split('\\').pop() || match[pattern.module]
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectExport(line, lineNum, ext) {
+    const patterns = [
+        { regex: /^(?:export\s+(?:default\s+)?(?:class|function|const|let|var|interface|type|enum)\s+(\w+))/, type: 'named_export' },
+        { regex: /^(?:export\s+{\s*([^}]+)\s*})/, type: 'export_list' },
+        { regex: /^(?:export\s+default\s+(\w+))/, type: 'default_export' },
+        { regex: /^(?:module\.exports\s*=\s*)/, type: 'commonjs_export' },
+        { regex: /^(?:exports\.(\w+)\s*=)/, type: 'commonjs_named_export' },
+        // Python __all__
+        { regex: /^(?:__all__\s*=\s*\[)/, type: 'python_export' },
+        // PHP public/protected/private
+        { regex: /^(?:public\s+(?:static\s+)?function\s+(\w+))/, type: 'php_public_method' },
+    ];
+    
+    for (const pattern of patterns) {
+        const match = line.match(pattern.regex);
+        if (match) {
+            return {
+                line: lineNum,
+                type: pattern.type,
+                content: line.substring(0, 100)
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectDecorator(line, lineNum) {
+    const patterns = [
+        // Python decorator
+        { regex: /^@(\w+)(?:\(.*\))?$/, language: 'python' },
+        // JavaScript/TypeScript decorator
+        { regex: /^@(\w+)(?:\(.*\))?(?:\s*$|\s+)/, language: 'javascript' },
+        // Java annotation
+        { regex: /^@(\w+)(?:\(.*\))?$/, language: 'java' },
+        // C# attribute
+        { regex: /^\[(\w+)(?:\(.*\))?\]$/, language: 'csharp' },
+    ];
+    
+    for (const pattern of patterns) {
+        const match = line.match(pattern.regex);
+        if (match) {
+            return {
+                line: lineNum,
+                name: match[1],
+                content: line.substring(0, 100),
+                language: pattern.language
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectFunction(line, lineNum, ext) {
+    const patterns = [
+        // JavaScript/TypeScript function declaration
+        { regex: /^(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)/, isAsync: 1, name: 2, params: 3 },
+        // Python function
+        { regex: /^(?:async\s+)?def\s+(\w+)\s*\(([^)]*)\)/, isAsync: 1, name: 2, params: 3 },
+        // Java/C#/C++ method
+        { regex: /^(?:public|private|protected|static|virtual|override|abstract|final|\s)*\s+[\w<>[\],\s]+\s+(\w+)\s*\(([^)]*)\)/, name: 2, params: 3 },
+        // PHP function
+        { regex: /^(?:public|private|protected|static)?\s*function\s+(\w+)\s*\(([^)]*)\)/, name: 1, params: 2 },
+        // Ruby method
+        { regex: /^def\s+(?:self\.)?(\w+)(?:\(([^)]*)\))?/, name: 1, params: 2 },
+        // Go function
+        { regex: /^func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\(([^)]*)\)/, name: 2, params: 3 },
+        // Rust function
+        { regex: /^fn\s+(\w+)\s*\(([^)]*)\)/, name: 1, params: 2 },
+        // Kotlin function
+        { regex: /^fun\s+(\w+)\s*\(([^)]*)\)/, name: 1, params: 2 },
+        // Swift function
+        { regex: /^func\s+(\w+)\s*\(([^)]*)\)/, name: 1, params: 2 },
+    ];
+    
+    for (const pattern of patterns) {
+        const match = line.match(pattern.regex);
+        if (match) {
+            const funcName = match[pattern.name];
+            // Skip common keywords that might match function patterns
+            if (['if', 'for', 'while', 'switch', 'catch', 'with', 'class', 'interface', 'enum'].includes(funcName)) {
+                continue;
+            }
+            return {
+                line: lineNum,
+                name: funcName || 'anonymous',
+                type: 'function',
+                params: match[pattern.params] || '',
+                isAsync: pattern.isAsync ? !!match[pattern.isAsync] : false,
+                content: line.substring(0, 150)
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectArrowFunction(line, lineNum) {
+    const patterns = [
+        { regex: /^(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(([^)]*)\)\s*=>/, name: 1, params: 2, isAsync: 0 },
+        { regex: /^(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?(\w+)\s*=>/, name: 1, params: 2, isAsync: 0 },
+        { regex: /^(?:async\s+)?\(([^)]*)\)\s*=>/, name: null, params: 1, isAsync: 0 },
+    ];
+    
+    for (const pattern of patterns) {
+        const match = line.match(pattern.regex);
+        if (match) {
+            return {
+                line: lineNum,
+                name: match[pattern.name] || 'anonymous',
+                type: 'arrow_function',
+                params: match[pattern.params] || '',
+                isAsync: line.includes('async'),
+                content: line.substring(0, 150)
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectClass(line, lineNum, ext) {
+    const patterns = [
+        { regex: /^class\s+(\w+)(?:\s+extends\s+(\w+))?(?:\s+implements\s+([\w\s,]+))?/, name: 1, extends: 2, implements: 3 },
+        { regex: /^(?:public|private|protected)?\s*class\s+(\w+)/, name: 1 },
+        // Python class
+        { regex: /^class\s+(\w+)(?:\(([^)]*)\))?/, name: 1, inherits: 2 },
+        // PHP class
+        { regex: /^(?:abstract|final)?\s*class\s+(\w+)(?:\s+extends\s+(\w+))?(?:\s+implements\s+([\w\s,]+))?/, name: 1 },
+        // Ruby class
+        { regex: /^class\s+(\w+)(?:\s+<\s+(\w+))?/, name: 1 },
+        // Kotlin/Swift class
+        { regex: /^(?:data\s+)?class\s+(\w+)(?:\s*:\s*(\w+))?/, name: 1 },
+    ];
+    
+    for (const pattern of patterns) {
+        const match = line.match(pattern.regex);
+        if (match) {
+            return {
+                line: lineNum,
+                name: match[pattern.name],
+                type: 'class',
+                extends: match[pattern.extends] || match[2] || null,
+                implements: match[pattern.implements] || match[3] || null,
+                content: line.substring(0, 150)
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectInterface(line, lineNum, ext) {
+    const patterns = [
+        { regex: /^interface\s+(\w+)(?:\s+extends\s+([\w\s,]+))?/, name: 1 },
+        { regex: /^(?:export\s+)?interface\s+(\w+)/, name: 1 },
+        // Java interface
+        { regex: /^(?:public\s+)?interface\s+(\w+)/, name: 1 },
+        // PHP interface
+        { regex: /^interface\s+(\w+)(?:\s+extends\s+([\w\s,]+))?/, name: 1 },
+        // TypeScript type
+        { regex: /^(?:export\s+)?type\s+(\w+)\s*=/, name: 1 },
+        // Go interface
+        { regex: /^type\s+(\w+)\s+interface/, name: 1 },
+        // Rust trait
+        { regex: /^trait\s+(\w+)/, name: 1 },
+    ];
+    
+    for (const pattern of patterns) {
+        const match = line.match(pattern.regex);
+        if (match) {
+            return {
+                line: lineNum,
+                name: match[pattern.name],
+                type: 'interface',
+                content: line.substring(0, 150)
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectTypeDefinition(line, lineNum) {
+    const patterns = [
+        { regex: /^type\s+(\w+)\s*=\s*(.+)/, name: 1, definition: 2 },
+        { regex: /^typedef\s+.*\s+(\w+)\s*;/, name: 1 }, // C typedef
+        { regex: /^data\s+class\s+(\w+)/, name: 1 }, // Kotlin data class
+        { regex: /^record\s+(\w+)/, name: 1 }, // Java record
+        { regex: /^(?:export\s+)?type\s+(\w+)\s*=\s*{/, name: 1 }, // TypeScript object type
+    ];
+    
+    for (const pattern of patterns) {
+        const match = line.match(pattern.regex);
+        if (match) {
+            return {
+                line: lineNum,
+                name: match[pattern.name],
+                type: 'type_definition',
+                content: line.substring(0, 150)
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectEnum(line, lineNum) {
+    const patterns = [
+        { regex: /^(?:export\s+)?enum\s+(\w+)/, name: 1 },
+        { regex: /^(?:public\s+)?enum\s+(\w+)/, name: 1 }, // Java
+        // Rust enum
+        { regex: /^pub\s+enum\s+(\w+)/, name: 1 },
+        // Swift enum
+        { regex: /^(?:indirect\s+)?enum\s+(\w+)/, name: 1 },
+    ];
+    
+    for (const pattern of patterns) {
+        const match = line.match(pattern.regex);
+        if (match) {
+            return {
+                line: lineNum,
+                name: match[pattern.name],
+                type: 'enum',
+                content: line.substring(0, 150)
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectConstant(line, lineNum, ext) {
+    const patterns = [
+        { regex: /^const\s+(\w+)\s*[:=]/, name: 1 },
+        { regex: /^(?:public\s+)?static\s+final\s+\w+\s+(\w+)\s*=/, name: 1 }, // Java constant
+        { regex: /^#define\s+(\w+)/, name: 1 }, // C/C++ define
+        { regex: /^(?:public\s+)?const\s+\w+\s+(\w+)\s*=/, name: 1 }, // C# constant
+        { regex: /^(\w+)\s*=\s*(?:['"].*['"]|\d+)\s*$/, name: 1 }, // Python constant (heuristic)
+    ];
+    
+    for (const pattern of patterns) {
+        const match = line.match(pattern.regex);
+        if (match) {
+            const name = match[pattern.name];
+            // For Python, only detect ALL_CAPS as constants
+            if (ext === '.py' && !/^[A-Z_][A-Z0-9_]*$/.test(name)) {
+                continue;
+            }
+            return {
+                line: lineNum,
+                name: name,
+                type: 'constant',
+                content: line.substring(0, 150)
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectVariable(line, lineNum) {
+    const patterns = [
+        { regex: /^(?:const|let|var)\s+(\w+)\s*(?:=|:)/, name: 1 },
+        { regex: /^(?:private|protected|public)?\s*(?:static\s+)?(?:final\s+)?[\w<>[\]]+\s+(\w+)\s*[=;]/, name: 1 },
+        { regex: /^\$(\w+)\s*=/, name: 1 }, // PHP variable
+        { regex: /^(\w+)\s*:=\s*/, name: 1 }, // Go short declaration
+        { regex: /^(\w+)\s*=\s*\w+/, name: 1 }, // Python variable
+    ];
+    
+    for (const pattern of patterns) {
+        const match = line.match(pattern.regex);
+        if (match) {
+            const name = match[pattern.name];
+            // Skip if it's a keyword or already detected as something else
+            if (['if', 'for', 'while', 'switch', 'return', 'throw', 'new', 'delete'].includes(name)) {
+                continue;
+            }
+            return {
+                line: lineNum,
+                name: name,
+                type: 'variable',
+                content: line.substring(0, 100)
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectControlStructure(line, lineNum) {
+    const patterns = [
+        { regex: /^(?:}\s*else\s*{?|else\s+if\s*\(|else\s*{)/, type: 'else_if' },
+        { regex: /^if\s*\(/, type: 'if_statement' },
+        { regex: /^for\s*\(/, type: 'for_loop' },
+        { regex: /^for\s+\w+\s+in\s+/, type: 'for_in' },
+        { regex: /^for\s+\w+\s+of\s+/, type: 'for_of' },
+        { regex: /^while\s*\(/, type: 'while_loop' },
+        { regex: /^do\s*{/, type: 'do_while' },
+        { regex: /^switch\s*\(/, type: 'switch' },
+        { regex: /^case\s+/, type: 'case' },
+        { regex: /^default\s*:/, type: 'default' },
+        { regex: /^try\s*{/, type: 'try' },
+        { regex: /^catch\s*\(/, type: 'catch' },
+        { regex: /^finally\s*{/, type: 'finally' },
+        { regex: /^foreach\s*\(/, type: 'foreach' },
+        { regex: /^match\s*\(/, type: 'match' }, // Rust match
+        { regex: /^when\s*{/, type: 'when' }, // Kotlin when
+    ];
+    
+    for (const pattern of patterns) {
+        if (pattern.regex.test(line)) {
+            return {
+                line: lineNum,
+                type: pattern.type,
+                content: line.substring(0, 100)
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectErrorHandling(line, lineNum) {
+    const patterns = [
+        { regex: /^throw\s+(?:new\s+)?/, type: 'throw' },
+        { regex: /^raise\s+/, type: 'raise' },
+        { regex: /^assert\s+/, type: 'assert' },
+        { regex: /^panic\s*\(/, type: 'panic' },
+        { regex: /\.catch\s*\(/, type: 'promise_catch' },
+        { regex: /^except\s+/, type: 'except' },
+        { regex: /^rescue\s+/, type: 'rescue' },
+    ];
+    
+    for (const pattern of patterns) {
+        if (pattern.regex.test(line)) {
+            return {
+                line: lineNum,
+                type: pattern.type,
+                content: line.substring(0, 100)
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectAsyncPattern(line, lineNum) {
+    const patterns = [
+        { regex: /\bawait\s+/, type: 'await' },
+        { regex: /\.then\s*\(/, type: 'promise_then' },
+        { regex: /\basync\s+/, type: 'async_keyword' },
+        { regex: /Promise\./, type: 'promise_usage' },
+        { regex: /async\s+def\s+/, type: 'async_function' },
+    ];
+    
+    for (const pattern of patterns) {
+        if (pattern.regex.test(line)) {
+            return {
+                line: lineNum,
+                type: pattern.type,
+                content: line.substring(0, 100)
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectReactComponent(line, lineNum) {
+    const patterns = [
+        { regex: /^(?:export\s+)?(?:default\s+)?function\s+([A-Z]\w*)\s*\(/, name: 1, type: 'functional_component' },
+        { regex: /^(?:export\s+)?(?:default\s+)?class\s+([A-Z]\w*)\s+extends\s+(?:React\.)?(?:Pure)?Component/, name: 1, type: 'class_component' },
+        { regex: /^(?:const|let|var)\s+([A-Z]\w*)\s*=\s*(?:React\.)?(?:memo|forwardRef|createElement)/, name: 1, type: 'memo_component' },
+        { regex: /^(?:const|let|var)\s+([A-Z]\w*)\s*:\s*React\.FC/, name: 1, type: 'typescript_component' },
+    ];
+    
+    for (const pattern of patterns) {
+        const match = line.match(pattern.regex);
+        if (match) {
+            return {
+                line: lineNum,
+                name: match[pattern.name],
+                type: pattern.type,
+                content: line.substring(0, 100)
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectReactHook(line, lineNum) {
+    const patterns = [
+        { regex: /\buseState\s*\(/, hook: 'useState' },
+        { regex: /\buseEffect\s*\(/, hook: 'useEffect' },
+        { regex: /\buseContext\s*\(/, hook: 'useContext' },
+        { regex: /\buseReducer\s*\(/, hook: 'useReducer' },
+        { regex: /\buseCallback\s*\(/, hook: 'useCallback' },
+        { regex: /\buseMemo\s*\(/, hook: 'useMemo' },
+        { regex: /\buseRef\s*\(/, hook: 'useRef' },
+        { regex: /\buseSelector\s*\(/, hook: 'useSelector' },
+        { regex: /\buseDispatch\s*\(/, hook: 'useDispatch' },
+        { regex: /\buseQuery\s*\(/, hook: 'useQuery' },
+        { regex: /\buseMutation\s*\(/, hook: 'useMutation' },
+        { regex: /\buseRouter\s*\(/, hook: 'useRouter' },
+        { regex: /\buseForm\s*\(/, hook: 'useForm' },
+        { regex: /\buseTranslation\s*\(/, hook: 'useTranslation' },
+    ];
+    
+    for (const pattern of patterns) {
+        if (pattern.regex.test(line)) {
+            return {
+                line: lineNum,
+                name: pattern.hook,
+                type: 'hook',
+                content: line.substring(0, 100)
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectTestSuite(line, lineNum) {
+    const patterns = [
+        { regex: /^(?:it|test)\s*\(/, type: 'test_case' },
+        { regex: /^describe\s*\(/, type: 'test_suite' },
+        { regex: /^(?:beforeEach|afterEach|beforeAll|afterAll)\s*\(/, type: 'test_hook' },
+        { regex: /^context\s*\(/, type: 'test_context' },
+        { regex: /^def\s+test_/, type: 'python_test' },
+        { regex: /^class\s+\w*Test/, type: 'test_class' },
+        { regex: /@Test/, type: 'test_annotation' },
+    ];
+    
+    for (const pattern of patterns) {
+        if (pattern.regex.test(line)) {
+            return {
+                line: lineNum,
+                type: pattern.type,
+                content: line.substring(0, 100)
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectDatabaseQuery(line, lineNum) {
+    const patterns = [
+        { regex: /\b(SELECT|INSERT|UPDATE|DELETE|CREATE TABLE|ALTER TABLE|DROP TABLE)\b/i, type: 'sql_query' },
+        { regex: /\b\.query\s*\(/, type: 'db_query' },
+        { regex: /\b\.execute\s*\(/, type: 'db_execute' },
+        { regex: /\b\.find\s*\(/, type: 'orm_find' },
+        { regex: /\b\.findOne\s*\(/, type: 'orm_find_one' },
+        { regex: /\b\.save\s*\(/, type: 'orm_save' },
+        { regex: /\b\.create\s*\(/, type: 'orm_create' },
+        { regex: /\b\.update\s*\(/, type: 'orm_update' },
+        { regex: /\b\.delete\s*\(/, type: 'orm_delete' },
+        { regex: /\bModel\./, type: 'orm_model' },
+        { regex: /\bSchema\./, type: 'orm_schema' },
+    ];
+    
+    for (const pattern of patterns) {
+        if (pattern.regex.test(line)) {
+            return {
+                line: lineNum,
+                type: pattern.type,
+                content: line.substring(0, 150)
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectApiEndpoint(line, lineNum) {
+    const patterns = [
+        { regex: /\.(get|post|put|delete|patch|options|head)\s*\(/, type: 'http_method' },
+        { regex: /app\.(get|post|put|delete|patch)\s*\(/, type: 'express_route' },
+        { regex: /router\.(get|post|put|delete|patch)\s*\(/, type: 'router_route' },
+        { regex: /@(Get|Post|Put|Delete|Patch|RequestMapping)\s*\(/, type: 'spring_route' },
+        { regex: /@(app\.route|bp\.route)\s*\(/, type: 'flask_route' },
+        { regex: /Route::(get|post|put|delete|patch)\s*\(/, type: 'laravel_route' },
+        { regex: /fetch\s*\(/, type: 'fetch_call' },
+        { regex: /axios\.(get|post|put|delete|patch)\s*\(/, type: 'axios_call' },
+    ];
+    
+    for (const pattern of patterns) {
+        if (pattern.regex.test(line)) {
+            return {
+                line: lineNum,
+                type: pattern.type,
+                content: line.substring(0, 150)
+            };
+        }
+    }
+    
+    return null;
+}
+
+function detectLanguageFeatures(line, features) {
+    const featurePatterns = [
+        { regex: /=>/, feature: 'arrow_functions' },
+        { regex: /\?\s*\./, feature: 'optional_chaining' },
+        { regex: /\?\?/, feature: 'nullish_coalescing' },
+        { regex: /\.{3}/, feature: 'spread_operator' },
+        { regex: /`[^`]*\$\{[^}]*\}[^`]*`/, feature: 'template_literals' },
+        { regex: /\[.*\]:/, feature: 'computed_properties' },
+        { regex: /async\s+/, feature: 'async_await' },
+        { regex: /yield\s+/, feature: 'generators' },
+        { regex: /Symbol\(/, feature: 'symbols' },
+        { regex: /Proxy\(/, feature: 'proxies' },
+        { regex: /Reflect\./, feature: 'reflection' },
+        { regex: /Map\(/, feature: 'maps' },
+        { regex: /Set\(/, feature: 'sets' },
+        { regex: /WeakMap|WeakSet/, feature: 'weak_collections' },
+        { regex: /class\s+/, feature: 'classes' },
+        { regex: /import\s*\(/, feature: 'dynamic_imports' },
+        { regex: /with\s*\(/, feature: 'with_statement' },
+        { regex: /pattern\s+/, feature: 'pattern_matching' },
+    ];
+    
+    for (const pattern of featurePatterns) {
+        if (pattern.regex.test(line)) {
+            features.add(pattern.feature);
+        }
+    }
+}
+
+// Calculate file detail map data - ENHANCED VERSION
 function calculateFileDetailMapData(filePath, commitHash = null) {
     const structure = analyzeFileStructure(filePath, commitHash);
     if (!structure) return null;
@@ -161,91 +947,283 @@ function calculateFileDetailMapData(filePath, commitHash = null) {
         path: filePath,
         depth: 0,
         size: structure.totalLines,
-        childrenCount: 3
+        childrenCount: 6 + (structure.complexity ? 1 : 0)
     });
     
-    // Overview node
+    // Overview section
     const overviewId = id++;
     nodes.push({
         id: overviewId,
-        name: 'Overview',
+        name: '📊 File Overview',
         type: 'section',
         path: filePath + '#overview',
         depth: 1,
         size: structure.totalLines,
-        childrenCount: 4
+        childrenCount: 8
     });
     links.push({ source: rootId, target: overviewId, depth: 1 });
     
-    // Detail nodes
-    const details = [
-        `Total: ${structure.totalLines} lines`,
-        `Code: ${structure.codeLines} lines`,
-        `Comments: ${structure.commentLines} lines`,
-        `Empty: ${structure.emptyLines} lines`
+    // File statistics
+    const stats = [
+        { name: `📏 Total Lines: ${structure.totalLines}`, type: 'stat' },
+        { name: `⌨️  Code Lines: ${structure.codeLines}`, type: 'stat' },
+        { name: `💬 Comment Lines: ${structure.commentLines}`, type: 'stat' },
+        { name: `⬜ Empty Lines: ${structure.emptyLines}`, type: 'stat' },
+        { name: `📈 Code Density: ${((structure.codeLines / Math.max(1, structure.totalLines)) * 100).toFixed(1)}%`, type: 'stat' },
+        { name: `💭 Comment Ratio: ${((structure.commentLines / Math.max(1, structure.codeLines + structure.commentLines)) * 100).toFixed(1)}%`, type: 'stat' },
+        { name: `🧩 Language Features: ${structure.languageFeatures.length}`, type: 'stat' },
+        { name: `📦 Dependencies: ${structure.dependencies.length}`, type: 'stat' }
     ];
     
-    details.forEach(name => {
-        const detailId = id++;
-        nodes.push({ id: detailId, name, type: 'detail', depth: 2, size: 1 });
-        links.push({ source: overviewId, target: detailId, depth: 2 });
+    stats.forEach(stat => {
+        const statId = id++;
+        nodes.push({ id: statId, name: stat.name, type: stat.type, depth: 2, size: 1 });
+        links.push({ source: overviewId, target: statId, depth: 2 });
     });
     
-    // Functions section
-    if (structure.blocks.length > 0) {
-        const blocksId = id++;
+    // Complexity section
+    if (structure.complexity) {
+        const complexityId = id++;
         nodes.push({
-            id: blocksId,
-            name: `Functions (${structure.blocks.length})`,
+            id: complexityId,
+            name: '📈 Code Complexity',
             type: 'section',
             depth: 1,
-            size: structure.blocks.length,
-            childrenCount: Math.min(structure.blocks.length, 10)
+            size: 3,
+            childrenCount: 3
         });
-        links.push({ source: rootId, target: blocksId, depth: 1 });
+        links.push({ source: rootId, target: complexityId, depth: 1 });
         
-        structure.blocks.slice(0, 10).forEach(block => {
-            const blockId = id++;
+        const complexityStats = [
+            `🔄 Cyclomatic: ${structure.complexity.cyclomaticComplexity}`,
+            `📊 Max Nesting: ${structure.complexity.maxNestingDepth}`,
+            `🏷️  Complexity Score: ${calculateComplexityScore(structure.complexity)}`
+        ];
+        
+        complexityStats.forEach(stat => {
+            const statId = id++;
+            nodes.push({ id: statId, name: stat, type: 'detail', depth: 2, size: 1 });
+            links.push({ source: complexityId, target: statId, depth: 2 });
+        });
+    }
+    
+    // Functions section
+    if (structure.functions.length > 0) {
+        const functionsId = id++;
+        nodes.push({
+            id: functionsId,
+            name: `⚡ Functions (${structure.functions.length})`,
+            type: 'section',
+            depth: 1,
+            size: structure.functions.length,
+            childrenCount: Math.min(structure.functions.length, 15)
+        });
+        links.push({ source: rootId, target: functionsId, depth: 1 });
+        
+        structure.functions.slice(0, 15).forEach(func => {
+            const funcId = id++;
             nodes.push({
-                id: blockId,
-                name: block.name,
+                id: funcId,
+                name: func.name,
                 type: 'function',
                 depth: 2,
                 size: 1,
-                line: block.line
+                line: func.line,
+                params: func.params
             });
-            links.push({ source: blocksId, target: blockId, depth: 2 });
+            links.push({ source: functionsId, target: funcId, depth: 2 });
         });
     }
     
     // Classes section
-    if (structure.definitions.length > 0) {
-        const defsId = id++;
+    if (structure.classes.length > 0) {
+        const classesId = id++;
         nodes.push({
-            id: defsId,
-            name: `Classes (${structure.definitions.length})`,
+            id: classesId,
+            name: `🏗️  Classes (${structure.classes.length})`,
             type: 'section',
             depth: 1,
-            size: structure.definitions.length,
-            childrenCount: Math.min(structure.definitions.length, 10)
+            size: structure.classes.length,
+            childrenCount: Math.min(structure.classes.length, 15)
         });
-        links.push({ source: rootId, target: defsId, depth: 1 });
+        links.push({ source: rootId, target: classesId, depth: 1 });
         
-        structure.definitions.slice(0, 10).forEach(def => {
-            const defId = id++;
+        structure.classes.slice(0, 15).forEach(cls => {
+            const clsId = id++;
             nodes.push({
-                id: defId,
-                name: def.name,
+                id: clsId,
+                name: cls.name,
                 type: 'class',
                 depth: 2,
                 size: 1,
-                line: def.line
+                line: cls.line
             });
-            links.push({ source: defsId, target: defId, depth: 2 });
+            links.push({ source: classesId, target: clsId, depth: 2 });
         });
     }
     
-    return { nodes, links };
+    // Imports section
+    if (structure.imports.length > 0) {
+        const importsId = id++;
+        nodes.push({
+            id: importsId,
+            name: `📦 Imports (${structure.imports.length})`,
+            type: 'section',
+            depth: 1,
+            size: structure.imports.length,
+            childrenCount: Math.min(structure.imports.length, 10)
+        });
+        links.push({ source: rootId, target: importsId, depth: 1 });
+        
+        // Group imports by type
+        const importTypes = {};
+        structure.imports.forEach(imp => {
+            if (!importTypes[imp.type]) importTypes[imp.type] = [];
+            importTypes[imp.type].push(imp);
+        });
+        
+        Object.entries(importTypes).slice(0, 10).forEach(([type, imports]) => {
+            const typeId = id++;
+            nodes.push({
+                id: typeId,
+                name: `${type} (${imports.length})`,
+                type: 'import_group',
+                depth: 2,
+                size: imports.length
+            });
+            links.push({ source: importsId, target: typeId, depth: 2 });
+            
+            imports.slice(0, 5).forEach(imp => {
+                const impId = id++;
+                nodes.push({
+                    id: impId,
+                    name: imp.module || 'unknown',
+                    type: 'import',
+                    depth: 3,
+                    size: 1,
+                    line: imp.line
+                });
+                links.push({ source: typeId, target: impId, depth: 3 });
+            });
+        });
+    }
+    
+    // Exports section
+    if (structure.exports.length > 0) {
+        const exportsId = id++;
+        nodes.push({
+            id: exportsId,
+            name: `📤 Exports (${structure.exports.length})`,
+            type: 'section',
+            depth: 1,
+            size: structure.exports.length,
+            childrenCount: Math.min(structure.exports.length, 10)
+        });
+        links.push({ source: rootId, target: exportsId, depth: 1 });
+        
+        structure.exports.slice(0, 10).forEach(exp => {
+            const expId = id++;
+            nodes.push({
+                id: expId,
+                name: exp.type,
+                type: 'export',
+                depth: 2,
+                size: 1,
+                line: exp.line
+            });
+            links.push({ source: exportsId, target: expId, depth: 2 });
+        });
+    }
+    
+    // React Components section
+    if (structure.reactComponents.length > 0) {
+        const reactId = id++;
+        nodes.push({
+            id: reactId,
+            name: `⚛️  React Components (${structure.reactComponents.length})`,
+            type: 'section',
+            depth: 1,
+            size: structure.reactComponents.length,
+            childrenCount: structure.reactComponents.length
+        });
+        links.push({ source: rootId, target: reactId, depth: 1 });
+        
+        structure.reactComponents.forEach(comp => {
+            const compId = id++;
+            nodes.push({
+                id: compId,
+                name: comp.name,
+                type: 'react_component',
+                depth: 2,
+                size: 1,
+                line: comp.line
+            });
+            links.push({ source: reactId, target: compId, depth: 2 });
+        });
+    }
+    
+    // Hooks section
+    if (structure.hooks.length > 0) {
+        const hooksId = id++;
+        nodes.push({
+            id: hooksId,
+            name: `🎣 Hooks (${structure.hooks.length})`,
+            type: 'section',
+            depth: 1,
+            size: structure.hooks.length,
+            childrenCount: Math.min(structure.hooks.length, 10)
+        });
+        links.push({ source: rootId, target: hooksId, depth: 1 });
+        
+        structure.hooks.slice(0, 10).forEach(hook => {
+            const hookId = id++;
+            nodes.push({
+                id: hookId,
+                name: hook.name,
+                type: 'hook',
+                depth: 2,
+                size: 1,
+                line: hook.line
+            });
+            links.push({ source: hooksId, target: hookId, depth: 2 });
+        });
+    }
+    
+    // Dependencies section
+    if (structure.dependencies.length > 0) {
+        const depsId = id++;
+        nodes.push({
+            id: depsId,
+            name: `🔗 Dependencies (${structure.dependencies.length})`,
+            type: 'section',
+            depth: 1,
+            size: structure.dependencies.length,
+            childrenCount: Math.min(structure.dependencies.length, 10)
+        });
+        links.push({ source: rootId, target: depsId, depth: 1 });
+        
+        structure.dependencies.slice(0, 10).forEach(dep => {
+            const depId = id++;
+            nodes.push({
+                id: depId,
+                name: dep,
+                type: 'dependency',
+                depth: 2,
+                size: 1
+            });
+            links.push({ source: depsId, target: depId, depth: 2 });
+        });
+    }
+    
+    return { nodes, links, structure };
+}
+
+function calculateComplexityScore(complexity) {
+    const score = complexity.cyclomaticComplexity * 2 + complexity.maxNestingDepth * 3;
+    if (score <= 10) return 'Low';
+    if (score <= 20) return 'Medium';
+    if (score <= 30) return 'High';
+    return 'Very High';
 }
 
 // Function to build file tree structure
@@ -424,14 +1402,40 @@ function generateHTML(initialTree, isGitRepo, commits) {
         .commit-info span { color: #58a6ff; font-weight: 600; }
         .main-content { flex: 1; display: flex; gap: 20px; overflow: hidden; min-height: 0; }
         .views-container { flex: 1; overflow: hidden; position: relative; min-width: 0; }
-        .file-detail-view { width: 450px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; display: none; flex-direction: column; overflow: hidden; }
+        .file-detail-view { width: 550px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; display: none; flex-direction: column; overflow: hidden; }
         .file-detail-view.active { display: flex; }
         .file-detail-header { padding: 15px; border-bottom: 1px solid #30363d; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
         .file-detail-title { color: #58a6ff; font-size: 16px; font-weight: 600; word-break: break-all; flex: 1; margin-right: 10px; }
         .close-btn { background: none; border: none; color: #8b949e; cursor: pointer; font-size: 20px; padding: 5px; transition: color 0.2s; }
         .close-btn:hover { color: #f85149; }
-        .file-detail-content { flex: 1; overflow: hidden; position: relative; min-height: 300px; }
-        .file-detail-svg { width: 100%; height: 100%; }
+        .file-detail-tabs { display: flex; gap: 5px; padding: 10px; background: #0d1117; border-bottom: 1px solid #30363d; flex-shrink: 0; }
+        .tab-btn { background: transparent; color: #8b949e; border: 1px solid #30363d; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; transition: all 0.2s; }
+        .tab-btn.active { background: #1f6feb; color: white; border-color: #1f6feb; }
+        .tab-btn:hover:not(.active) { background: #21262d; color: #c9d1d9; }
+        .file-detail-content { flex: 1; overflow: hidden; position: relative; min-height: 0; }
+        .tab-content { position: absolute; top: 0; left: 0; right: 0; bottom: 0; overflow-y: auto; overflow-x: hidden; padding: 15px; display: none; }
+        .tab-content.active { display: block; }
+        .structure-section { margin-bottom: 20px; }
+        .structure-section h3 { color: #58a6ff; font-size: 14px; margin-bottom: 10px; padding-bottom: 5px; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 8px; }
+        .structure-item { background: #1c2128; border: 1px solid #30363d; border-radius: 4px; padding: 8px 12px; margin-bottom: 5px; font-size: 12px; display: flex; justify-content: space-between; align-items: center; transition: all 0.2s; }
+        .structure-item:hover { background: #21262d; border-color: #58a6ff; }
+        .structure-item .item-name { color: #79c0ff; font-weight: 600; font-family: 'Courier New', monospace; }
+        .structure-item .item-line { color: #8b949e; font-size: 11px; }
+        .structure-item .item-type { color: #8b949e; font-size: 10px; text-transform: uppercase; background: #30363d; padding: 2px 6px; border-radius: 3px; }
+        .structure-badge { display: inline-block; background: #30363d; color: #8b949e; padding: 2px 8px; border-radius: 12px; font-size: 11px; margin-left: 5px; }
+        .complexity-indicator { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+        .complexity-low { background: #1b3826; color: #3fb950; }
+        .complexity-medium { background: #3d2e00; color: #d2991d; }
+        .complexity-high { background: #3d1f00; color: #f0883e; }
+        .complexity-very-high { background: #3d1119; color: #f85149; }
+        .file-detail-svg { width: 100%; height: 100%; min-height: 300px; }
+        .file-detail-tooltip { position: absolute; background: #1c2128; border: 1px solid #30363d; border-radius: 6px; padding: 10px; color: #c9d1d9; font-size: 12px; pointer-events: none; opacity: 0; transition: opacity 0.2s; z-index: 1000; max-width: 250px; }
+        .file-detail-controls { position: absolute; bottom: 20px; right: 20px; display: flex; gap: 5px; z-index: 10; }
+        .zoom-btn { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 16px; }
+        .zoom-btn:hover { background: #30363d; }
+        .file-content-preview { padding: 10px; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; font-family: 'Courier New', monospace; font-size: 12px; white-space: pre-wrap; word-wrap: break-word; max-height: none; }
+        .file-content-preview pre { margin: 0; }
+        .empty-detail-message { display: flex; align-items: center; justify-content: center; height: 100%; color: #8b949e; font-size: 14px; text-align: center; padding: 20px; }
         .tree-view, .map-view { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: #161b22; border: 1px solid #30363d; border-radius: 6px; overflow: auto; }
         .tree-view { padding: 20px; }
         .map-view { padding: 20px; display: none; }
@@ -454,7 +1458,7 @@ function generateHTML(initialTree, isGitRepo, commits) {
         .toggle-btn:hover { color: #79c0ff; }
         .loading { display: none; color: #58a6ff; margin-left: 10px; font-style: italic; }
         .stats { color: #8b949e; font-size: 12px; margin-top: 10px; flex-shrink: 0; }
-        .map-svg, .file-detail-svg { width: 100%; height: 100%; min-height: 300px; }
+        .map-svg { width: 100%; height: 100%; min-height: 300px; }
         .map-node { cursor: pointer; transition: all 0.3s; }
         .map-node:hover { filter: brightness(1.3); }
         .map-node-circle { stroke-width: 2px; transition: all 0.3s; }
@@ -462,14 +1466,27 @@ function generateHTML(initialTree, isGitRepo, commits) {
         .map-link { stroke: #30363d; stroke-width: 1.5px; transition: all 0.3s; }
         .map-link:hover { stroke: #58a6ff; stroke-width: 2px; }
         .map-label { fill: #c9d1d9; font-size: 10px; pointer-events: none; text-anchor: middle; }
-        .map-tooltip, .file-detail-tooltip { position: absolute; background: #1c2128; border: 1px solid #30363d; border-radius: 6px; padding: 10px; color: #c9d1d9; font-size: 12px; pointer-events: none; opacity: 0; transition: opacity 0.2s; z-index: 1000; max-width: 300px; }
-        .file-detail-tooltip { max-width: 250px; }
-        .map-controls, .file-detail-controls { position: absolute; bottom: 20px; right: 20px; display: flex; gap: 5px; z-index: 10; }
-        .zoom-btn { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 16px; }
-        .zoom-btn:hover { background: #30363d; }
-        .file-content-preview { padding: 10px; background: #0d1117; border-top: 1px solid #30363d; max-height: 200px; overflow-y: auto; font-family: 'Courier New', monospace; font-size: 12px; flex-shrink: 0; }
-        .file-content-preview pre { margin: 0; white-space: pre-wrap; word-wrap: break-word; }
-        .empty-detail-message { display: flex; align-items: center; justify-content: center; height: 100%; color: #8b949e; font-size: 14px; text-align: center; padding: 20px; }
+        .map-tooltip { position: absolute; background: #1c2128; border: 1px solid #30363d; border-radius: 6px; padding: 10px; color: #c9d1d9; font-size: 12px; pointer-events: none; opacity: 0; transition: opacity 0.2s; z-index: 1000; max-width: 300px; }
+        .map-controls { position: absolute; bottom: 20px; right: 20px; display: flex; gap: 5px; z-index: 10; }
+        
+        /* Custom scrollbar */
+        .tab-content::-webkit-scrollbar,
+        .file-content-preview::-webkit-scrollbar {
+            width: 8px;
+        }
+        .tab-content::-webkit-scrollbar-track,
+        .file-content-preview::-webkit-scrollbar-track {
+            background: #0d1117;
+        }
+        .tab-content::-webkit-scrollbar-thumb,
+        .file-content-preview::-webkit-scrollbar-thumb {
+            background: #30363d;
+            border-radius: 4px;
+        }
+        .tab-content::-webkit-scrollbar-thumb:hover,
+        .file-content-preview::-webkit-scrollbar-thumb:hover {
+            background: #484f58;
+        }
     </style>
 </head>
 <body>
@@ -522,18 +1539,37 @@ function generateHTML(initialTree, isGitRepo, commits) {
                     <span class="file-detail-title" id="fileDetailTitle">Select a file to view details</span>
                     <button class="close-btn" onclick="closeFileDetail()">✕</button>
                 </div>
-                <div class="file-detail-content" id="fileDetailContent">
-                    <svg class="file-detail-svg" id="fileDetailSvg" style="display:none;"></svg>
-                    <div class="empty-detail-message" id="emptyDetailMessage">Click on a file in the tree or map view to see its structure</div>
-                    <div class="file-detail-tooltip" id="fileDetailTooltip"></div>
-                    <div class="file-detail-controls" id="fileDetailControls" style="display:none;">
-                        <button class="zoom-btn" onclick="zoomFileDetailMap(1.2)">➕</button>
-                        <button class="zoom-btn" onclick="zoomFileDetailMap(0.8)">➖</button>
-                        <button class="zoom-btn" onclick="resetFileDetailMap()">🔄</button>
-                    </div>
+                <div class="file-detail-tabs" id="fileDetailTabs" style="display:none;">
+                    <button class="tab-btn active" onclick="switchDetailTab('overview')">📊 Overview</button>
+                    <button class="tab-btn" onclick="switchDetailTab('structure')">🏗️ Structure</button>
+                    <button class="tab-btn" onclick="switchDetailTab('map')">🗺️ Map</button>
+                    <button class="tab-btn" onclick="switchDetailTab('code')">💻 Code</button>
                 </div>
-                <div class="file-content-preview" id="fileContentPreview" style="display:none;">
-                    <pre id="fileContentCode"></pre>
+                <div class="file-detail-content" id="fileDetailContent">
+                    <div class="tab-content active" id="tab-overview">
+                        <div class="empty-detail-message" id="emptyOverviewMessage">Loading file overview...</div>
+                        <div id="overviewContent" style="display:none;"></div>
+                    </div>
+                    <div class="tab-content" id="tab-structure">
+                        <div class="empty-detail-message" id="emptyStructureMessage">Loading file structure...</div>
+                        <div id="structureContent" style="display:none;"></div>
+                    </div>
+                    <div class="tab-content" id="tab-map">
+                        <svg class="file-detail-svg" id="fileDetailSvg" style="display:none;"></svg>
+                        <div class="empty-detail-message" id="emptyMapMessage">Click on a file in the tree or map view to see its structure</div>
+                        <div class="file-detail-tooltip" id="fileDetailTooltip"></div>
+                        <div class="file-detail-controls" id="fileDetailControls" style="display:none;">
+                            <button class="zoom-btn" onclick="zoomFileDetailMap(1.2)">➕</button>
+                            <button class="zoom-btn" onclick="zoomFileDetailMap(0.8)">➖</button>
+                            <button class="zoom-btn" onclick="resetFileDetailMap()">🔄</button>
+                        </div>
+                    </div>
+                    <div class="tab-content" id="tab-code">
+                        <div class="file-content-preview" id="fileContentPreview" style="display:none;">
+                            <pre id="fileContentCode"></pre>
+                        </div>
+                        <div class="empty-detail-message" id="emptyCodeMessage">Code preview will appear here</div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -548,6 +1584,7 @@ function generateHTML(initialTree, isGitRepo, commits) {
         let currentMapData = ${JSON.stringify(mapData)};
         let initialTree = ${JSON.stringify(initialTree)};
         let currentFileDetailData = null;
+        let currentFileStructure = null;
         let mapTransform = { x: 0, y: 0, scale: 1 };
         let fileDetailMapTransform = { x: 0, y: 0, scale: 1 };
         let isDragging = false;
@@ -555,6 +1592,7 @@ function generateHTML(initialTree, isGitRepo, commits) {
         let isFileDetailDragging = false;
         let fileDetailDragStart = { x: 0, y: 0 };
         let currentSelectedFile = null;
+        let currentDetailTab = 'overview';
         let isGitRepo = ${isGitRepo};
         
         // View switching
@@ -581,6 +1619,21 @@ function generateHTML(initialTree, isGitRepo, commits) {
             }
         }
         
+        // Detail tab switching
+        function switchDetailTab(tab) {
+            currentDetailTab = tab;
+            
+            document.querySelectorAll('#fileDetailTabs .tab-btn').forEach(btn => btn.classList.remove('active'));
+            event.target.classList.add('active');
+            
+            document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+            document.getElementById('tab-' + tab).classList.add('active');
+            
+            if (tab === 'map' && currentFileDetailData) {
+                setTimeout(() => renderMap(currentFileDetailData, 'fileDetailSvg', 'fileDetailTooltip', fileDetailMapTransform, 'file-detail'), 100);
+            }
+        }
+        
         // Map rendering
         function renderMapData(data, svgId, tooltipId, transform, type) {
             const svg = document.getElementById(svgId);
@@ -591,7 +1644,7 @@ function generateHTML(initialTree, isGitRepo, commits) {
             if (!data || !data.nodes || data.nodes.length === 0) {
                 svg.style.display = 'none';
                 if (type === 'file-detail') {
-                    document.getElementById('emptyDetailMessage').style.display = 'flex';
+                    document.getElementById('emptyMapMessage').style.display = 'flex';
                     document.getElementById('fileDetailControls').style.display = 'none';
                 }
                 return;
@@ -599,7 +1652,7 @@ function generateHTML(initialTree, isGitRepo, commits) {
             
             svg.style.display = 'block';
             if (type === 'file-detail') {
-                document.getElementById('emptyDetailMessage').style.display = 'none';
+                document.getElementById('emptyMapMessage').style.display = 'none';
                 document.getElementById('fileDetailControls').style.display = 'flex';
             }
             
@@ -655,7 +1708,13 @@ function generateHTML(initialTree, isGitRepo, commits) {
                     case 'function': radius = 12; color = '#d2a8ff'; break;
                     case 'class': radius = 14; color = '#f0883e'; break;
                     case 'import': radius = 10; color = '#79c0ff'; break;
+                    case 'import_group': radius = 14; color = '#1f6feb'; break;
+                    case 'export': radius = 10; color = '#3fb950'; break;
                     case 'detail': radius = 8; color = '#8b949e'; break;
+                    case 'stat': radius = 6; color = '#6e7681'; break;
+                    case 'dependency': radius = 8; color = '#f0883e'; break;
+                    case 'react_component': radius = 12; color = '#61dafb'; break;
+                    case 'hook': radius = 10; color = '#d2a8ff'; break;
                     default: radius = 8; color = '#8b949e';
                 }
                 
@@ -775,23 +1834,196 @@ function generateHTML(initialTree, isGitRepo, commits) {
             updateFileDetailMapTransform();
         }
         
+        // Render structure overview
+        function renderStructureOverview(structure) {
+            let html = '';
+            
+            // File Statistics
+            html += '<div class="structure-section">';
+            html += '<h3>📊 File Statistics</h3>';
+            html += \`<div class="structure-item"><span>Total Lines</span><span class="item-name">\${structure.totalLines}</span></div>\`;
+            html += \`<div class="structure-item"><span>Code Lines</span><span class="item-name">\${structure.codeLines}</span></div>\`;
+            html += \`<div class="structure-item"><span>Comment Lines</span><span class="item-name">\${structure.commentLines}</span></div>\`;
+            html += \`<div class="structure-item"><span>Empty Lines</span><span class="item-name">\${structure.emptyLines}</span></div>\`;
+            const density = ((structure.codeLines / Math.max(1, structure.totalLines)) * 100).toFixed(1);
+            html += \`<div class="structure-item"><span>Code Density</span><span class="item-name">\${density}%</span></div>\`;
+            html += '</div>';
+            
+            // Complexity
+            if (structure.complexity) {
+                html += '<div class="structure-section">';
+                html += '<h3>📈 Complexity Analysis</h3>';
+                html += \`<div class="structure-item"><span>Cyclomatic Complexity</span><span class="item-name">\${structure.complexity.cyclomaticComplexity}</span></div>\`;
+                html += \`<div class="structure-item"><span>Max Nesting Depth</span><span class="item-name">\${structure.complexity.maxNestingDepth}</span></div>\`;
+                const score = structure.complexity.cyclomaticComplexity * 2 + structure.complexity.maxNestingDepth * 3;
+                let complexityClass = 'low';
+                let complexityLabel = 'Low';
+                if (score > 30) { complexityClass = 'very-high'; complexityLabel = 'Very High'; }
+                else if (score > 20) { complexityClass = 'high'; complexityLabel = 'High'; }
+                else if (score > 10) { complexityClass = 'medium'; complexityLabel = 'Medium'; }
+                html += \`<div class="structure-item"><span>Complexity Score</span><span class="complexity-indicator complexity-\${complexityClass}">\${complexityLabel}</span></div>\`;
+                html += '</div>';
+            }
+            
+            // Language Features
+            if (structure.languageFeatures && structure.languageFeatures.length > 0) {
+                html += '<div class="structure-section">';
+                html += '<h3>🧩 Language Features</h3>';
+                structure.languageFeatures.forEach(feature => {
+                    html += \`<div class="structure-item"><span class="item-type">\${feature}</span></div>\`;
+                });
+                html += '</div>';
+            }
+            
+            // Dependencies
+            if (structure.dependencies && structure.dependencies.length > 0) {
+                html += '<div class="structure-section">';
+                html += \`<h3>📦 Dependencies <span class="structure-badge">\${structure.dependencies.length}</span></h3>\`;
+                structure.dependencies.forEach(dep => {
+                    html += \`<div class="structure-item"><span class="item-name">\${dep}</span></div>\`;
+                });
+                html += '</div>';
+            }
+            
+            return html;
+        }
+        
+        // Render detailed structure
+        function renderDetailedStructure(structure) {
+            let html = '';
+            
+            // Functions
+            if (structure.functions && structure.functions.length > 0) {
+                html += '<div class="structure-section">';
+                html += \`<h3>⚡ Functions <span class="structure-badge">\${structure.functions.length}</span></h3>\`;
+                structure.functions.forEach(func => {
+                    html += \`<div class="structure-item">\`;
+                    html += \`<span class="item-name">\${func.name || 'anonymous'}(\${func.params || ''})</span>\`;
+                    html += \`<div>\`;
+                    html += \`<span class="item-type">\${func.type || 'function'}</span>\`;
+                    if (func.isAsync) html += '<span class="structure-badge">async</span>';
+                    html += \`<span class="item-line">Line \${func.line}</span>\`;
+                    html += \`</div></div>\`;
+                });
+                html += '</div>';
+            }
+            
+            // Classes
+            if (structure.classes && structure.classes.length > 0) {
+                html += '<div class="structure-section">';
+                html += \`<h3>🏗️ Classes <span class="structure-badge">\${structure.classes.length}</span></h3>\`;
+                structure.classes.forEach(cls => {
+                    html += \`<div class="structure-item">\`;
+                    html += \`<span class="item-name">\${cls.name}</span>\`;
+                    html += \`<div>\`;
+                    html += \`<span class="item-type">class</span>\`;
+                    if (cls.extends) html += \`<span class="structure-badge">extends \${cls.extends}</span>\`;
+                    html += \`<span class="item-line">Line \${cls.line}</span>\`;
+                    html += \`</div></div>\`;
+                });
+                html += '</div>';
+            }
+            
+            // Interfaces/Types
+            if (structure.interfaces && structure.interfaces.length > 0) {
+                html += '<div class="structure-section">';
+                html += \`<h3>📋 Interfaces/Types <span class="structure-badge">\${structure.interfaces.length}</span></h3>\`;
+                structure.interfaces.forEach(iface => {
+                    html += \`<div class="structure-item">\`;
+                    html += \`<span class="item-name">\${iface.name}</span>\`;
+                    html += \`<div><span class="item-type">\${iface.type}</span><span class="item-line">Line \${iface.line}</span></div>\`;
+                    html += \`</div>\`;
+                });
+                html += '</div>';
+            }
+            
+            // Imports
+            if (structure.imports && structure.imports.length > 0) {
+                html += '<div class="structure-section">';
+                html += \`<h3>📥 Imports <span class="structure-badge">\${structure.imports.length}</span></h3>\`;
+                structure.imports.slice(0, 20).forEach(imp => {
+                    html += \`<div class="structure-item">\`;
+                    html += \`<span class="item-name">\${imp.module || 'unknown'}</span>\`;
+                    html += \`<div><span class="item-type">\${imp.type}</span><span class="item-line">Line \${imp.line}</span></div>\`;
+                    html += \`</div>\`;
+                });
+                if (structure.imports.length > 20) {
+                    html += \`<div class="structure-item"><span>... and \${structure.imports.length - 20} more imports</span></div>\`;
+                }
+                html += '</div>';
+            }
+            
+            // Exports
+            if (structure.exports && structure.exports.length > 0) {
+                html += '<div class="structure-section">';
+                html += \`<h3>📤 Exports <span class="structure-badge">\${structure.exports.length}</span></h3>\`;
+                structure.exports.forEach(exp => {
+                    html += \`<div class="structure-item">\`;
+                    html += \`<span class="item-name">\${exp.type}</span>\`;
+                    html += \`<span class="item-line">Line \${exp.line}</span>\`;
+                    html += \`</div>\`;
+                });
+                html += '</div>';
+            }
+            
+            // React Components
+            if (structure.reactComponents && structure.reactComponents.length > 0) {
+                html += '<div class="structure-section">';
+                html += \`<h3>⚛️ React Components <span class="structure-badge">\${structure.reactComponents.length}</span></h3>\`;
+                structure.reactComponents.forEach(comp => {
+                    html += \`<div class="structure-item">\`;
+                    html += \`<span class="item-name">\${comp.name}</span>\`;
+                    html += \`<div><span class="item-type">\${comp.type}</span><span class="item-line">Line \${comp.line}</span></div>\`;
+                    html += \`</div>\`;
+                });
+                html += '</div>';
+            }
+            
+            // Control Structures
+            if (structure.controlStructures && structure.controlStructures.length > 0) {
+                html += '<div class="structure-section">';
+                html += \`<h3>🔄 Control Flow <span class="structure-badge">\${structure.controlStructures.length}</span></h3>\`;
+                const controlTypes = {};
+                structure.controlStructures.forEach(cs => {
+                    if (!controlTypes[cs.type]) controlTypes[cs.type] = 0;
+                    controlTypes[cs.type]++;
+                });
+                Object.entries(controlTypes).forEach(([type, count]) => {
+                    html += \`<div class="structure-item"><span class="item-name">\${type}</span><span class="structure-badge">\${count}</span></div>\`;
+                });
+                html += '</div>';
+            }
+            
+            return html;
+        }
+        
         // File detail functions
         async function openFileDetail(filePath) {
             currentSelectedFile = filePath;
             const fileDetailView = document.getElementById('fileDetailView');
             const fileDetailTitle = document.getElementById('fileDetailTitle');
-            const fileDetailSvg = document.getElementById('fileDetailSvg');
-            const emptyDetailMessage = document.getElementById('emptyDetailMessage');
-            const fileDetailControls = document.getElementById('fileDetailControls');
+            const fileDetailTabs = document.getElementById('fileDetailTabs');
             
             fileDetailTitle.textContent = '📄 ' + filePath.split('/').pop();
             fileDetailView.classList.add('active');
+            fileDetailTabs.style.display = 'flex';
             
-            fileDetailSvg.style.display = 'none';
-            emptyDetailMessage.style.display = 'flex';
-            emptyDetailMessage.textContent = 'Loading...';
-            fileDetailControls.style.display = 'none';
+            // Reset tabs
+            document.querySelectorAll('#fileDetailTabs .tab-btn').forEach(btn => btn.classList.remove('active'));
+            document.querySelector('#fileDetailTabs .tab-btn:first-child').classList.add('active');
+            document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+            document.getElementById('tab-overview').classList.add('active');
+            currentDetailTab = 'overview';
+            
+            document.getElementById('emptyOverviewMessage').style.display = 'flex';
+            document.getElementById('overviewContent').style.display = 'none';
+            document.getElementById('emptyStructureMessage').style.display = 'flex';
+            document.getElementById('structureContent').style.display = 'none';
+            document.getElementById('fileDetailSvg').style.display = 'none';
+            document.getElementById('emptyMapMessage').style.display = 'flex';
+            document.getElementById('fileDetailControls').style.display = 'none';
             document.getElementById('fileContentPreview').style.display = 'none';
+            document.getElementById('emptyCodeMessage').style.display = 'flex';
             
             document.getElementById('loading').style.display = 'inline';
             
@@ -810,43 +2042,53 @@ function generateHTML(initialTree, isGitRepo, commits) {
                     throw new Error('Failed to fetch file details');
                 }
                 
-                currentFileDetailData = await response.json();
+                const detailData = await response.json();
+                currentFileDetailData = detailData;
+                currentFileStructure = detailData.structure;
                 
                 fileDetailMapTransform = { x: 0, y: 0, scale: 1 };
                 
-                if (currentFileDetailData && currentFileDetailData.nodes && currentFileDetailData.nodes.length > 0) {
-                    renderMap(currentFileDetailData, 'fileDetailSvg', 'fileDetailTooltip', fileDetailMapTransform, 'file-detail');
+                // Render overview
+                if (currentFileStructure) {
+                    document.getElementById('emptyOverviewMessage').style.display = 'none';
+                    document.getElementById('overviewContent').style.display = 'block';
+                    document.getElementById('overviewContent').innerHTML = renderStructureOverview(currentFileStructure);
                     
-                    // Try to load file content preview
-                    try {
-                        let contentUrl = '/file-content/' + encodeURIComponent(filePath);
-                        if (commitHash) contentUrl += '?commit=' + commitHash;
+                    document.getElementById('emptyStructureMessage').style.display = 'none';
+                    document.getElementById('structureContent').style.display = 'block';
+                    document.getElementById('structureContent').innerHTML = renderDetailedStructure(currentFileStructure);
+                }
+                
+                // Render map
+                if (currentFileDetailData && currentFileDetailData.nodes && currentFileDetailData.nodes.length > 0) {
+                    document.getElementById('emptyMapMessage').style.display = 'none';
+                    document.getElementById('fileDetailControls').style.display = 'flex';
+                    renderMap(currentFileDetailData, 'fileDetailSvg', 'fileDetailTooltip', fileDetailMapTransform, 'file-detail');
+                }
+                
+                // Load code preview
+                try {
+                    let contentUrl = '/file-content/' + encodeURIComponent(filePath);
+                    if (commitHash) contentUrl += '?commit=' + commitHash;
+                    
+                    const contentResponse = await fetch(contentUrl);
+                    const contentData = await contentResponse.json();
+                    
+                    if (contentData.content) {
+                        const preview = document.getElementById('fileContentPreview');
+                        const code = document.getElementById('fileContentCode');
+                        preview.style.display = 'block';
+                        document.getElementById('emptyCodeMessage').style.display = 'none';
                         
-                        const contentResponse = await fetch(contentUrl);
-                        const contentData = await contentResponse.json();
-                        
-                        if (contentData.content) {
-                            const preview = document.getElementById('fileContentPreview');
-                            const code = document.getElementById('fileContentCode');
-                            preview.style.display = 'block';
-                            
-                            const truncatedContent = contentData.content.length > 3000 
-                                ? contentData.content.substring(0, 3000) + '\\n\\n... (truncated, showing first 3000 characters)'
-                                : contentData.content;
-                            
-                            code.textContent = truncatedContent;
-                        }
-                    } catch (contentError) {
-                        console.error('Error loading file content:', contentError);
+                        code.textContent = contentData.content;
                     }
-                } else {
-                    emptyDetailMessage.style.display = 'flex';
-                    emptyDetailMessage.textContent = 'No structure could be analyzed for this file';
+                } catch (contentError) {
+                    console.error('Error loading file content:', contentError);
                 }
             } catch (error) {
                 console.error('Error loading file detail:', error);
-                emptyDetailMessage.style.display = 'flex';
-                emptyDetailMessage.textContent = 'Error loading file details: ' + error.message;
+                document.getElementById('emptyOverviewMessage').style.display = 'flex';
+                document.getElementById('emptyOverviewMessage').textContent = 'Error loading file details: ' + error.message;
             } finally {
                 document.getElementById('loading').style.display = 'none';
             }
@@ -855,11 +2097,13 @@ function generateHTML(initialTree, isGitRepo, commits) {
         function closeFileDetail() {
             const fileDetailView = document.getElementById('fileDetailView');
             fileDetailView.classList.remove('active');
+            document.getElementById('fileDetailTabs').style.display = 'none';
             currentSelectedFile = null;
             currentFileDetailData = null;
+            currentFileStructure = null;
             document.getElementById('fileDetailSvg').style.display = 'none';
-            document.getElementById('emptyDetailMessage').style.display = 'flex';
-            document.getElementById('emptyDetailMessage').textContent = 'Click on a file in the tree or map view to see its structure';
+            document.getElementById('emptyMapMessage').style.display = 'flex';
+            document.getElementById('emptyMapMessage').textContent = 'Click on a file in the tree or map view to see its structure';
             document.getElementById('fileDetailControls').style.display = 'none';
             document.getElementById('fileContentPreview').style.display = 'none';
         }
@@ -1012,7 +2256,7 @@ function generateHTML(initialTree, isGitRepo, commits) {
             if (currentView === 'map') {
                 renderMap(currentMapData, 'mapSvg', 'mapTooltip', mapTransform, 'map');
             }
-            if (currentFileDetailData) {
+            if (currentFileDetailData && currentDetailTab === 'map') {
                 renderMap(currentFileDetailData, 'fileDetailSvg', 'fileDetailTooltip', fileDetailMapTransform, 'file-detail');
             }
         });
@@ -1134,7 +2378,7 @@ const server = http.createServer(async (req, res) => {
             
             if (!detailMapData) {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ nodes: [], links: [] }));
+                res.end(JSON.stringify({ nodes: [], links: [], structure: null }));
                 return;
             }
             
@@ -1189,10 +2433,10 @@ server.listen(PORT, () => {
         console.log(`📜 Git repository detected with ${commits.length} commits`);
         console.log(`🔄 Use the slider to navigate through commit history`);
         console.log(`🗺️  Toggle between Tree and Map views`);
-        console.log(`📄 Click on files to view detailed structure analysis\n`);
+        console.log(`📄 Click on files to view detailed structure analysis with multi-language support\n`);
     } else {
         console.log(`ℹ️  Not a git repository - showing current file structure only`);
-        console.log(`📄 Click on files to view detailed structure analysis\n`);
+        console.log(`📄 Click on files to view detailed structure analysis with multi-language support\n`);
     }
 });
 
