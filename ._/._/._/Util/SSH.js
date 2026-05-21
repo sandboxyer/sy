@@ -33,29 +33,26 @@ export default class SSH {
     }
   }
 
-  /**
-   * One-time global setup: SSH config + key generation
-   * @returns {Promise<{success: boolean, message: string}>}
-   */
   static async setup() {
     try {
       const sshDir = join(homedir(), '.ssh');
       const configPath = join(sshDir, 'config');
       const keyPath = join(sshDir, 'id_rsa');
-
+  
       // Create .ssh directory
       await mkdir(sshDir, { recursive: true, mode: 0o700 });
-
+  
       // Write SSH config
       const configContent = 'Host *\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null\n    LogLevel ERROR\n';
       await writeFile(configPath, configContent, { mode: 0o600 });
-
+  
       // Generate SSH key if not exists
       try {
         await access(keyPath);
         return { success: true, message: 'SSH already configured, key exists' };
       } catch {
-        await execAsync(`ssh-keygen -t rsa -N "" -f ${keyPath} <<< y`);
+        // Use echo to pipe 'y' for overwrite confirmation, works in both bash and sh
+        await execAsync(`echo y | ssh-keygen -t rsa -N "" -f ${keyPath}`);
         return { success: true, message: 'SSH configured and key generated' };
       }
     } catch (error) {
