@@ -218,7 +218,7 @@ Examples:
     try {
       switch (method) {
         case 'setup': {
-          const result = await SSHLab.setup();
+          const result = await SSH.setup();
           console.log(JSON.stringify(result));
           break;
         }
@@ -228,7 +228,7 @@ Examples:
             console.log('Usage: node ssh-lab.mjs copyKey <host> <password> [user]');
             process.exit(1);
           }
-          const result = await SSHLab.copyKey(host, password, user);
+          const result = await SSH.copyKey(host, password, user);
           console.log(JSON.stringify(result));
           break;
         }
@@ -238,7 +238,7 @@ Examples:
             console.log('Usage: node ssh-lab.mjs checkAccess <host> [port]');
             process.exit(1);
           }
-          const result = await SSHLab.checkAccess(host, port);
+          const result = await SSH.checkAccess(host, port);
           console.log(result);
           break;
         }
@@ -248,7 +248,7 @@ Examples:
             console.log('Usage: node ssh-lab.mjs fullSetup <host> <password> [user]');
             process.exit(1);
           }
-          const result = await SSHLab.fullSetup(host, password, user);
+          const result = await SSH.fullSetup(host, password, user);
           console.log(JSON.stringify(result));
           break;
         }
