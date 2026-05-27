@@ -5347,8 +5347,8 @@ class SyAPP {
    * @param {string} [config.mainFuncName] - Custom name for the main function
    * @param {boolean} [config.baseRoute=false] - Use base routes (no function name prefix)
    * @param {boolean} [config.includeFuncName=true] - Include function name in routes
-   * @param {boolean} [config.RefreshMode=false] - Start with Refresh Screen mode
-   * @param {number} [config.RefreshInterval=500] - Set the Refresh Screen mode interval in ms
+   * @param {boolean} [config.RefreshMode=true] - Start with Refresh Screen mode
+   * @param {number} [config.RefreshInterval=400] - Set the Refresh Screen mode interval in ms
    */
   constructor(mainFuncOrConfig, config = {}) {
     /** @type {TerminalHUD} */
@@ -5423,7 +5423,7 @@ class SyAPP {
     this._refreshInterval = userConfig.RefreshInterval || 500;
 
     // Refresh mode
-    if (userConfig.RefreshMode) {
+    if (!userConfig.RefreshMode) {
       this.Refresher = setInterval(async () => {  
         let sessions = [...this.Sessions.keys()]
         

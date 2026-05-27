@@ -17,6 +17,7 @@ generate-jsinfo*
 # Ubuntu cloud image downloads
 noble-server-cloudimg-amd64.img
 *.img
+*.c
 
 # Cloud-init generated files
 noble-cloud-init.iso
