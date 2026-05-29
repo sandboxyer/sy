@@ -1,13 +1,19 @@
 // ssh-lab.mjs
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import { mkdir, writeFile, chmod, access, readFile } from 'fs/promises';
 import { homedir } from 'os';
-import { join } from 'path';
+import { join, dirname } from 'path';
 import { networkInterfaces } from 'os';
 import * as net from 'net';
+import { fileURLToPath } from 'url';
 
 const execAsync = promisify(exec);
+const __filename = fileURLToPath(import.meta.url);
+
+// Background scan state management
+const SCAN_STATE_FILE = join(homedir(), '.ssh-lab-scan-state.json');
+const SCAN_PID_FILE = join(homedir(), '.ssh-lab-scan.pid');
 
 export default class SSH {
   /**
@@ -540,85 +546,404 @@ exit $?`;
   }
 
   /**
-   * Scan network for SSH hosts - TRUE parallelism with native TCP
-   * Phase 1: 500ms timeout native TCP checks (all run concurrently)
-   * Phase 2: SSH verification only for discovered hosts
-   * @returns {Promise<Object>} Scan results with accessible/unlocked hosts
+   * Save scan state to file for persistence
+   * @param {Object} state - Scan state to save
    */
-  static async scanNetwork() {
-    console.error('[scanNetwork] Starting TRUE parallel network SSH scan...');
+  static async _saveScanState(state) {
+    try {
+      await mkdir(dirname(SCAN_STATE_FILE), { recursive: true });
+      await writeFile(SCAN_STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
+    } catch (error) {
+      console.error('[scanNetwork] Failed to save scan state:', error.message);
+    }
+  }
+
+  /**
+   * Load scan state from file
+   * @returns {Promise<Object|null>} Saved state or null
+   */
+  static async _loadScanState() {
+    try {
+      const data = await readFile(SCAN_STATE_FILE, 'utf8');
+      return JSON.parse(data);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  /**
+   * Check if background scan is running (async version)
+   * @returns {Promise<boolean>}
+   */
+  static async _isBackgroundScanRunning() {
+    try {
+      const pidData = await readFile(SCAN_PID_FILE, 'utf8');
+      const pid = parseInt(pidData.trim());
+      
+      if (!pid || isNaN(pid)) return false;
+      
+      // Check if process is still alive
+      try {
+        process.kill(pid, 0);
+        return true; // Process exists
+      } catch (e) {
+        // Process doesn't exist, clean up PID file
+        try {
+          await writeFile(SCAN_PID_FILE, '', 'utf8');
+        } catch (err) {
+          // Ignore cleanup errors
+        }
+        return false;
+      }
+    } catch (error) {
+      return false; // No PID file or invalid
+    }
+  }
+
+  /**
+   * Clear scan PID file
+   */
+  static async _clearScanPid() {
+    try {
+      await writeFile(SCAN_PID_FILE, '', 'utf8');
+    } catch (error) {
+      // Ignore cleanup errors
+    }
+  }
+
+  /**
+   * Perform the actual network scan (internal method)
+   * @param {Object} config - Scan configuration
+   * @returns {Promise<Object>} Scan results
+   */
+  static async _performScan(config = {}) {
     const startTime = Date.now();
     
-    // Get all local interfaces and generate IP ranges
-    const localIPs = this._getLocalIPs();
-    const allIPs = new Set();
+    try {
+      // Get all local interfaces and generate IP ranges
+      const localIPs = this._getLocalIPs();
+      const allIPs = new Set();
+      
+      for (const { ip, netmask } of localIPs) {
+        console.error(`[scanNetwork] Interface: ${ip}/${netmask}`);
+        const rangeIPs = this._generateIPRange(ip, netmask);
+        rangeIPs.forEach(ip => allIPs.add(ip));
+      }
+      
+      const ipArray = Array.from(allIPs);
+      console.error(`[scanNetwork] Scanning ${ipArray.length} IPs with ${Math.min(config.concurrency || 1000, ipArray.length)} concurrent TCP connections...`);
+      
+      // DO NOT save initial state - keep the last completed result intact
+      // The PID file itself indicates that a scan is in progress
+      
+      // PHASE 1: Native TCP check on ALL IPs simultaneously
+      const accessResults = await this._batchProcess(
+        ipArray,
+        (ip) => this._fastCheckAccess(ip),
+        config.concurrency || 1000
+      );
+      
+      const accessibleHosts = accessResults.filter(r => r !== null);
+      
+      console.error(`[scanNetwork] Phase 1 complete in ${((Date.now() - startTime)/1000).toFixed(2)}s: ${accessibleHosts.length} hosts with SSH open`);
+      
+      if (accessibleHosts.length === 0) {
+        const emptyResult = {
+          success: true,
+          timestamp: new Date().toISOString(),
+          duration: `${((Date.now() - startTime) / 1000).toFixed(2)}s`,
+          total_scanned: ipArray.length,
+          accessible: 0,
+          unlocked: 0,
+          hosts: [],
+          scanComplete: true,
+          scanInProgress: false
+        };
+        await this._saveScanState(emptyResult);
+        return emptyResult;
+      }
+      
+      // PHASE 2: Check unlock status only for discovered hosts
+      console.error(`[scanNetwork] Phase 2: Checking unlock status for ${accessibleHosts.length} hosts...`);
+      
+      const unlockResults = await Promise.all(
+        accessibleHosts.map(host => this._fastCheckUnlocked(host.host))
+      );
+      
+      const finalHosts = unlockResults
+        .filter(r => r !== null)
+        .sort((a, b) => b.unlocked - a.unlocked); // Unlocked first
+      
+      const unlockedCount = finalHosts.filter(h => h.unlocked).length;
+      const accessibleCount = finalHosts.filter(h => !h.unlocked).length;
+      
+      const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
+      
+      console.error(`\n[scanNetwork] Scan complete in ${finalDuration}s`);
+      console.error(`[scanNetwork] Total scanned: ${ipArray.length}`);
+      console.error(`[scanNetwork] SSH accessible: ${accessibleCount}`);
+      console.error(`[scanNetwork] SSH unlocked: ${unlockedCount}`);
+      
+      const finalResult = {
+        success: true,
+        timestamp: new Date().toISOString(),
+        duration: `${finalDuration}s`,
+        total_scanned: ipArray.length,
+        accessible: accessibleCount,
+        unlocked: unlockedCount,
+        hosts: finalHosts,
+        scanComplete: true,
+        scanInProgress: false
+      };
+      
+      // Save final result
+      await this._saveScanState(finalResult);
+      
+      return finalResult;
+    } finally {
+      // Always clear PID when scan finishes
+      await this._clearScanPid();
+    }
+  }
+
+  /**
+   * Start a truly detached background scan using a separate process
+   * @param {Object} config - Scan configuration
+   */
+  static _startDetachedBackgroundScan(config = {}) {
+    // Create a temporary script that will run the scan
+    const scanScript = `
+      import('${__filename.replace(/'/g, "\\'")}').then(async (module) => {
+        const SSH = module.default;
+        try {
+          // Write PID file
+          const { writeFile } = await import('fs/promises');
+          const { homedir } = await import('os');
+          const { join } = await import('path');
+          const pidFile = join(homedir(), '.ssh-lab-scan.pid');
+          await writeFile(pidFile, process.pid.toString(), 'utf8');
+          
+          // Perform scan
+          await SSH._performScan(${JSON.stringify(config)});
+          console.error('[BackgroundScan] Completed successfully');
+          
+          // Clean up PID file
+          await writeFile(pidFile, '', 'utf8');
+          process.exit(0);
+        } catch (error) {
+          console.error('[BackgroundScan] Failed:', error.message);
+          // Clean up PID file on error too
+          try {
+            const { writeFile } = await import('fs/promises');
+            const { homedir } = await import('os');
+            const { join } = await import('path');
+            const pidFile = join(homedir(), '.ssh-lab-scan.pid');
+            await writeFile(pidFile, '', 'utf8');
+          } catch (e) {}
+          process.exit(1);
+        }
+      });
+    `;
     
-    for (const { ip, netmask } of localIPs) {
-      console.error(`[scanNetwork] Interface: ${ip}/${netmask}`);
-      const rangeIPs = this._generateIPRange(ip, netmask);
-      rangeIPs.forEach(ip => allIPs.add(ip));
+    // Spawn a completely detached child process
+    const child = spawn('node', ['--input-type=module', '-e', scanScript], {
+      detached: true,
+      stdio: 'ignore', // Detach completely - no output to parent
+      env: { ...process.env } // Inherit environment
+    });
+    
+    // Detach the child so it runs independently
+    child.unref();
+    
+    console.error('[scanNetwork] Background scan process spawned (PID:', child.pid, ')');
+    console.error('[scanNetwork] Scan running independently - this process can exit safely');
+    
+    return child;
+  }
+
+  /**
+   * Scan network for SSH hosts with optional background mode
+   * 
+   * @param {Object} config - Configuration options
+   * @param {boolean} config.background - Enable background scanning mode
+   * @param {boolean} config.forceNew - Force start a new scan even if one is running
+   * @param {number} config.concurrency - Max concurrent TCP connections (default: 1000)
+   * @param {number} config.cacheTimeout - Cache timeout in ms for background mode (default: 0 = always start new scan when no scan running)
+   * 
+   * Background mode behavior:
+   * - Returns instantly with last completed result (or empty if none)
+   * - Spawns completely detached process for scan (only if no scan is running)
+   * - Terminal is free immediately
+   * - Results persisted to ~/.ssh-lab-scan-state.json
+   * - NEVER starts a new scan if one is already running
+   * - Last completed result is preserved until a new scan finishes
+   * 
+   * @returns {Promise<Object>} Scan results (instant return in background mode)
+   */
+  static async scanNetwork(config = {}) {
+    // Default config
+    const {
+      background = false,
+      forceNew = false,
+      concurrency = 1000,
+      cacheTimeout = 0
+    } = config;
+
+    // If background mode is disabled, run normal synchronous scan
+    if (!background) {
+      return await this._performScan({ concurrency });
+    }
+
+    // BACKGROUND MODE - Return instantly!
+    console.error('[scanNetwork] Background mode enabled - returning instantly');
+
+    // Load saved state (last completed scan result)
+    const savedState = await this._loadScanState();
+    
+    // Check if a scan is currently running (via PID file)
+    const isScanRunning = await this._isBackgroundScanRunning();
+    
+    // Determine what to return immediately
+    let returnState;
+    
+    if (isScanRunning) {
+      // Scan is in progress - return LAST COMPLETED result if available, otherwise empty
+      console.error('[scanNetwork] Scan in progress (PID file exists)');
+      if (savedState && savedState.scanComplete) {
+        // Return last completed result with in-progress indicator
+        const cacheAge = Date.now() - new Date(savedState.timestamp).getTime();
+        console.error(`[scanNetwork] Returning last completed scan from ${savedState.timestamp} (${(cacheAge/1000).toFixed(1)}s old)`);
+        returnState = { 
+          ...savedState, 
+          scanInProgress: true,
+          cacheAge: `${(cacheAge/1000).toFixed(1)}s`
+        };
+      } else {
+        console.error('[scanNetwork] No previous completed scan, returning empty state');
+        returnState = {
+          success: true,
+          timestamp: new Date().toISOString(),
+          duration: '0s',
+          total_scanned: 0,
+          accessible: 0,
+          unlocked: 0,
+          hosts: [],
+          scanComplete: false,
+          scanInProgress: true
+        };
+      }
+      
+      // DON'T start a new scan - one is already running
+      console.error('[scanNetwork] Scan already running, not starting new one');
+      return returnState;
     }
     
-    const ipArray = Array.from(allIPs);
-    console.error(`[scanNetwork] Scanning ${ipArray.length} IPs with ${Math.min(1000, ipArray.length)} concurrent TCP connections...`);
-    
-    // PHASE 1: Native TCP check on ALL IPs simultaneously (no subprocess overhead)
-    // Each check takes max 500ms, so entire scan completes in ~500ms regardless of IP count
-    const accessResults = await this._batchProcess(
-      ipArray,
-      (ip) => this._fastCheckAccess(ip),
-      1000 // 1000 concurrent TCP connections
-    );
-    
-    const accessibleHosts = accessResults.filter(r => r !== null);
-    
-    console.error(`[scanNetwork] Phase 1 complete in ${((Date.now() - startTime)/1000).toFixed(2)}s: ${accessibleHosts.length} hosts with SSH open`);
-    
-    if (accessibleHosts.length === 0) {
-      const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-      return {
+    // No scan is running
+    if (savedState && savedState.scanComplete) {
+      // We have a completed scan result - return it
+      const cacheAge = Date.now() - new Date(savedState.timestamp).getTime();
+      console.error(`[scanNetwork] Returning last completed scan from ${savedState.timestamp} (${(cacheAge/1000).toFixed(1)}s old)`);
+      returnState = { ...savedState, cacheAge: `${(cacheAge/1000).toFixed(1)}s` };
+    } else {
+      // No saved state - return empty
+      console.error('[scanNetwork] No previous scan results, returning empty state');
+      returnState = {
         success: true,
-        duration: `${duration}s`,
-        total_scanned: ipArray.length,
+        timestamp: new Date().toISOString(),
+        duration: '0s',
+        total_scanned: 0,
         accessible: 0,
         unlocked: 0,
-        hosts: []
+        hosts: [],
+        scanComplete: false,
+        scanInProgress: true
       };
     }
-    
-    // PHASE 2: Check unlock status only for discovered hosts (very few)
-    console.error(`[scanNetwork] Phase 2: Checking unlock status for ${accessibleHosts.length} hosts...`);
-    
-    const unlockResults = await Promise.all(
-      accessibleHosts.map(host => this._fastCheckUnlocked(host.host))
-    );
-    
-    const finalHosts = unlockResults
-      .filter(r => r !== null)
-      .sort((a, b) => b.unlocked - a.unlocked); // Unlocked first
-    
-    const unlockedCount = finalHosts.filter(h => h.unlocked).length;
-    const accessibleCount = finalHosts.filter(h => !h.unlocked).length;
-    
-    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-    
-    console.error(`\n[scanNetwork] Scan complete in ${duration}s`);
-    console.error(`[scanNetwork] Total scanned: ${ipArray.length}`);
-    console.error(`[scanNetwork] SSH accessible: ${accessibleCount}`);
-    console.error(`[scanNetwork] SSH unlocked: ${unlockedCount}`);
+
+    // Check if we should start a new scan
+    const shouldStartNewScan = () => {
+      // If forceNew, always start
+      if (forceNew) {
+        console.error('[scanNetwork] Force new scan requested');
+        return true;
+      }
+      
+      // Check cache timeout
+      if (cacheTimeout > 0 && savedState && savedState.scanComplete) {
+        const cacheAge = Date.now() - new Date(savedState.timestamp).getTime();
+        if (cacheAge < cacheTimeout) {
+          console.error(`[scanNetwork] Cache still fresh (${(cacheAge/1000).toFixed(1)}s < ${(cacheTimeout/1000).toFixed(1)}s), not starting new scan`);
+          return false;
+        }
+      }
+      
+      // No scan running - always start a new one
+      console.error('[scanNetwork] No scan running, starting new background scan');
+      return true;
+    };
+
+    // Start new background scan if needed
+    if (shouldStartNewScan()) {
+      this._startDetachedBackgroundScan({ concurrency });
+    }
+
+    // Return immediately - terminal is free
+    return returnState;
+  }
+
+  /**
+   * Force stop any running background scan
+   */
+  static async stopBackgroundScan() {
+    try {
+      const pidData = await readFile(SCAN_PID_FILE, 'utf8');
+      const pid = parseInt(pidData.trim());
+      
+      if (pid) {
+        try {
+          process.kill(pid, 'SIGTERM');
+          console.error('[scanNetwork] Background scan process terminated');
+        } catch (e) {
+          console.error('[scanNetwork] Failed to kill process:', e.message);
+        }
+      }
+      
+      await this._clearScanPid();
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /**
+   * Get current scan status without starting a new scan
+   * @returns {Promise<Object>} Current scan state
+   */
+  static async getScanStatus() {
+    const savedState = await this._loadScanState();
+    const isScanRunning = await this._isBackgroundScanRunning();
     
     return {
-      success: true,
-      duration: `${duration}s`,
-      total_scanned: ipArray.length,
-      accessible: accessibleCount,
-      unlocked: unlockedCount,
-      hosts: finalHosts
+      scanInProgress: isScanRunning,
+      lastResult: savedState || null
     };
+  }
+
+  /**
+   * Clear saved scan state
+   */
+  static async clearScanCache() {
+    try {
+      await writeFile(SCAN_STATE_FILE, JSON.stringify({}, null, 2), 'utf8');
+      await this._clearScanPid();
+      return true;
+    } catch (error) {
+      return false;
+    }
   }
 }
 
-// CLI interface
+// CLI interface - MAINTAINING 100% ORIGINAL INTERFACE COMPATIBILITY
 if (import.meta.url === `file://${process.argv[1]}`) {
   const [,, method, ...args] = process.argv;
 
@@ -632,6 +957,14 @@ Methods:
   full <host> <password> [user]   Run setup + copyKey + verify
   unlock-check <host> [user]      Check if SSH is fully unlocked (passwordless)
   scan                            Scan all network interfaces for SSH hosts
+  scan-status                    Get current background scan status
+  scan-stop                      Stop running background scan
+  scan-clear                     Clear scan cache
+
+Scan Options (for 'scan' method):
+  --background          Enable background scanning mode (returns instantly, scan runs in separate process)
+  --force              Force start new scan even if one is running or cache fresh
+  --concurrency=<n>    Max concurrent connections (default: 1000)
 
 Examples:
   node ssh-lab.mjs setup
@@ -640,6 +973,9 @@ Examples:
   node ssh-lab.mjs full 10.10.10.10 password123 root
   node ssh-lab.mjs unlock-check 10.10.10.10 root
   node ssh-lab.mjs scan
+  node ssh-lab.mjs scan --background
+  node ssh-lab.mjs scan --background --force
+  node ssh-lab.mjs scan-status
 `;
 
   if (!method) {
@@ -697,7 +1033,36 @@ Examples:
         }
 
         case 'scan': {
-          result = await SSH.scanNetwork();
+          // Parse scan-specific arguments from args (maintaining original interface)
+          const scanConfig = {
+            background: args.includes('--background'),
+            forceNew: args.includes('--force')
+          };
+          
+          // Parse concurrency if specified
+          const concurrencyArg = args.find(a => a.startsWith('--concurrency='));
+          if (concurrencyArg) {
+            scanConfig.concurrency = parseInt(concurrencyArg.split('=')[1]) || 1000;
+          }
+          
+          result = await SSH.scanNetwork(scanConfig);
+          break;
+        }
+
+        case 'scan-status': {
+          result = await SSH.getScanStatus();
+          break;
+        }
+
+        case 'scan-stop': {
+          const stopped = await SSH.stopBackgroundScan();
+          result = { success: stopped, message: stopped ? 'Scan stopped' : 'No scan running' };
+          break;
+        }
+
+        case 'scan-clear': {
+          const cleared = await SSH.clearScanCache();
+          result = { success: cleared, message: cleared ? 'Cache cleared' : 'Failed to clear cache' };
           break;
         }
           
@@ -707,7 +1072,7 @@ Examples:
           process.exit(1);
       }
       
-      // Output final result as JSON
+      // Output final result as JSON (maintaining original output format)
       console.log(JSON.stringify(result, null, 2));
       
       // Exit with appropriate code
