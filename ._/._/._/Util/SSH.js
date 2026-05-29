@@ -5,6 +5,7 @@ import { mkdir, writeFile, chmod, access, readFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 import { networkInterfaces } from 'os';
+import * as net from 'net';
 
 const execAsync = promisify(exec);
 
@@ -370,32 +371,57 @@ exit $?`;
   }
 
   /**
-   * Fast check if host has SSH accessible (port check only)
+   * Ultra-fast TCP port check using native Node.js net module
+   * No subprocess spawning - pure async I/O
+   * @param {string} host - Target IP
+   * @param {number} port - Port to check (default 22)
+   * @param {number} timeout - Timeout in ms (default 500)
+   * @returns {Promise<boolean>} True if port is open
+   */
+  static _tcpCheck(host, port = 22, timeout = 500) {
+    return new Promise((resolve) => {
+      const socket = new net.Socket();
+      let resolved = false;
+
+      socket.setTimeout(timeout);
+
+      socket.on('connect', () => {
+        if (!resolved) {
+          resolved = true;
+          socket.destroy();
+          resolve(true);
+        }
+      });
+
+      socket.on('timeout', () => {
+        if (!resolved) {
+          resolved = true;
+          socket.destroy();
+          resolve(false);
+        }
+      });
+
+      socket.on('error', () => {
+        if (!resolved) {
+          resolved = true;
+          socket.destroy();
+          resolve(false);
+        }
+      });
+
+      socket.connect(port, host);
+    });
+  }
+
+  /**
+   * Fast check if host has SSH accessible using native TCP
    * @param {string} host - Target IP
    * @returns {Promise<Object|null>} Host info or null if not accessible
    */
   static async _fastCheckAccess(host) {
-    const result = await this._exec(
-      `timeout 2 bash -c "echo >/dev/tcp/${host}/22" 2>&1`,
-      { timeout: 3000 }
-    );
+    const isOpen = await this._tcpCheck(host, 22, 500);
     
-    if (result.success) {
-      return {
-        host,
-        accessible: true,
-        unlocked: false,
-        type: 'accessible'
-      };
-    }
-    
-    // Quick nc fallback
-    const ncResult = await this._exec(
-      `nc -zv -w1 ${host} 22 2>&1`,
-      { timeout: 2000 }
-    );
-    
-    if (ncResult.success || ncResult.stderr.includes('succeeded') || ncResult.stderr.includes('open')) {
+    if (isOpen) {
       return {
         host,
         accessible: true,
@@ -408,7 +434,7 @@ exit $?`;
   }
 
   /**
-   * Fast check if host is unlocked (passwordless)
+   * Fast check if host is unlocked (passwordless) using native SSH
    * @param {string} host - Target IP
    * @param {string} user - SSH user
    * @returns {Promise<Object>} Updated host object with unlock status
@@ -483,12 +509,44 @@ exit $?`;
   }
 
   /**
-   * Scan network for SSH hosts - ultra fast with full parallelism
-   * Only returns hosts that have SSH accessible or unlocked
+   * Process IPs in batches with controlled concurrency
+   * @param {Array} items - Array of items to process
+   * @param {Function} fn - Async function to apply to each item
+   * @param {number} concurrency - Max concurrent operations
+   * @returns {Promise<Array>} Results array
+   */
+  static async _batchProcess(items, fn, concurrency = 1000) {
+    const results = new Array(items.length);
+    let index = 0;
+
+    async function worker() {
+      while (index < items.length) {
+        const currentIndex = index++;
+        try {
+          results[currentIndex] = await fn(items[currentIndex]);
+        } catch (error) {
+          results[currentIndex] = null;
+        }
+      }
+    }
+
+    // Start workers
+    const workers = Array(Math.min(concurrency, items.length))
+      .fill(null)
+      .map(() => worker());
+
+    await Promise.all(workers);
+    return results.filter(r => r !== null);
+  }
+
+  /**
+   * Scan network for SSH hosts - TRUE parallelism with native TCP
+   * Phase 1: 500ms timeout native TCP checks (all run concurrently)
+   * Phase 2: SSH verification only for discovered hosts
    * @returns {Promise<Object>} Scan results with accessible/unlocked hosts
    */
   static async scanNetwork() {
-    console.error('[scanNetwork] Starting ultra-fast network SSH scan...');
+    console.error('[scanNetwork] Starting TRUE parallel network SSH scan...');
     const startTime = Date.now();
     
     // Get all local interfaces and generate IP ranges
@@ -502,19 +560,19 @@ exit $?`;
     }
     
     const ipArray = Array.from(allIPs);
-    console.error(`[scanNetwork] Scanning ${ipArray.length} IPs in FULL PARALLEL...`);
+    console.error(`[scanNetwork] Scanning ${ipArray.length} IPs with ${Math.min(1000, ipArray.length)} concurrent TCP connections...`);
     
-    // PHASE 1: Check all IPs for SSH port accessibility in full parallel
-    const accessResults = await Promise.allSettled(
-      ipArray.map(ip => this._fastCheckAccess(ip))
+    // PHASE 1: Native TCP check on ALL IPs simultaneously (no subprocess overhead)
+    // Each check takes max 500ms, so entire scan completes in ~500ms regardless of IP count
+    const accessResults = await this._batchProcess(
+      ipArray,
+      (ip) => this._fastCheckAccess(ip),
+      1000 // 1000 concurrent TCP connections
     );
     
-    // Filter only accessible hosts
-    const accessibleHosts = accessResults
-      .filter(r => r.status === 'fulfilled' && r.value !== null)
-      .map(r => r.value);
+    const accessibleHosts = accessResults.filter(r => r !== null);
     
-    console.error(`[scanNetwork] Phase 1 complete: ${accessibleHosts.length} hosts with SSH open`);
+    console.error(`[scanNetwork] Phase 1 complete in ${((Date.now() - startTime)/1000).toFixed(2)}s: ${accessibleHosts.length} hosts with SSH open`);
     
     if (accessibleHosts.length === 0) {
       const duration = ((Date.now() - startTime) / 1000).toFixed(2);
@@ -528,16 +586,15 @@ exit $?`;
       };
     }
     
-    // PHASE 2: Check all accessible hosts for unlock status in full parallel
+    // PHASE 2: Check unlock status only for discovered hosts (very few)
     console.error(`[scanNetwork] Phase 2: Checking unlock status for ${accessibleHosts.length} hosts...`);
     
-    const unlockResults = await Promise.allSettled(
+    const unlockResults = await Promise.all(
       accessibleHosts.map(host => this._fastCheckUnlocked(host.host))
     );
     
     const finalHosts = unlockResults
-      .filter(r => r.status === 'fulfilled' && r.value !== null)
-      .map(r => r.value)
+      .filter(r => r !== null)
       .sort((a, b) => b.unlocked - a.unlocked); // Unlocked first
     
     const unlockedCount = finalHosts.filter(h => h.unlocked).length;
