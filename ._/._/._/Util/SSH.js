@@ -725,13 +725,11 @@ exit $?`;
           
           // Perform scan
           await SSH._performScan(${JSON.stringify(config)});
-          console.error('[BackgroundScan] Completed successfully');
           
           // Clean up PID file
           await writeFile(pidFile, '', 'utf8');
           process.exit(0);
         } catch (error) {
-          console.error('[BackgroundScan] Failed:', error.message);
           // Clean up PID file on error too
           try {
             const { writeFile } = await import('fs/promises');
@@ -754,9 +752,6 @@ exit $?`;
     
     // Detach the child so it runs independently
     child.unref();
-    
-    console.error('[scanNetwork] Background scan process spawned (PID:', child.pid, ')');
-    console.error('[scanNetwork] Scan running independently - this process can exit safely');
     
     return child;
   }
@@ -795,8 +790,7 @@ exit $?`;
     }
 
     // BACKGROUND MODE - Return instantly!
-    console.error('[scanNetwork] Background mode enabled - returning instantly');
-
+    
     // Load saved state (last completed scan result)
     const savedState = await this._loadScanState();
     
@@ -808,18 +802,15 @@ exit $?`;
     
     if (isScanRunning) {
       // Scan is in progress - return LAST COMPLETED result if available, otherwise empty
-      console.error('[scanNetwork] Scan in progress (PID file exists)');
       if (savedState && savedState.scanComplete) {
         // Return last completed result with in-progress indicator
         const cacheAge = Date.now() - new Date(savedState.timestamp).getTime();
-        console.error(`[scanNetwork] Returning last completed scan from ${savedState.timestamp} (${(cacheAge/1000).toFixed(1)}s old)`);
         returnState = { 
           ...savedState, 
           scanInProgress: true,
           cacheAge: `${(cacheAge/1000).toFixed(1)}s`
         };
       } else {
-        console.error('[scanNetwork] No previous completed scan, returning empty state');
         returnState = {
           success: true,
           timestamp: new Date().toISOString(),
@@ -834,7 +825,6 @@ exit $?`;
       }
       
       // DON'T start a new scan - one is already running
-      console.error('[scanNetwork] Scan already running, not starting new one');
       return returnState;
     }
     
@@ -842,11 +832,9 @@ exit $?`;
     if (savedState && savedState.scanComplete) {
       // We have a completed scan result - return it
       const cacheAge = Date.now() - new Date(savedState.timestamp).getTime();
-      console.error(`[scanNetwork] Returning last completed scan from ${savedState.timestamp} (${(cacheAge/1000).toFixed(1)}s old)`);
       returnState = { ...savedState, cacheAge: `${(cacheAge/1000).toFixed(1)}s` };
     } else {
       // No saved state - return empty
-      console.error('[scanNetwork] No previous scan results, returning empty state');
       returnState = {
         success: true,
         timestamp: new Date().toISOString(),
@@ -863,22 +851,15 @@ exit $?`;
     // Check if we should start a new scan
     const shouldStartNewScan = () => {
       // If forceNew, always start
-      if (forceNew) {
-        console.error('[scanNetwork] Force new scan requested');
-        return true;
-      }
+      if (forceNew) return true;
       
       // Check cache timeout
       if (cacheTimeout > 0 && savedState && savedState.scanComplete) {
         const cacheAge = Date.now() - new Date(savedState.timestamp).getTime();
-        if (cacheAge < cacheTimeout) {
-          console.error(`[scanNetwork] Cache still fresh (${(cacheAge/1000).toFixed(1)}s < ${(cacheTimeout/1000).toFixed(1)}s), not starting new scan`);
-          return false;
-        }
+        if (cacheAge < cacheTimeout) return false;
       }
       
       // No scan running - always start a new one
-      console.error('[scanNetwork] No scan running, starting new background scan');
       return true;
     };
 
@@ -902,9 +883,8 @@ exit $?`;
       if (pid) {
         try {
           process.kill(pid, 'SIGTERM');
-          console.error('[scanNetwork] Background scan process terminated');
         } catch (e) {
-          console.error('[scanNetwork] Failed to kill process:', e.message);
+          // Process might already be dead
         }
       }
       
