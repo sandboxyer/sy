@@ -103,37 +103,138 @@ export default class SSH {
   }
 
   /**
-   * Copy SSH key using pure bash
+   * Copy SSH key using pure bash with expect fallback
+   * SURGICAL FIX: Removed sshpass dependency in bash fallback, uses expect or pure SSH
    */
   static async _copyKeyBash(host, password, user) {
     const tmpScript = `/tmp/ssh_copy_${Date.now()}.sh`;
     const escapedPassword = password.replace(/'/g, "'\\''");
-   
-    const scriptContent = `#!/bin/bash
+    
+    // Check if expect is available for proper automation
+    const expectCheck = await this._exec('which expect');
+    
+    if (expectCheck.success) {
+      // Method 1: Use expect for reliable SSH key copy
+      const expectScript = `/tmp/ssh_copy_${Date.now()}.exp`;
+      const expectContent = `#!/usr/bin/expect -f
+set timeout 30
+spawn ssh-copy-id -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${user}@${host}
+expect {
+  "password:" {
+    send "${escapedPassword}\\r"
+    expect {
+      "already exist" {
+        puts "SUCCESS: Key already exists on target"
+        exit 0
+      }
+      eof
+    }
+  }
+  "already exist" {
+    puts "SUCCESS: Key already exists on target"
+    exit 0
+  }
+  timeout {
+    puts "FAILED: Connection timeout"
+    exit 1
+  }
+  eof {
+    puts "FAILED: Unexpected EOF"
+    exit 1
+  }
+}
+catch wait result
+exit [lindex \\$result 3]`;
+
+      try {
+        await writeFile(expectScript, expectContent, { mode: 0o700 });
+        const result = await this._exec(expectScript);
+        await this._exec(`rm -f ${expectScript}`);
+        
+        if (result.stdout.includes('SUCCESS')) {
+          return { success: true, method: 'expect', message: result.stdout.trim() };
+        }
+        
+        return { success: false, method: 'expect', error: result.stdout || result.stderr };
+      } catch (error) {
+        await this._exec(`rm -f ${expectScript}`);
+        return { success: false, method: 'expect', error: error.message };
+      }
+    } else {
+      // Method 2: Pure bash using sshpass only if available, otherwise manual approach
+      const sshpassCheck = await this._exec('which sshpass');
+      
+      if (sshpassCheck.success) {
+        // sshpass is available, use it
+        const scriptContent = `#!/bin/bash
 export SSHPASS='${escapedPassword}'
 sshpass -e ssh-copy-id -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${user}@${host} 2>&1
 exit_code=$?
 if [ $exit_code -eq 0 ]; then
-  echo "SUCCESS: Key copied"
+  echo "SUCCESS: Key copied via sshpass"
   exit 0
 fi
 
 sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${user}@${host} "test -f ~/.ssh/authorized_keys && grep -q '$(cat ~/.ssh/id_rsa.pub)' ~/.ssh/authorized_keys && echo 'SUCCESS: Key already present' || echo 'FAILED: Key not found'" 2>&1
 exit $?`;
 
-    try {
-      await writeFile(tmpScript, scriptContent, { mode: 0o700 });
-      const result = await this._exec(`bash ${tmpScript}`);
-      await this._exec(`rm -f ${tmpScript}`);
-     
-      if (result.stdout.includes('SUCCESS')) {
-        return { success: true, method: 'bash', message: result.stdout.trim() };
+        try {
+          await writeFile(tmpScript, scriptContent, { mode: 0o700 });
+          const result = await this._exec(`bash ${tmpScript}`);
+          await this._exec(`rm -f ${tmpScript}`);
+          
+          if (result.stdout.includes('SUCCESS')) {
+            return { success: true, method: 'bash-sshpass', message: result.stdout.trim() };
+          }
+          
+          return { success: false, method: 'bash-sshpass', error: result.stdout || result.stderr };
+        } catch (error) {
+          await this._exec(`rm -f ${tmpScript}`);
+          return { success: false, method: 'bash-sshpass', error: error.message };
+        }
+      } else {
+        // Pure bash fallback without sshpass - use SSH_ASKPASS trick
+        const askpassScript = `/tmp/ssh_askpass_${Date.now()}.sh`;
+        const askpassContent = `#!/bin/bash
+echo '${escapedPassword}'`;
+
+        const scriptContent = `#!/bin/bash
+export SSH_ASKPASS="${askpassScript}"
+export DISPLAY=dummy:0
+setsid ssh-copy-id -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${user}@${host} 2>&1
+exit_code=$?
+rm -f "${askpassScript}"
+if [ $exit_code -eq 0 ]; then
+  echo "SUCCESS: Key copied via askpass"
+  exit 0
+fi
+
+# Check if key already exists
+ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o PasswordAuthentication=no -o BatchMode=yes ${user}@${host} "exit" 2>&1
+if [ $? -eq 0 ]; then
+  echo "SUCCESS: Key already present and working"
+  exit 0
+fi
+
+echo "FAILED: Could not copy key"
+exit 1`;
+
+        try {
+          await writeFile(askpassScript, askpassContent, { mode: 0o700 });
+          await writeFile(tmpScript, scriptContent, { mode: 0o700 });
+          const result = await this._exec(`bash ${tmpScript}`);
+          await this._exec(`rm -f ${tmpScript} ${askpassScript}`);
+          
+          if (result.stdout.includes('SUCCESS')) {
+            return { success: true, method: 'bash-askpass', message: result.stdout.trim() };
+          }
+          
+          return { success: false, method: 'bash-askpass', error: result.stdout || result.stderr };
+        } catch (error) {
+          await this._exec(`rm -f ${tmpScript} ${askpassScript}`);
+          return { success: false, method: 'bash-askpass', error: error.message };
+        }
       }
-     
-      return { success: false, method: 'bash', error: result.stdout || result.stderr };
-    } catch (error) {
-      await this._exec(`rm -f ${tmpScript}`);
-      return { success: false, method: 'bash', error: error.message };
     }
   }
 
