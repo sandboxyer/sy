@@ -1594,7 +1594,7 @@ exit 1`;
       whitelist,
       blacklist
     } = config;
-
+  
     // Build network filter from convenience flags
     const effectiveNetworkFilter = { ...networkFilter };
     
@@ -1607,11 +1607,11 @@ exit 1`;
     if (blacklist) {
       effectiveNetworkFilter.blacklist = Array.isArray(blacklist) ? blacklist : [blacklist];
     }
-
+  
     // Suppress stderr for clean output
     const originalStderrWrite = process.stderr.write;
     process.stderr.write = () => true;
-
+  
     const trackingEnabled = minUnlocked > 0 || minAccessible > 0;
     
     console.log('SSH Lab Test Mode - Ctrl+C to stop');
@@ -1622,7 +1622,7 @@ exit 1`;
       console.log(`Network filter: ${JSON.stringify(effectiveNetworkFilter)}`);
     }
     console.log('');
-
+  
     // Build header dynamically based on tracking mode
     const headers = [
       '#'.padEnd(5),
@@ -1644,13 +1644,13 @@ exit 1`;
     headers.push('IPs');
     console.log(headers.join(' | '));
     console.log('='.repeat(trackingEnabled ? 110 : 85));
-
+  
     let totalDuration = 0;
     let totalScans = 0;
     let successCount = 0;
-    let totalDurationPerIP = 0; // Cumulative duration/IP across all scans
+    let totalDurationPerIP = 0;
     let running = true;
-
+  
     process.on('SIGINT', () => {
       running = false;
       process.stderr.write = originalStderrWrite;
@@ -1664,10 +1664,8 @@ exit 1`;
       
       process.exit(0);
     });
-
+  
     while (running) {
-      totalScans++;
-      
       try {
         const scanResult = await this._performScan({
           concurrency,
@@ -1675,18 +1673,19 @@ exit 1`;
           networkFilter: effectiveNetworkFilter
         });
         
+        if (!running) break;
+        
         if (scanResult.success && scanResult.scanComplete) {
+          totalScans++;
           const duration = parseFloat(scanResult.duration) || 0;
           totalDuration += duration;
           const avgDuration = totalDuration / totalScans;
           
-          // Calculate duration per IP for this scan
           const totalIPsScanned = scanResult.total_scanned || 0;
           const durationPerIP = totalIPsScanned > 0 ? duration / totalIPsScanned : 0;
           totalDurationPerIP += durationPerIP;
           const avgDurationPerIP = totalDurationPerIP / totalScans;
           
-          // Determine if this scan meets minimum requirements
           const unlockedCount = scanResult.unlocked || 0;
           const accessibleCount = scanResult.accessible || 0;
           
@@ -1703,7 +1702,6 @@ exit 1`;
             }
           }
           
-          // Build row data
           const rowData = [
             `#${String(totalScans).padStart(3)}`,
             new Date().toISOString().substring(11, 19).padEnd(12),
@@ -1726,7 +1724,6 @@ exit 1`;
           
           rowData.push(String(totalIPsScanned));
           
-          // Apply visual indicator for tracking mode
           let linePrefix = '';
           if (trackingEnabled) {
             linePrefix = isSuccess ? '  ' : '! ';
@@ -1734,7 +1731,6 @@ exit 1`;
           
           console.log(linePrefix + rowData.join(' | '));
           
-          // Show host details with appropriate indicators
           if (scanResult.hosts && scanResult.hosts.length > 0) {
             const unlockedHosts = scanResult.hosts.filter(h => h.unlocked && !h.noLongerActive);
             const accessibleHosts = scanResult.hosts.filter(h => h.accessible && !h.unlocked && !h.noLongerActive);
@@ -1757,10 +1753,14 @@ exit 1`;
             }
           }
         } else {
+          if (!running) break;
+          totalScans++;
           console.log(`#${String(totalScans).padStart(3)} | ${new Date().toISOString().substring(11, 19)} | Scan failed`);
         }
         
       } catch (error) {
+        if (!running) break;
+        totalScans++;
         console.log(`#${String(totalScans).padStart(3)} | ${new Date().toISOString().substring(11, 19)} | Error: ${error.message}`);
       }
     }
