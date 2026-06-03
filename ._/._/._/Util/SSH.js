@@ -1390,6 +1390,13 @@ exit 1`;
   /**
    * SURGICAL FEATURE: Test mode - runs scans continuously until Ctrl+C
    * Prints clean results as each scan completes
+   * Tracks success rate when minimum IP counts are specified
+   * Shows duration per IP metrics
+   * @param {Object} config - Configuration options
+   * @param {number} config.concurrency - Max concurrent connections (default: 500)
+   * @param {Object} config.persistentRetryConfig - Persistent retry configuration
+   * @param {number} config.minUnlocked - Minimum unlocked IPs required for success (default: 0, disabled)
+   * @param {number} config.minAccessible - Minimum accessible IPs required for success (default: 0, disabled)
    */
   static async testMode(config = {}) {
     const {
@@ -1399,16 +1406,25 @@ exit 1`;
         enhancedTimeout: 3000,
         enhancedRetries: 6,
         maxInactiveScans: 3
-      }
+      },
+      minUnlocked = 0,
+      minAccessible = 0
     } = config;
 
     // Suppress stderr for clean output
     const originalStderrWrite = process.stderr.write;
     process.stderr.write = () => true;
 
-    console.log('SSH Lab Test Mode - Ctrl+C to stop\n');
+    const trackingEnabled = minUnlocked > 0 || minAccessible > 0;
+    
+    console.log('SSH Lab Test Mode - Ctrl+C to stop');
+    if (trackingEnabled) {
+      console.log(`Tracking: min-unlocked=${minUnlocked}, min-accessible=${minAccessible}`);
+    }
+    console.log('');
 
-    console.log([
+    // Build header dynamically based on tracking mode
+    const headers = [
       '#'.padEnd(5),
       'Time'.padEnd(12),
       'Unlocked'.padEnd(10),
@@ -1416,23 +1432,35 @@ exit 1`;
       'Inactive'.padEnd(10),
       'Duration'.padEnd(10),
       'Avg Dur'.padEnd(10),
-      'IPs'
-    ].join(' | '));
-    console.log('='.repeat(85));
+      'Dur/IP'.padEnd(8),
+      'Avg D/IP'.padEnd(8)
+    ];
+    
+    if (trackingEnabled) {
+      headers.push('Success'.padEnd(8));
+      headers.push('Success%'.padEnd(9));
+    }
+    
+    headers.push('IPs');
+    console.log(headers.join(' | '));
+    console.log('='.repeat(trackingEnabled ? 110 : 85));
 
     let totalDuration = 0;
     let totalScans = 0;
+    let successCount = 0;
+    let totalDurationPerIP = 0; // Cumulative duration/IP across all scans
     let running = true;
 
     process.on('SIGINT', () => {
       running = false;
       process.stderr.write = originalStderrWrite;
       
-      if (totalScans > 0) {
-        const avgDuration = totalDuration / totalScans;
-        console.log(`\n=== Stopped after ${totalScans} scans ===`);
-        console.log(`Total time: ${totalDuration.toFixed(2)}s | Avg duration: ${avgDuration.toFixed(2)}s`);
+      console.log(`\n=== Stopped after ${totalScans} scans ===`);
+      console.log(`Total time: ${totalDuration.toFixed(2)}s | Avg duration: ${(totalDuration / Math.max(totalScans, 1)).toFixed(2)}s`);
+      if (trackingEnabled) {
+        console.log(`Success rate: ${successCount}/${totalScans} (${((successCount / Math.max(totalScans, 1)) * 100).toFixed(1)}%)`);
       }
+      console.log(`Avg Duration/IP: ${(totalDurationPerIP / Math.max(totalScans, 1)).toFixed(4)}s`);
       
       process.exit(0);
     });
@@ -1451,27 +1479,73 @@ exit 1`;
           totalDuration += duration;
           const avgDuration = totalDuration / totalScans;
           
-          console.log([
+          // Calculate duration per IP for this scan
+          const totalIPsScanned = scanResult.total_scanned || 0;
+          const durationPerIP = totalIPsScanned > 0 ? duration / totalIPsScanned : 0;
+          totalDurationPerIP += durationPerIP;
+          const avgDurationPerIP = totalDurationPerIP / totalScans;
+          
+          // Determine if this scan meets minimum requirements
+          const unlockedCount = scanResult.unlocked || 0;
+          const accessibleCount = scanResult.accessible || 0;
+          
+          let isSuccess = true;
+          if (trackingEnabled) {
+            if (minUnlocked > 0 && unlockedCount < minUnlocked) {
+              isSuccess = false;
+            }
+            if (minAccessible > 0 && accessibleCount < minAccessible) {
+              isSuccess = false;
+            }
+            if (isSuccess) {
+              successCount++;
+            }
+          }
+          
+          // Build row data
+          const rowData = [
             `#${String(totalScans).padStart(3)}`,
             new Date().toISOString().substring(11, 19).padEnd(12),
-            String(scanResult.unlocked || 0).padEnd(10),
-            String(scanResult.accessible || 0).padEnd(12),
+            String(unlockedCount).padEnd(10),
+            String(accessibleCount).padEnd(12),
             String(scanResult.inactive || 0).padEnd(10),
             `${duration.toFixed(2)}s`.padEnd(10),
             `${avgDuration.toFixed(2)}s`.padEnd(10),
-            String(scanResult.total_scanned || 0)
-          ].join(' | '));
+            `${durationPerIP.toFixed(4)}s`.padEnd(8),
+            `${avgDurationPerIP.toFixed(4)}s`.padEnd(8)
+          ];
           
+          if (trackingEnabled) {
+            const successPercent = ((successCount / totalScans) * 100).toFixed(1);
+            rowData.push(
+              isSuccess ? '✓'.padEnd(8) : '✗'.padEnd(8),
+              `${successPercent}%`.padEnd(9)
+            );
+          }
+          
+          rowData.push(String(totalIPsScanned));
+          
+          // Apply visual indicator for tracking mode
+          let linePrefix = '';
+          if (trackingEnabled) {
+            linePrefix = isSuccess ? '  ' : '! ';
+          }
+          
+          console.log(linePrefix + rowData.join(' | '));
+          
+          // Show host details with appropriate indicators
           if (scanResult.hosts && scanResult.hosts.length > 0) {
             const unlockedHosts = scanResult.hosts.filter(h => h.unlocked && !h.noLongerActive);
             const accessibleHosts = scanResult.hosts.filter(h => h.accessible && !h.unlocked && !h.noLongerActive);
             const inactiveHosts = scanResult.hosts.filter(h => h.noLongerActive);
             
             if (unlockedHosts.length > 0) {
-              console.log(`  ✓ ${unlockedHosts.map(h => h.host).join(', ')}`);
+              const prefix = trackingEnabled && minUnlocked > 0 && unlockedHosts.length < minUnlocked ? '! ' : '  ';
+              console.log(`${prefix}✓ ${unlockedHosts.map(h => h.host).join(', ')}`);
             }
             if (accessibleHosts.length > 0) {
-              console.log(`  ○ ${accessibleHosts.map(h => h.host).join(', ')}`);
+              const prefix = trackingEnabled && minAccessible > 0 && accessibleHosts.length < minAccessible ? '! ' : '  ';
+              console.log(`${prefix}○ ${accessibleHosts.map(h => h.host).join(', ')}`);
             }
             if (inactiveHosts.length > 0) {
               console.log(`  ✗ ${inactiveHosts.map(h => {
@@ -1572,6 +1646,9 @@ Test Options (for 'test' method):
   --concurrency=<n>         Max concurrent connections (default: 500)
   --persistent-retries=<n>  Max retry scans for persistent hosts (default: 1)
   --max-inactive-scans=<n>  Max consecutive inactive scans before removal (default: 3)
+  --min-unlocked=<n>        Minimum unlocked IPs required for success (default: 0, disabled)
+  --min-accessible=<n>      Minimum accessible IPs required for success (default: 0, disabled)
+                            When set, success % is calculated based on meeting minimum counts
 
 Examples:
   node ssh-lab.mjs setup
@@ -1587,7 +1664,9 @@ Examples:
   node ssh-lab.mjs scan --persistent-retries=2 --max-inactive-scans=5
   node ssh-lab.mjs scan-status
   node ssh-lab.mjs test
-  node ssh-lab.mjs test --persistent-retries=2 --max-inactive-scans=5
+  node ssh-lab.mjs test --min-unlocked=3
+  node ssh-lab.mjs test --min-unlocked=3 --min-accessible=5
+  node ssh-lab.mjs test --persistent-retries=2 --min-unlocked=3 --max-inactive-scans=5
   node ssh-lab.mjs test --concurrency=1000
 `;
 
@@ -1674,12 +1753,24 @@ Examples:
 
         case 'test': {
           const testConfig = {
-            concurrency: 500
+            concurrency: 500,
+            minUnlocked: 0,
+            minAccessible: 0
           };
           
           const concurrencyArg = args.find(a => a.startsWith('--concurrency='));
           if (concurrencyArg) {
             testConfig.concurrency = parseInt(concurrencyArg.split('=')[1]) || 500;
+          }
+          
+          const minUnlockedArg = args.find(a => a.startsWith('--min-unlocked='));
+          if (minUnlockedArg) {
+            testConfig.minUnlocked = parseInt(minUnlockedArg.split('=')[1]) || 0;
+          }
+          
+          const minAccessibleArg = args.find(a => a.startsWith('--min-accessible='));
+          if (minAccessibleArg) {
+            testConfig.minAccessible = parseInt(minAccessibleArg.split('=')[1]) || 0;
           }
           
           const persistentRetriesArg = args.find(a => a.startsWith('--persistent-retries='));
