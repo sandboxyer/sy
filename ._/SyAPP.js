@@ -4761,7 +4761,7 @@ class Error extends SyAPP_Func {
       async (props) => {
         let uid = props.session.UniqueID
         this.Text(uid, `Internal error loading ${this.TextColor.brightRed(props.error_func)}\n`)
-        if (props.error_message) { this.Text(uid, props.error_message.toString()) }
+        if (props.error_message) { this.Alert(uid, props.error_message.toString()) }
         this.SideButton(uid, { name: '← Return', path: props.session.PreviousPath })
         this.SideButton(uid, { name: '⌂ Main Func', path: props.mainfunc })
       }

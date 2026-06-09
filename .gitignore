@@ -17,6 +17,7 @@ build/
 buildsaves.cfg
 
 # Ubuntu cloud image downloads
+alpine-cloudinit.qcow2.partial
 noble-server-cloudimg-amd64.img
 *.img
 *.c
