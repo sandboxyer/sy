@@ -18,7 +18,7 @@ class RacksLab extends SyAPP.Func(){
                     this.Alert(uid,this.TextColor.green('Alpine lauched !'))
                  }
 
-                 let racks = await SSH.scanNetwork({background : true})
+                 let racks = await SSH.scanNetwork({background : true,qemu : true})
 
                  //await this.WaitLog(racks)
 
