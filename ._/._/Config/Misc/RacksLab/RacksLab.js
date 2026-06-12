@@ -31,9 +31,13 @@ class RacksLab extends SyAPP.Func(){
 
                  this.Text(uid,`• Racks Lab | ${racks.cacheAge}`)
 
+                 if(props.connect){
+                    await SSH.connect(props.connect)
+                 }
+
                 racks.hosts.forEach(e => {
                     if(e.unlocked){
-                        this.Button(uid,ColorText.green(e.host))
+                        this.Button(uid,ColorText.green(e.host),{props : {connect : e.host}})
                     } else {
                         this.Button(uid,ColorText.red(e.host))
                     }

@@ -82,6 +82,115 @@ export default class SSH {
   }
 
   /**
+ * Connect to a host via SSH interactively in a child process
+ * This preserves the parent process's readline/terminal state completely
+ * @param {string} host - Target IP/hostname
+ * @param {Object} options - Connection options
+ * @param {string} options.user - SSH user (default: 'root')
+ * @param {number} options.port - SSH port (default: 22)
+ * @param {string} options.identityFile - Path to identity file (default: ~/.ssh/id_rsa)
+ * @param {boolean} options.clearScreen - Clear terminal before connecting (default: true)
+ * @returns {Promise<Object>} Result object with exit code
+ */
+static async connect(host, options = {}) {
+  const {
+    user = 'root',
+    port = 22,
+    identityFile = join(homedir(), '.ssh', 'id_rsa'),
+    clearScreen = true
+  } = options;
+
+  if (!host) {
+    return { success: false, message: 'Host is required' };
+  }
+
+  // Clear terminal screen if requested
+  if (clearScreen) {
+    process.stdout.write('\x1b[2J');    // Clear entire screen
+    process.stdout.write('\x1b[3J');    // Clear scrollback buffer
+    process.stdout.write('\x1b[H');     // Move cursor to home position
+  }
+
+  console.error(`[connect] Starting SSH connection to ${user}@${host}:${port}...`);
+
+  return new Promise((resolve) => {
+    const sshArgs = [
+      '-o', 'StrictHostKeyChecking=no',
+      '-o', 'UserKnownHostsFile=/dev/null',
+      '-o', 'LogLevel=ERROR',
+      '-o', 'ConnectTimeout=10',
+      '-o', 'PasswordAuthentication=no',
+      '-o', 'BatchMode=yes',
+      '-p', String(port),
+      '-i', identityFile,
+      `${user}@${host}`
+    ];
+
+    console.error(`[connect] Spawning: ssh ${sshArgs.join(' ')}`);
+
+    // CRITICAL: Release the terminal before spawning SSH
+    if (process.stdin.isTTY) {
+      try {
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+      } catch (e) {
+        // Ignore
+      }
+    }
+
+    const child = spawn('ssh', sshArgs, {
+      stdio: [process.stdin, process.stdout, process.stderr],
+      detached: false
+    });
+
+    child.on('exit', (code, signal) => {
+      console.error(`\n[connect] SSH session ended with code ${code}${signal ? `, signal ${signal}` : ''}`);
+      
+      // Restore stdin
+      if (process.stdin.isTTY) {
+        try {
+          process.stdin.resume();
+        } catch (e) {
+          // Ignore
+        }
+      }
+      
+      // Small delay to let terminal settle
+      setTimeout(() => {
+        resolve({
+          success: code === 0,
+          exitCode: code,
+          signal: signal || null,
+          message: code === 0 
+            ? 'SSH session ended successfully' 
+            : `SSH session ended with exit code ${code}`
+        });
+      }, 100);
+    });
+
+    child.on('error', (error) => {
+      console.error(`[connect] Failed to spawn SSH: ${error.message}`);
+      
+      // Restore stdin
+      if (process.stdin.isTTY) {
+        try {
+          process.stdin.resume();
+        } catch (e) {
+          // Ignore
+        }
+      }
+      
+      resolve({
+        success: false,
+        exitCode: null,
+        signal: null,
+        message: `Failed to start SSH: ${error.message}`
+      });
+    });
+  });
+}
+
+  /**
    * Setup SSH directory and config
    */
   static async setup() {
