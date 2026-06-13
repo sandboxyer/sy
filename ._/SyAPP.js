@@ -4096,6 +4096,489 @@ this.ProcessAlerts = (id) => {
 
       return true;
     };
+    
+    /**
+ * File browser with recursive dropdown navigation and pagination
+ * @param {string} id - User/build ID
+ * @param {Object} config - File browser configuration
+ * @param {string} [config.startPath] - Starting directory path (default: OS root)
+ * @param {boolean} [config.multiple=true] - Allow multiple file selection
+ * @param {boolean} [config.showMessages=false] - Show status messages via Text/Alert
+ * @param {string} [config.storageKey='fileBrowser'] - Storage key for tracking selections
+ * @param {number} [config.itemsPerPage=5] - Items per page in dropdown
+ * @param {Function} [config.filter] - Filter function for files/dirs: (itemPath, isDir) => boolean
+ * @param {Object} [config.icons] - Custom icons
+ * @param {string} [config.icons.folder='📁'] - Folder icon
+ * @param {string} [config.icons.file='📄'] - File icon
+ * @param {string} [config.icons.selected='✅'] - Selected indicator
+ * @param {string} [config.icons.openFolder='📂'] - Open folder icon
+ * @param {string} [config.icons.back='⬆️'] - Back navigation icon
+ * @param {string} [config.icons.error='❌'] - Error icon
+ * @param {string} [config.icons.clear='🗑️'] - Clear selection icon
+ * @returns {Array<string>} Array of selected file paths
+ */
+this.File = async (id, config = {}) => {
+  // Default configuration
+  const defaultConfig = {
+    startPath: os.platform() === 'win32' ? process.cwd().split(path.sep)[0] + path.sep : '/',
+    multiple: true,
+    showMessages: false,
+    storageKey: 'fileBrowser',
+    itemsPerPage: 5,
+    filter: null,
+    icons: {
+      folder: '📁',
+      file: '📄',
+      selected: '✅',
+      openFolder: '📂',
+      back: '⬆️',
+      error: '❌',
+      clear: '🗑️'
+    }
+  };
+
+  const finalConfig = { ...defaultConfig, ...config };
+  finalConfig.icons = { ...defaultConfig.icons, ...(config.icons || {}) };
+
+  // Initialize storage if needed
+  const storageKey = finalConfig.storageKey;
+  if (!this.Storages.Has(id, storageKey)) {
+    this.Storages.Set(id, storageKey, {
+      selectedFiles: [],
+      currentPath: finalConfig.startPath,
+      currentPage: 0
+    });
+  }
+
+  const storage = this.Storages.Get(id, storageKey);
+  
+  // Handle navigation
+  if (this.Builds.get(id).Session.ActualProps?.[`${storageKey}_navigate`]) {
+    const newPath = this.Builds.get(id).Session.ActualProps[`${storageKey}_navigate`];
+    storage.currentPath = newPath;
+    storage.currentPage = 0; // Reset page on navigation
+    this.Storages.Set(id, storageKey, storage);
+    delete this.Builds.get(id).Session.ActualProps[`${storageKey}_navigate`];
+  }
+
+  // Handle file selection
+  if (this.Builds.get(id).Session.ActualProps?.[`${storageKey}_select`]) {
+    const selectedPath = this.Builds.get(id).Session.ActualProps[`${storageKey}_select`];
+    
+    if (storage.selectedFiles.includes(selectedPath)) {
+      // Deselect
+      storage.selectedFiles = storage.selectedFiles.filter(f => f !== selectedPath);
+    } else {
+      // Select
+      if (finalConfig.multiple) {
+        storage.selectedFiles.push(selectedPath);
+      } else {
+        storage.selectedFiles = [selectedPath];
+      }
+    }
+    
+    this.Storages.Set(id, storageKey, storage);
+    delete this.Builds.get(id).Session.ActualProps[`${storageKey}_select`];
+  }
+
+  // Handle pagination
+  if (this.Builds.get(id).Session.ActualProps?.[`${storageKey}_page`]) {
+    storage.currentPage = this.Builds.get(id).Session.ActualProps[`${storageKey}_page`];
+    this.Storages.Set(id, storageKey, storage);
+    delete this.Builds.get(id).Session.ActualProps[`${storageKey}_page`];
+  }
+
+  // Handle clear selection
+  if (this.Builds.get(id).Session.ActualProps?.[`${storageKey}_clear`]) {
+    storage.selectedFiles = [];
+    storage.currentPage = 0;
+    this.Storages.Set(id, storageKey, storage);
+    delete this.Builds.get(id).Session.ActualProps[`${storageKey}_clear`];
+  }
+
+  const currentPath = storage.currentPath;
+  
+  // Show current path header (only if messages enabled)
+  if (finalConfig.showMessages) {
+    this.Text(id, `${finalConfig.icons.openFolder} ${currentPath}`);
+    if (storage.selectedFiles.length > 0) {
+      this.Text(id, `${finalConfig.icons.selected} ${storage.selectedFiles.length} file(s) selected`);
+    }
+  }
+
+  // Read directory
+  try {
+    const allItems = fs.readdirSync(currentPath, { withFileTypes: true });
+    
+    // Process items
+    const items = [];
+    
+    // Add parent directory if not at root
+    const parentPath = path.dirname(currentPath);
+    if (currentPath !== parentPath) {
+      items.push({
+        name: '..',
+        path: parentPath,
+        isDirectory: true,
+        isParent: true
+      });
+    }
+    
+    for (const item of allItems) {
+      const itemPath = path.join(currentPath, item.name);
+      
+      // Apply filter if provided
+      if (finalConfig.filter && !finalConfig.filter(itemPath, item.isDirectory())) {
+        continue;
+      }
+      
+      try {
+        if (item.isDirectory()) {
+          items.push({
+            name: item.name,
+            path: itemPath,
+            isDirectory: true,
+            isParent: false
+          });
+        } else if (item.isFile()) {
+          items.push({
+            name: item.name,
+            path: itemPath,
+            isDirectory: false,
+            isParent: false
+          });
+        }
+      } catch (error) {
+        // Skip inaccessible items
+        continue;
+      }
+    }
+    
+    // Sort: directories first (except parent), then files, all alphabetically
+    const parentItems = items.filter(i => i.isParent);
+    const directories = items.filter(i => i.isDirectory && !i.isParent).sort((a, b) => a.name.localeCompare(b.name));
+    const files = items.filter(i => !i.isDirectory).sort((a, b) => a.name.localeCompare(b.name));
+    const sortedItems = [...parentItems, ...directories, ...files];
+    
+    // Calculate pagination
+    const totalPages = Math.ceil(sortedItems.length / finalConfig.itemsPerPage);
+    const currentPage = Math.min(storage.currentPage, totalPages - 1);
+    const startIdx = currentPage * finalConfig.itemsPerPage;
+    const endIdx = Math.min(startIdx + finalConfig.itemsPerPage, sortedItems.length);
+    const pageItems = sortedItems.slice(startIdx, endIdx);
+    
+    // Update storage with current page
+    storage.currentPage = currentPage;
+    this.Storages.Set(id, storageKey, storage);
+    
+    // Build button texts
+    // Closed dropdown button (clean, no pagination info)
+    let closedButtonText = `${finalConfig.icons.folder} Browse: ${path.basename(currentPath) || currentPath}`;
+    
+    // Add selection count if any
+    if (storage.selectedFiles.length > 0) {
+      closedButtonText += ` (${storage.selectedFiles.length} selected)`;
+    }
+    
+    // Open dropdown button (with pagination info)
+    let openButtonText = `${finalConfig.icons.openFolder} Hide`;
+    if (totalPages > 1) {
+      openButtonText += ` [Page ${currentPage + 1}/${totalPages}]`;
+    }
+    if (storage.selectedFiles.length > 0) {
+      openButtonText += ` (${storage.selectedFiles.length} selected)`;
+    }
+    
+    // Create dropdown with all items in a single layer
+    const dropdownName = `${storageKey}_browser`;
+    
+    await this.DropDown(id, dropdownName, async () => {
+      // Display items
+      for (const item of pageItems) {
+        if (item.isDirectory) {
+          // Check if directory contains selected files
+          const hasSelectedContent = storage.selectedFiles.some(f => f.startsWith(item.path + path.sep));
+          
+          let icon = item.isParent ? finalConfig.icons.back : 
+                   (hasSelectedContent ? finalConfig.icons.selected : finalConfig.icons.folder);
+          
+          this.Button(id, {
+            name: `${icon} ${item.name}${hasSelectedContent && !item.isParent ? ' (has selected)' : ''}`,
+            path: this.Name,
+            props: { 
+              [`${storageKey}_navigate`]: item.path,
+              page: this.Builds.get(id).Session.ActualProps?.page 
+            }
+          });
+        } else {
+          const isSelected = storage.selectedFiles.includes(item.path);
+          const icon = isSelected ? finalConfig.icons.selected : finalConfig.icons.file;
+          
+          this.Button(id, {
+            name: `${icon} ${item.name}`,
+            path: this.Name,
+            props: { 
+              [`${storageKey}_select`]: item.path,
+              page: this.Builds.get(id).Session.ActualProps?.page 
+            }
+          });
+        }
+      }
+      
+      // Navigation and controls section
+      if (totalPages > 1 || storage.selectedFiles.length > 0) {
+        this.Button(id, { name: ' ' }); // Spacer
+        
+        // Create array of control buttons
+        const controlButtons = [];
+        
+        // Prev button (only if multiple pages)
+        if (totalPages > 1) {
+          controlButtons.push({
+            name: `◀ Prev`,
+            path: this.Name,
+            props: { 
+              [`${storageKey}_page`]: currentPage > 0 ? currentPage - 1 : totalPages - 1,
+              page: this.Builds.get(id).Session.ActualProps?.page 
+            }
+          });
+        }
+        
+        // Next button (only if multiple pages)
+        if (totalPages > 1) {
+          controlButtons.push({
+            name: `Next ▶`,
+            path: this.Name,
+            props: { 
+              [`${storageKey}_page`]: currentPage < totalPages - 1 ? currentPage + 1 : 0,
+              page: this.Builds.get(id).Session.ActualProps?.page 
+            }
+          });
+        }
+        
+        // Clear selection button (only if there are selected files)
+        if (storage.selectedFiles.length > 0) {
+          controlButtons.push({
+            name: `${finalConfig.icons.clear} Clear (${storage.selectedFiles.length})`,
+            path: this.Name,
+            props: { 
+              [`${storageKey}_clear`]: true,
+              page: this.Builds.get(id).Session.ActualProps?.page 
+            }
+          });
+        }
+        
+        // Add all control buttons as side buttons
+        if (controlButtons.length > 0) {
+          this.Buttons(id, controlButtons);
+        }
+      }
+      
+      // Show empty message if no items
+      if (sortedItems.length === 0) {
+        this.Button(id, {
+          name: '(empty directory)',
+          path: this.Name,
+          props: {}
+        });
+      }
+      
+    }, {
+      up_buttontext: closedButtonText,
+      down_buttontext: openButtonText,
+      down_emoji: '▼',
+      up_emoji: '▶'
+    });
+    
+    // Show selected files summary if messages enabled
+    if (finalConfig.showMessages && storage.selectedFiles.length > 0) {
+      this.Text(id, '');
+      this.Text(id, '📋 Selected Files:');
+      storage.selectedFiles.forEach((filePath, index) => {
+        const relativePath = path.relative(finalConfig.startPath, filePath);
+        this.Text(id, `  ${index + 1}. ${relativePath}`);
+      });
+    }
+
+  } catch (error) {
+    if (finalConfig.showMessages) {
+      this.Alert(id, `Error reading directory: ${error.message}`, { duration: 3000 });
+    }
+    
+    // Build error button texts
+    let errorClosedText = `${finalConfig.icons.error} Error: ${path.basename(currentPath)}`;
+    let errorOpenText = `${finalConfig.icons.error} Hide Error`;
+    
+    // Show error in dropdown
+    const dropdownName = `${storageKey}_browser`;
+    await this.DropDown(id, dropdownName, async () => {
+      this.Text(id, `${finalConfig.icons.error} Error reading directory:`);
+      this.Text(id, error.message);
+      
+      // Back button if not at root
+      const parentPath = path.dirname(currentPath);
+      if (currentPath !== parentPath) {
+        this.Button(id, {
+          name: `${finalConfig.icons.back} Go back to parent`,
+          path: this.Name,
+          props: { 
+            [`${storageKey}_navigate`]: parentPath,
+            page: this.Builds.get(id).Session.ActualProps?.page 
+          }
+        });
+      }
+    }, {
+      up_buttontext: errorClosedText,
+      down_buttontext: errorOpenText,
+      down_emoji: '▼',
+      up_emoji: '▶'
+    });
+  }
+
+  return storage.selectedFiles;
+};
+
+/**
+ * File manager methods for managing file selections
+ * @namespace
+ */
+this.FileManager = {
+  /**
+   * Get selected files array
+   * @param {string} id - User/build ID
+   * @param {string} [storageKey='fileBrowser'] - Storage key used in this.File()
+   * @returns {Array<string>} Array of selected file paths
+   */
+  GetSelected: (id, storageKey = 'fileBrowser') => {
+    const storage = this.Storages.Get(id, storageKey);
+    return storage?.selectedFiles || [];
+  },
+
+  /**
+   * Clear all selected files
+   * @param {string} id - User/build ID
+   * @param {string} [storageKey='fileBrowser'] - Storage key used in this.File()
+   */
+  ClearSelection: (id, storageKey = 'fileBrowser') => {
+    const storage = this.Storages.Get(id, storageKey);
+    if (storage) {
+      storage.selectedFiles = [];
+      storage.currentPage = 0;
+      this.Storages.Set(id, storageKey, storage);
+    }
+  },
+
+  /**
+   * Remove a specific file from selection
+   * @param {string} id - User/build ID
+   * @param {string} filePath - File path to remove from selection
+   * @param {string} [storageKey='fileBrowser'] - Storage key used in this.File()
+   */
+  RemoveFile: (id, filePath, storageKey = 'fileBrowser') => {
+    const storage = this.Storages.Get(id, storageKey);
+    if (storage) {
+      storage.selectedFiles = storage.selectedFiles.filter(f => f !== filePath);
+      this.Storages.Set(id, storageKey, storage);
+    }
+  },
+
+  /**
+   * Set a specific file as the only selected file (clears others)
+   * @param {string} id - User/build ID
+   * @param {string} filePath - File path to set as selected
+   * @param {string} [storageKey='fileBrowser'] - Storage key used in this.File()
+   */
+  SetFile: (id, filePath, storageKey = 'fileBrowser') => {
+    const storage = this.Storages.Get(id, storageKey);
+    if (storage) {
+      storage.selectedFiles = [filePath];
+      this.Storages.Set(id, storageKey, storage);
+    }
+  },
+
+  /**
+   * Add a file to selection without clearing others
+   * @param {string} id - User/build ID
+   * @param {string} filePath - File path to add to selection
+   * @param {string} [storageKey='fileBrowser'] - Storage key used in this.File()
+   */
+  AddFile: (id, filePath, storageKey = 'fileBrowser') => {
+    const storage = this.Storages.Get(id, storageKey);
+    if (storage && !storage.selectedFiles.includes(filePath)) {
+      storage.selectedFiles.push(filePath);
+      this.Storages.Set(id, storageKey, storage);
+    }
+  },
+
+  /**
+   * Check if a specific file is selected
+   * @param {string} id - User/build ID
+   * @param {string} filePath - File path to check
+   * @param {string} [storageKey='fileBrowser'] - Storage key used in this.File()
+   * @returns {boolean} Whether the file is selected
+   */
+  IsSelected: (id, filePath, storageKey = 'fileBrowser') => {
+    const storage = this.Storages.Get(id, storageKey);
+    return storage?.selectedFiles?.includes(filePath) || false;
+  },
+
+  /**
+   * Get current browsing path
+   * @param {string} id - User/build ID
+   * @param {string} [storageKey='fileBrowser'] - Storage key used in this.File()
+   * @returns {string} Current directory path being browsed
+   */
+  GetCurrentPath: (id, storageKey = 'fileBrowser') => {
+    const storage = this.Storages.Get(id, storageKey);
+    return storage?.currentPath || '';
+  },
+
+  /**
+   * Get selection count
+   * @param {string} id - User/build ID
+   * @param {string} [storageKey='fileBrowser'] - Storage key used in this.File()
+   * @returns {number} Number of selected files
+   */
+  GetCount: (id, storageKey = 'fileBrowser') => {
+    const storage = this.Storages.Get(id, storageKey);
+    return storage?.selectedFiles?.length || 0;
+  },
+
+  /**
+   * Get current page number (0-based)
+   * @param {string} id - User/build ID
+   * @param {string} [storageKey='fileBrowser'] - Storage key used in this.File()
+   * @returns {number} Current page number
+   */
+  GetCurrentPage: (id, storageKey = 'fileBrowser') => {
+    const storage = this.Storages.Get(id, storageKey);
+    return storage?.currentPage || 0;
+  },
+
+  /**
+   * Reset file browser to initial state (clears everything)
+   * @param {string} id - User/build ID
+   * @param {string} [storageKey='fileBrowser'] - Storage key used in this.File()
+   */
+  Reset: (id, storageKey = 'fileBrowser') => {
+    this.Storages.Delete(id, storageKey);
+  },
+
+  /**
+   * Get selected files with relative paths
+   * @param {string} id - User/build ID
+   * @param {string} [basePath] - Base path for relative paths (default: startPath from storage)
+   * @param {string} [storageKey='fileBrowser'] - Storage key used in this.File()
+   * @returns {Array<string>} Array of relative file paths
+   */
+  GetSelectedRelative: (id, basePath = null, storageKey = 'fileBrowser') => {
+    const storage = this.Storages.Get(id, storageKey);
+    if (!storage || storage.selectedFiles.length === 0) return [];
+    
+    const base = basePath || storage.startPath || '/';
+    return storage.selectedFiles.map(filePath => path.relative(base, filePath));
+  }
+};
 
     // --------------------------- SetPage Method ---------------------------
 
