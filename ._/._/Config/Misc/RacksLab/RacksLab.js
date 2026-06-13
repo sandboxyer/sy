@@ -35,14 +35,23 @@ class RacksLab extends SyAPP.Func(){
                     await SSH.connect(props.connect)
                  }
 
-                racks.hosts.forEach(e => {
-                    if(e.unlocked){
-                        this.Button(uid,ColorText.green(e.host),{props : {connect : e.host}})
-                    } else {
-                        this.Button(uid,ColorText.red(e.host))
-                    }
-                   
-                })
+                 if(props.unlock){
+                    this.Alert(uid,' ')
+                    this.Alert(uid,`${ColorText.brightWhite(props.unlock)} unlock requested !`)
+                    SSH.fullSetup(props.unlock,'123')
+                }   
+
+                 for(let host of racks.hosts){
+                    await this.DropDown(uid,host.host,async () => {
+                        let buttons = [{name : 'Connect',props :{connect : host.host}}]
+                        if(!host.unlocked){buttons.push({name : 'Unlock',props : {unlock : host.host}})}
+                        buttons.push({name : 'Config'})
+                        this.Buttons(uid,buttons)
+                    },{up_buttontext : (host.unlocked) ? ColorText.green(host.host) : ColorText.yellow(host.host),
+                        down_buttontext :(host.unlocked) ? ColorText.green(host.host) : ColorText.yellow(host.host)
+                    })
+                 }
+
                 this.Button(uid,' ')
                 await this.DropDown(uid,'dropdownlaunch',() => {
                     this.Button(uid,'Alpine',{props : {alpine : true}})
