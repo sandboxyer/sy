@@ -12,14 +12,12 @@ class RacksLab extends SyAPP.Func(){
                  if(!this.Storages.Has(uid,'parentfunc')){this.Storages.Set(uid,'parentfunc',props.session.PreviousPath)}
 
                  if(props.alpine){
-                    
                     Qemu.startVM()
                     this.Alert(uid,' ')
                     this.Alert(uid,this.TextColor.green('Alpine lauched !'))
                  }
 
                  if(props.ubuntu){
-                    
                     Qemu.startVM({os : 'ubuntu'})
                     this.Alert(uid,' ')
                     this.Alert(uid,this.TextColor.green('Ubuntu lauched !'))
@@ -43,10 +41,10 @@ class RacksLab extends SyAPP.Func(){
 
                  for(let host of racks.hosts){
                     await this.DropDown(uid,host.host,async () => {
-                        let buttons = [{name : 'Connect',props :{connect : host.host}}]
-                        if(!host.unlocked){buttons.push({name : 'Unlock',props : {unlock : host.host}})}
-                        buttons.push({name : 'Config'})
-                        this.Buttons(uid,buttons)
+                        this.Button(uid,{name : 'Connect',props :{connect : host.host}})
+                        if(!host.unlocked){this.Button(uid,{name : 'Unlock',props : {unlock : host.host}})}
+                        this.Button(uid,this.TextColor.red('Poweroff'))
+                        this.File(uid)
                     },{up_buttontext : (host.unlocked) ? ColorText.green(host.host) : ColorText.yellow(host.host),
                         down_buttontext :(host.unlocked) ? ColorText.green(host.host) : ColorText.yellow(host.host)
                     })
@@ -56,6 +54,7 @@ class RacksLab extends SyAPP.Func(){
                 await this.DropDown(uid,'dropdownlaunch',() => {
                     this.Button(uid,'Alpine',{props : {alpine : true}})
                     this.Button(uid,'Ubuntu',{props : {ubuntu : true}})
+                    this.Button(uid,'Custom')
                 },{down_buttontext : 'Launch VM',up_buttontext : 'Launch VM',horizontal : true})
                 this.Button(uid,' ')
               
