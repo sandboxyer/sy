@@ -4104,6 +4104,7 @@ this.ProcessAlerts = (id) => {
  * @param {Object} config - File browser configuration
  * @param {string} [config.name='fileBrowser'] - Unique name for this file browser instance
  * @param {string} [config.startPath] - Starting directory path (default: OS root)
+ * @param {string} [config.displayName] - Custom display name for the browser button (default: 'Browse: {current folder}')
  * @param {boolean} [config.multiple=true] - Allow multiple file selection
  * @param {boolean} [config.showMessages=false] - Show status messages via Text/Alert
  * @param {number} [config.itemsPerPage=5] - Items per page in dropdown
@@ -4123,6 +4124,7 @@ this.File = async (id, config = {}) => {
   const defaultConfig = {
     name: 'fileBrowser',
     startPath: os.platform() === 'win32' ? process.cwd().split(path.sep)[0] + path.sep : '/',
+    displayName: null, // null means auto-generate from current path
     multiple: true,
     showMessages: false,
     itemsPerPage: 5,
@@ -4148,6 +4150,7 @@ this.File = async (id, config = {}) => {
   if (!this.Storages.Has(id, storageKey)) {
     this.Storages.Set(id, storageKey, {
       instanceName: instanceName,
+      displayName: finalConfig.displayName, // Store the custom display name
       selectedFiles: [],
       currentPath: finalConfig.startPath,
       currentPage: 0,
@@ -4156,6 +4159,12 @@ this.File = async (id, config = {}) => {
   }
 
   const storage = this.Storages.Get(id, storageKey);
+  
+  // Update display name if it was provided in config
+  if (finalConfig.displayName !== undefined && storage.displayName !== finalConfig.displayName) {
+    storage.displayName = finalConfig.displayName;
+    this.Storages.Set(id, storageKey, storage);
+  }
   
   // Get current props from session
   const currentProps = this.Builds.get(id).Session.ActualProps || {};
@@ -4190,14 +4199,12 @@ this.File = async (id, config = {}) => {
     delete this.Builds.get(id).Session.ActualProps[selectProp];
   }
 
-  // Handle pagination - FIXED: Read page change and update BEFORE reading directory
+  // Handle pagination
   const pageProp = `${storageKey}_page`;
-  let pageChanged = false;
   if (currentProps[pageProp] !== undefined) {
     const newPage = parseInt(currentProps[pageProp]);
     if (!isNaN(newPage) && newPage >= 0) {
       storage.currentPage = newPage;
-      pageChanged = true;
     }
     this.Storages.Set(id, storageKey, storage);
     delete this.Builds.get(id).Session.ActualProps[pageProp];
@@ -4213,6 +4220,27 @@ this.File = async (id, config = {}) => {
   }
 
   const currentPath = storage.currentPath;
+  
+  // Generate display name for the browser button
+  const getDisplayName = () => {
+    if (storage.displayName) {
+      // Use custom display name
+      return storage.displayName;
+    } else {
+      // Auto-generate from current path
+      const folderName = path.basename(currentPath) || currentPath;
+      return `Browse: ${folderName}`;
+    }
+  };
+  
+  const getOpenDisplayName = () => {
+    if (storage.displayName) {
+      return storage.displayName;
+    } else {
+      const folderName = path.basename(currentPath) || currentPath;
+      return `${folderName}`;
+    }
+  };
   
   // Show current path header (only if messages enabled)
   if (finalConfig.showMessages) {
@@ -4280,7 +4308,7 @@ this.File = async (id, config = {}) => {
     const totalPages = Math.max(1, Math.ceil(sortedItems.length / finalConfig.itemsPerPage));
     storage.totalPages = totalPages;
     
-    // FIXED: Validate and adjust current page AFTER calculating total pages
+    // Validate and adjust current page
     if (storage.currentPage >= totalPages) {
       storage.currentPage = 0;
     }
@@ -4296,14 +4324,20 @@ this.File = async (id, config = {}) => {
     // Update storage with validated page
     this.Storages.Set(id, storageKey, storage);
     
-    // Build button texts
-    let closedButtonText = `${finalConfig.icons.folder} Browse: ${path.basename(currentPath) || currentPath}`;
+    // Build button texts with customizable display name
+    const baseDisplayName = getDisplayName();
     
+    // Closed dropdown button
+    let closedButtonText = `${finalConfig.icons.folder} ${baseDisplayName}`;
+    
+    // Add selection count if any
     if (storage.selectedFiles.length > 0) {
       closedButtonText += ` (${storage.selectedFiles.length} selected)`;
     }
     
-    let openButtonText = `${finalConfig.icons.openFolder} Hide`;
+    // Open dropdown button
+    const openDisplayName = getOpenDisplayName();
+    let openButtonText = `${finalConfig.icons.openFolder} Hide ${openDisplayName}`;
     if (totalPages > 1) {
       openButtonText += ` [Page ${currentPage + 1}/${totalPages}]`;
     }
@@ -4352,7 +4386,7 @@ this.File = async (id, config = {}) => {
         
         const controlButtons = [];
         
-        // FIXED: Prev button - wraps around to last page if on first page
+        // Prev button
         if (totalPages > 1) {
           controlButtons.push({
             name: `◀ Prev`,
@@ -4364,7 +4398,7 @@ this.File = async (id, config = {}) => {
           });
         }
         
-        // FIXED: Next button - wraps around to first page if on last page
+        // Next button
         if (totalPages > 1) {
           controlButtons.push({
             name: `Next ▶`,
@@ -4424,7 +4458,8 @@ this.File = async (id, config = {}) => {
       this.Alert(id, `Error reading directory: ${error.message}`, { duration: 3000 });
     }
     
-    let errorClosedText = `${finalConfig.icons.error} Error: ${path.basename(currentPath)}`;
+    const baseDisplayName = getDisplayName();
+    let errorClosedText = `${finalConfig.icons.error} Error: ${baseDisplayName}`;
     let errorOpenText = `${finalConfig.icons.error} Hide Error`;
     
     const dropdownName = `${storageKey}_browser`;
@@ -4603,6 +4638,33 @@ this.FileManager = {
     
     const base = basePath || storage.startPath || '/';
     return storage.selectedFiles.map(filePath => path.relative(base, filePath));
+  },
+
+  /**
+   * Update the display name of a file browser instance
+   * @param {string} id - User/build ID
+   * @param {string} displayName - New display name
+   * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
+   */
+  SetDisplayName: (id, displayName, instanceName = 'fileBrowser') => {
+    const storageKey = `fileBrowser_${instanceName}`;
+    const storage = this.Storages.Get(id, storageKey);
+    if (storage) {
+      storage.displayName = displayName;
+      this.Storages.Set(id, storageKey, storage);
+    }
+  },
+
+  /**
+   * Get the display name of a file browser instance
+   * @param {string} id - User/build ID
+   * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
+   * @returns {string} Current display name
+   */
+  GetDisplayName: (id, instanceName = 'fileBrowser') => {
+    const storageKey = `fileBrowser_${instanceName}`;
+    const storage = this.Storages.Get(id, storageKey);
+    return storage?.displayName || `Browse: ${path.basename(storage?.currentPath || '')}`;
   }
 };
 
