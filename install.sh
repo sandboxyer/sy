@@ -73,10 +73,7 @@ SHELL_SCRIPTS_CMD="qemu lay"    # ← Add your command names here
 #   scripts/seed_data.js --env production --count 1000
 #
 POST_INSTALL_SCRIPTS="
-# scripts/deploy_model.sh
-# scripts/setup_config.js --port 8080 --env production
-# core/init_database.sh --force
-# utils/health_check.js --timeout 30
+._/._/._/Util/SSH.js toggle-on --qemu
 "
 # =============================================================================
 
@@ -2955,7 +2952,11 @@ execute_post_install_scripts() {
     scripts_failed=0
     scripts_skipped=0
     
-    echo "$POST_INSTALL_SCRIPTS" | while IFS= read -r line; do
+    # Use a temp file to store the scripts content to avoid subshell issues
+    SCRIPTS_TEMP_FILE="/tmp/post_install_scripts_$$.txt"
+    echo "$POST_INSTALL_SCRIPTS" > "$SCRIPTS_TEMP_FILE"
+    
+    while IFS= read -r line; do
         # Skip empty lines
         if [ -z "$line" ]; then
             continue
@@ -3056,7 +3057,10 @@ execute_post_install_scripts() {
             scripts_failed=$((scripts_failed + 1))
         fi
         
-    done
+    done < "$SCRIPTS_TEMP_FILE"
+    
+    # Clean up temp file
+    rm -f "$SCRIPTS_TEMP_FILE"
     
     # Return to original directory
     cd "$original_directory" || true
