@@ -44,7 +44,7 @@ class RacksLab extends SyAPP.Func(){
                         this.Button(uid,{name : 'Connect',props :{connect : host.host}})
                         if(!host.unlocked){this.Button(uid,{name : 'Unlock',props : {unlock : host.host}})}
                         this.Button(uid,this.TextColor.red('Poweroff'))
-                        this.File(uid)
+                        this.File(uid,{name : host.host})
                     },{up_buttontext : (host.unlocked) ? ColorText.green(host.host) : ColorText.yellow(host.host),
                         down_buttontext :(host.unlocked) ? ColorText.green(host.host) : ColorText.yellow(host.host)
                     })
