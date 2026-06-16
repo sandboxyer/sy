@@ -5978,7 +5978,7 @@ class SyAPP {
     /** @type {Object} */
     this.serverConfig = {
       port: userConfig.port || 3000,
-      host: userConfig.host || 'localhost',
+      host: userConfig.host || '0.0.0.0',
       enableHTTP: userConfig.enableHTTP || false,
       httpConfig: userConfig.httpConfig || {},
       mainFuncName: userConfig.mainFuncName,
