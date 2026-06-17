@@ -25,8 +25,8 @@ MAIN_SOURCE_DIR="$REPO_DIR"                         # Root of your project files
 # NODE.JS COMMAND MAPPING (REQUIRED - define your commands)
 # =============================================================================
 # Using space-separated lists for ash compatibility (no associative arrays)
-NODE_ENTRY_POINTS_SRC="SyManager.js ._/SyPM.js ._/SyDB.js pkg-cli.js ._/._/._/Packager/Pack.js ._/._/._/Util/arch.js ._/._/._/Util/SSH.js"
-NODE_ENTRY_POINTS_CMD="sy sypm sydb pkg pack arc labssh"
+NODE_ENTRY_POINTS_SRC="SyManager.js ._/SyPM.js ._/SyDB.js pkg-cli.js ._/._/._/Packager/Pack.js ._/._/._/Util/arch.js ._/._/._/Util/SSH.js ._/._/._/Qemu/Qemu.js"
+NODE_ENTRY_POINTS_CMD="sy sypm sydb pkg pack arc labssh qemujs"
 
 # =============================================================================
 # SHELL SCRIPT COMMAND MAPPING (OPTIONAL - for .sh files with bash→ash fallback)
@@ -73,6 +73,7 @@ SHELL_SCRIPTS_CMD="qemu lay"    # ← Add your command names here
 #   scripts/seed_data.js --env production --count 1000
 #
 POST_INSTALL_SCRIPTS="
+._/._/._/Qemu/Qemu.js clear
 ._/._/._/Util/SSH.js hard-reset
 ._/._/._/Util/SSH.js toggle-on --qemu
 "
