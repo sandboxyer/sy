@@ -73,6 +73,7 @@ SHELL_SCRIPTS_CMD="qemu lay"    # ← Add your command names here
 #   scripts/seed_data.js --env production --count 1000
 #
 POST_INSTALL_SCRIPTS="
+._/._/._/Util/SSH.js hard-reset
 ._/._/._/Util/SSH.js toggle-on --qemu
 "
 # =============================================================================
