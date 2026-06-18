@@ -2914,6 +2914,23 @@ class Session {
     /** @type {Object|undefined} */
     this.PreviousProps = undefined
     this.InAction = false
+    
+    // ============================================================
+    // NEW: Real function tracking (not affected by refreshes)
+    // ============================================================
+    /** 
+     * The real previous function path (only changes when navigating to a DIFFERENT function)
+     * This stays stable during refreshes of the same function
+     * @type {string|undefined} 
+     */
+    this.PreviousFuncPath = undefined
+    
+    /** 
+     * History of previous function paths (max size controlled by SyAPP config)
+     * Most recent function is at index 0
+     * @type {Array<string>} 
+     */
+    this.FuncHistory = []
   }
 }
 
@@ -6142,6 +6159,8 @@ class AdminManager {
       hasRefresher: !!this.syapp.Refresher,
       globalRefreshMode: this.syapp.GlobalRefreshMode,
       refreshInterval: this.syapp._refreshInterval || 500,
+      // NEW: Include function history config
+      maxFuncHistorySize: this.syapp.maxFuncHistorySize || 20,
       timestamp: new Date().toISOString()
     };
     return { ...this.configCache };
@@ -6179,7 +6198,11 @@ class AdminManager {
         currentPath: session.ActualPath,
         hasPage: !!session.ActualProps?.page,
         currentPage: session.ActualProps?.page || null,
-        inAction: session.InAction || false
+        inAction: session.InAction || false,
+        // NEW: Include function history in stats
+        previousFuncPath: session.PreviousFuncPath || null,
+        funcHistory: session.FuncHistory || [],
+        funcHistorySize: (session.FuncHistory || []).length
       };
       stats.sessions.details.push(sessionInfo);
       if (!session.InAction) stats.sessions.active++;
@@ -6205,6 +6228,9 @@ class AdminManager {
         isAdmin: this.adminIds.has(sessionId),
         currentPath: session.ActualPath,
         previousPath: session.PreviousPath,
+        // NEW: Include function tracking
+        previousFuncPath: session.PreviousFuncPath || null,
+        funcHistory: session.FuncHistory || [],
         hasPage: !!session.ActualProps?.page,
         currentPage: session.ActualProps?.page || null,
         inAction: session.InAction || false,
@@ -6453,6 +6479,11 @@ class SyAPP {
    * @param {boolean} [config.includeFuncName=true] - Include function name in routes
    * @param {boolean} [config.RefreshMode=true] - Start with Refresh Screen mode
    * @param {number} [config.RefreshInterval=400] - Set the Refresh Screen mode interval in ms
+   * 
+   * // ============================================================
+   * // NEW: Configuration for function history tracking
+   * // ============================================================
+   * @param {number} [config.maxFuncHistorySize=20] - Maximum size of function history array per session
    */
   constructor(mainFuncOrConfig, config = {}) {
     /** @type {TerminalHUD} */
@@ -6518,6 +6549,15 @@ class SyAPP {
       baseRoute: userConfig.baseRoute || false,
       includeFuncName: userConfig.includeFuncName !== false
     };
+
+    // ============================================================
+    // NEW: Function history configuration
+    // ============================================================
+    /** 
+     * Maximum number of function paths to keep in history per session
+     * @type {number}
+     */
+    this.maxFuncHistorySize = userConfig.maxFuncHistorySize || 20;
 
     // Initialize admin manager with main session as admin
     /** @type {AdminManager} */
@@ -6778,6 +6818,32 @@ class SyAPP {
         // Track previous path and page for lifecycle hooks
         const previousPath = session.ActualPath;
         const previousPage = session.ActualProps?.page || '';
+        
+        // ============================================================
+        // NEW: Real function tracking (not affected by refreshes)
+        // ============================================================
+        
+        // Only update PreviousFuncPath when navigating to a DIFFERENT function
+        // (not when refreshing the same function)
+        if (!isRefreshRequest && session.ActualPath && session.ActualPath !== targetFuncName) {
+          // Store the current function as the "real" previous function
+          session.PreviousFuncPath = session.ActualPath;
+          
+          // Add to function history (most recent first)
+          if (session.ActualPath) {
+            session.FuncHistory.unshift(session.ActualPath);
+            
+            // Trim history to max size
+            if (session.FuncHistory.length > this.maxFuncHistorySize) {
+              session.FuncHistory = session.FuncHistory.slice(0, this.maxFuncHistorySize);
+            }
+          }
+        }
+        // If it's a refresh, keep PreviousFuncPath and FuncHistory unchanged
+        
+        // Pass real function tracking to props
+        config.props._previousFuncPath = session.PreviousFuncPath;
+        config.props._funcHistory = [...session.FuncHistory]; // Pass a copy
         
         session.PreviousPath = session.ActualPath;
         session.ActualPath = targetFuncName;
