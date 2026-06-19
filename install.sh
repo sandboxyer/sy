@@ -208,6 +208,11 @@ BUILD_SAVE_NAME=""                  # NEW: saved configuration to load
 BUILD_DIR="$REPO_DIR/build"
 BUILD_SAVE_FILE="$REPO_DIR/buildsaves.cfg"   # NEW: persistent build configurations
 
+# NEW: List for files/directories manually included from actual filesystem (gitignored files)
+BUILD_INCLUDE_LIST="/tmp/build_include_$$.txt"
+# CRITICAL FIX: Track the original PID-based filename to prevent it from being lost
+BUILD_INCLUDE_LIST_NAME="build_include_$$.txt"
+
 # External dependencies (uncomment and configure if needed)
 # PM2_TAR_GZ="$ARCHIVE_DIR/pm2.tar.gz"              # Uncomment if using pm2
 # PM2_EXTRACT_DIR="$INSTALL_DIR/vendor/pm2"         # Uncomment if using pm2
@@ -243,8 +248,10 @@ save_build_configuration() {
     # Count current exclusions
     excl_file_count=0
     excl_dir_count=0
+    incl_file_count=0
     [ -f "$EXCLUDE_LIST" ] && excl_file_count=$(wc -l < "$EXCLUDE_LIST" 2>/dev/null || echo 0)
     [ -f "$EXCLUDE_DIRS_LIST" ] && excl_dir_count=$(wc -l < "$EXCLUDE_DIRS_LIST" 2>/dev/null || echo 0)
+    [ -f "$BUILD_INCLUDE_LIST" ] && incl_file_count=$(wc -l < "$BUILD_INCLUDE_LIST" 2>/dev/null || echo 0)
    
     # Write new save section
     {
@@ -255,6 +262,7 @@ save_build_configuration() {
         echo "COMMIT_MESSAGE=${BUILD_SELECTED_COMMIT_MSG:-HEAD}"
         echo "EXCLUDED_FILES_COUNT=${excl_file_count}"
         echo "EXCLUDED_DIRECTORIES_COUNT=${excl_dir_count}"
+        echo "INCLUDED_FILES_COUNT=${incl_file_count}"
        
         if [ -f "$EXCLUDE_LIST" ] && [ -s "$EXCLUDE_LIST" ]; then
             while IFS= read -r f; do
@@ -266,6 +274,12 @@ save_build_configuration() {
             while IFS= read -r d; do
                 [ -n "$d" ] && echo "EXCLUDED_DIRECTORY=${d}"
             done < "$EXCLUDE_DIRS_LIST"
+        fi
+        
+        if [ -f "$BUILD_INCLUDE_LIST" ] && [ -s "$BUILD_INCLUDE_LIST" ]; then
+            while IFS= read -r f; do
+                [ -n "$f" ] && echo "INCLUDED_FILE=${f}"
+            done < "$BUILD_INCLUDE_LIST"
         fi
        
         echo "[/SAVE:${save_name}]"
@@ -289,9 +303,15 @@ load_build_configuration() {
         return 1
     fi
    
-    # Clear current exclusions
-    > "$EXCLUDE_LIST"
-    > "$EXCLUDE_DIRS_LIST"
+    # CRITICAL FIX: Create fresh temporary files with unique names for this load operation
+    # This prevents conflicts when loading saved configs
+    local_load_exclude="/tmp/build_load_exclude_${save_name}_$$.txt"
+    local_load_exclude_dirs="/tmp/build_load_exclude_dirs_${save_name}_$$.txt"
+    local_load_include="/tmp/build_load_include_${save_name}_$$.txt"
+    
+    > "$local_load_exclude"
+    > "$local_load_exclude_dirs"
+    > "$local_load_include"
    
     # Extract save section
     in_section=false
@@ -325,20 +345,46 @@ load_build_configuration() {
                     BUILD_SELECTED_COMMIT_MSG=$(echo "$line" | cut -d= -f2-)
                     ;;
                 EXCLUDED_FILE=*)
-                    echo "$line" | cut -d= -f2- >> "$EXCLUDE_LIST"
+                    echo "$line" | cut -d= -f2- >> "$local_load_exclude"
                     ;;
                 EXCLUDED_DIRECTORY=*)
-                    echo "$line" | cut -d= -f2- >> "$EXCLUDE_DIRS_LIST"
+                    echo "$line" | cut -d= -f2- >> "$local_load_exclude_dirs"
+                    ;;
+                INCLUDED_FILE=*)
+                    echo "$line" | cut -d= -f2- >> "$local_load_include"
                     ;;
             esac
         fi
     done < "$BUILD_SAVE_FILE"
    
+    # CRITICAL FIX: Explicitly copy the loaded files to the standard temp locations
+    # This ensures do_build() can find them regardless of variable name changes
+    cp "$local_load_exclude" "$EXCLUDE_LIST" 2>/dev/null || true
+    cp "$local_load_exclude_dirs" "$EXCLUDE_DIRS_LIST" 2>/dev/null || true
+    cp "$local_load_include" "$BUILD_INCLUDE_LIST" 2>/dev/null || true
+    
+    # CRITICAL FIX: Also store a persistent copy that won't be affected by PID changes
+    # Store in a location based on save name to ensure it survives
+    SAVED_INCLUDE_LIST="/tmp/build_include_saved_${save_name}.txt"
+    cp "$local_load_include" "$SAVED_INCLUDE_LIST" 2>/dev/null || true
+    export SAVED_INCLUDE_LIST
+    
+    # Clean up temporary load files
+    rm -f "$local_load_exclude" "$local_load_exclude_dirs" "$local_load_include"
+    
+    # CRITICAL FIX: Export everything explicitly
     export BUILD_SELECTED_COMMIT
     export BUILD_SELECTED_COMMIT_MSG
     export BUILD_EXCLUDE_DIRS_LIST="$EXCLUDE_DIRS_LIST"
-   
+    export BUILD_INCLUDE_LIST
+    export EXCLUDE_LIST
+    export EXCLUDE_DIRS_LIST
+    
     echo "Loaded build configuration: $save_name"
+    echo "  Output format: $([ "$BUILD_TAR" = true ] && echo "Tar.gz Archive" || echo "Directory")"
+    echo "  Excluded files: $(wc -l < "$EXCLUDE_LIST" 2>/dev/null || echo 0)"
+    echo "  Excluded directories: $(wc -l < "$EXCLUDE_DIRS_LIST" 2>/dev/null || echo 0)"
+    echo "  Included from filesystem: $(wc -l < "$BUILD_INCLUDE_LIST" 2>/dev/null || echo 0)"
     return 0
 }
 
@@ -351,8 +397,7 @@ list_saved_configurations() {
             \[SAVE:*)
                 name=$(echo "$line" | sed 's/^\[SAVE://;s/\]$//')
                 count=$((count + 1))
-                printf "  %2s. %s
-" "$count" "$name"
+                printf "  %2s. %s\n" "$count" "$name"
                 ;;
         esac
     done < "$BUILD_SAVE_FILE"
@@ -526,6 +571,232 @@ calculate_build_stats() {
     echo "$total_size|$total_files"
 }
 
+# =============================================================================
+# NEW FUNCTION: Navigate filesystem to find files/directories to include
+# This allows adding files that exist on disk but may be in .gitignore
+# Shows hidden files and directories (starting with .) using both * and .* globs
+# =============================================================================
+navigate_filesystem_for_inclusion() {
+    echo ""
+    echo "=== Navigate Filesystem to Include Files/Directories ==="
+    echo "This allows you to add files that exist on disk but may be in .gitignore"
+    echo "Hidden files and directories (starting with .) are shown"
+    echo ""
+    
+    current_dir="$REPO_DIR"
+    
+    while true; do
+        clear
+        echo "=== File System Navigation for Inclusion ==="
+        echo "Current directory: $current_dir"
+        echo ""
+        
+        # Warn if outside repo
+        case "$current_dir" in
+            "${REPO_DIR}"*) ;;
+            *)
+                echo "Warning: You are outside the repository root!"
+                echo "Repository root: $REPO_DIR"
+                echo "Current: $current_dir"
+                echo ""
+                ;;
+        esac
+        
+        # Collect items in current directory
+        NAV_ITEMS="/tmp/build_nav_items_$$.txt"
+        > "$NAV_ITEMS"
+        
+        item_num=1
+        
+        # Add parent directory option (if not at root)
+        if [ "$current_dir" != "/" ]; then
+            echo "  0. [..] Go to parent directory"
+            echo ""
+        fi
+        
+        # List directories first (both regular and hidden)
+        # Use for loop with both * and .* patterns, but exclude . and ..
+        for item in "$current_dir"/* "$current_dir"/.*; do
+            [ ! -e "$item" ] && continue
+            base=$(basename "$item")
+            
+            # Skip . and ..
+            [ "$base" = "." ] && continue
+            [ "$base" = ".." ] && continue
+            
+            # Skip .git directory
+            [ "$base" = ".git" ] && continue
+            
+            if [ -d "$item" ]; then
+                # Count files inside for info (including hidden files)
+                file_count=$(find "$item" -type f 2>/dev/null | wc -l)
+                dir_size=$(du -sh "$item" 2>/dev/null | awk '{print $1}')
+                printf "  %2s. [DIR]  %-8s %s/ (%s files)\n" "$item_num" "$dir_size" "$base" "$file_count"
+                echo "${item_num}|DIR|${item}" >> "$NAV_ITEMS"
+                item_num=$((item_num + 1))
+            fi
+        done
+        
+        # List files (both regular and hidden)
+        for item in "$current_dir"/* "$current_dir"/.*; do
+            [ ! -e "$item" ] && continue
+            base=$(basename "$item")
+            
+            # Skip . and ..
+            [ "$base" = "." ] && continue
+            [ "$base" = ".." ] && continue
+            
+            # Skip .git directory
+            [ "$base" = ".git" ] && continue
+            
+            if [ -f "$item" ]; then
+                file_size=$(wc -c < "$item" 2>/dev/null || echo 0)
+                size_display=$(format_file_size "$file_size")
+                
+                # Check if this file is in gitignore
+                is_gitignored=""
+                relative_to_repo="${item#$REPO_DIR/}"
+                if [ "$relative_to_repo" = "$item" ]; then
+                    is_gitignored="[OUTSIDE REPO]"
+                elif command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
+                    if git check-ignore -q "$relative_to_repo" 2>/dev/null; then
+                        is_gitignored="[GITIGNORED]"
+                    fi
+                fi
+                
+                # Check if already in include list
+                already_included=""
+                if [ -f "$BUILD_INCLUDE_LIST" ] && grep -q "^${relative_to_repo}$" "$BUILD_INCLUDE_LIST" 2>/dev/null; then
+                    already_included="[ALREADY INCLUDED]"
+                fi
+                
+                printf "  %2s. [FILE] %8s %s %s %s\n" "$item_num" "$size_display" "$base" "$is_gitignored" "$already_included"
+                echo "${item_num}|FILE|${item}" >> "$NAV_ITEMS"
+                item_num=$((item_num + 1))
+            fi
+        done
+        
+        echo ""
+        echo "Current included files:"
+        if [ -f "$BUILD_INCLUDE_LIST" ] && [ -s "$BUILD_INCLUDE_LIST" ]; then
+            include_count=0
+            while IFS= read -r included_file; do
+                include_count=$((include_count + 1))
+                if [ $include_count -le 5 ]; then
+                    echo "  $included_file"
+                fi
+            done < "$BUILD_INCLUDE_LIST"
+            total_included=$(wc -l < "$BUILD_INCLUDE_LIST" 2>/dev/null || echo 0)
+            [ "$total_included" -gt 5 ] && echo "  ... and $((total_included - 5)) more files"
+        else
+            echo "  (none)"
+        fi
+        
+        echo ""
+        echo "Commands:"
+        echo "  <number> = Enter directory or add file to include list"
+        echo "  r <number> = Remove file from include list"
+        echo "  c = Clear all included files"
+        echo "  g = Go to specific path"
+        echo "  b = Back to main menu"
+        printf "Choice: "
+        read navigation_command
+        
+        case "$navigation_command" in
+            b|B)
+                rm -f "$NAV_ITEMS"
+                break
+                ;;
+            c|C)
+                if [ -f "$BUILD_INCLUDE_LIST" ]; then
+                    > "$BUILD_INCLUDE_LIST"
+                    echo "All included files cleared."
+                    sleep 1
+                fi
+                ;;
+            g|G)
+                printf "Enter path (relative or absolute): "
+                read custom_path
+                if [ -n "$custom_path" ]; then
+                    # Handle relative path
+                    case "$custom_path" in
+                        /*) ;;
+                        *) custom_path="$current_dir/$custom_path" ;;
+                    esac
+                    if [ -d "$custom_path" ]; then
+                        current_dir="$custom_path"
+                    else
+                        echo "Directory not found: $custom_path"
+                        sleep 1
+                    fi
+                fi
+                ;;
+            r*)
+                remove_number=$(echo "$navigation_command" | sed 's/^r//' | sed 's/^[[:space:]]*//')
+                if [ -n "$remove_number" ] && [ "$remove_number" -gt 0 ] 2>/dev/null; then
+                    if [ -f "$BUILD_INCLUDE_LIST" ] && [ -s "$BUILD_INCLUDE_LIST" ]; then
+                        line_to_remove=$(sed -n "${remove_number}p" "$BUILD_INCLUDE_LIST" 2>/dev/null)
+                        if [ -n "$line_to_remove" ]; then
+                            grep -v "^${line_to_remove}$" "$BUILD_INCLUDE_LIST" > "${BUILD_INCLUDE_LIST}.tmp"
+                            mv "${BUILD_INCLUDE_LIST}.tmp" "$BUILD_INCLUDE_LIST"
+                            echo "Removed from include list: $line_to_remove"
+                            sleep 1
+                        fi
+                    else
+                        echo "No files in include list."
+                        sleep 1
+                    fi
+                fi
+                ;;
+            *)
+                if echo "$navigation_command" | grep -q '^[0-9]\+$'; then
+                    if [ "$navigation_command" = "0" ] && [ "$current_dir" != "/" ]; then
+                        # Go to parent directory
+                        current_dir=$(dirname "$current_dir")
+                    else
+                        # Find the selected item
+                        selected_line=$(grep "^${navigation_command}|" "$NAV_ITEMS" 2>/dev/null)
+                        if [ -n "$selected_line" ]; then
+                            item_type=$(echo "$selected_line" | cut -d'|' -f2)
+                            item_path=$(echo "$selected_line" | cut -d'|' -f3)
+                            
+                            if [ "$item_type" = "DIR" ]; then
+                                # Navigate into directory
+                                current_dir="$item_path"
+                            elif [ "$item_type" = "FILE" ]; then
+                                # Add file to include list
+                                relative_to_repo="${item_path#$REPO_DIR/}"
+                                if [ "$relative_to_repo" = "$item_path" ]; then
+                                    echo "Warning: File is outside repository root. Using absolute path."
+                                    relative_to_repo="$item_path"
+                                fi
+                                
+                                # Check if already in list
+                                if [ -f "$BUILD_INCLUDE_LIST" ] && grep -q "^${relative_to_repo}$" "$BUILD_INCLUDE_LIST" 2>/dev/null; then
+                                    echo "File already in include list: $relative_to_repo"
+                                else
+                                    echo "$relative_to_repo" >> "$BUILD_INCLUDE_LIST"
+                                    echo "Added to include list: $relative_to_repo"
+                                    
+                                    # Show gitignore status
+                                    if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
+                                        if git check-ignore -q "$relative_to_repo" 2>/dev/null; then
+                                            echo "  Note: This file IS in .gitignore (will be force-included)"
+                                        else
+                                            echo "  Note: This file is tracked by git"
+                                        fi
+                                    fi
+                                fi
+                                sleep 1
+                            fi
+                        fi
+                    fi
+                fi
+                ;;
+        esac
+    done
+}
+
 # Interactive configuration interface - compact, full-featured
 build_config_interface() {
     echo ""
@@ -534,6 +805,7 @@ build_config_interface() {
     echo "========================================="
     echo ""
     echo "Select files and directories to EXCLUDE from the build"
+    echo "or INCLUDE files from filesystem (including .gitignore'd files)"
     echo ""
     
     if ! command -v git >/dev/null 2>&1 || ! git rev-parse --git-dir >/dev/null 2>&1; then
@@ -545,6 +817,7 @@ build_config_interface() {
     EXCLUDE_DIRS_LIST="/tmp/build_exclude_dirs_$$.txt"
     > "$EXCLUDE_LIST"
     > "$EXCLUDE_DIRS_LIST"
+    > "$BUILD_INCLUDE_LIST"
     
     BUILD_FILES_LIST="/tmp/build_files_$$.txt"
     BUILD_DIRS_LIST="/tmp/build_dirs_$$.txt"
@@ -574,11 +847,9 @@ build_config_interface() {
                 fi
                 case "$1" in
                     *.js|*.sh|*.py|*.rb|*.php|*.ts|*.jsx|*.tsx|*.css|*.html|*.json|*.xml|*.yml|*.yaml|*.md|*.txt|*.conf|*.cfg|*.ini)
-                        printf "%s|%s|C
-" "$size" "$1" ;;
+                        printf "%s|%s|C\n" "$size" "$1" ;;
                     *)
-                        printf "%s|%s|D
-" "$size" "$1" ;;
+                        printf "%s|%s|D\n" "$size" "$1" ;;
                 esac
             ' _ {} 2>/dev/null | sort -t'|' -k1 -n -r > "$BUILD_FILES_LIST"
             
@@ -721,6 +992,7 @@ build_config_interface() {
         build_file_count=$(echo "$stats" | cut -d'|' -f2)
         excl_files=$(wc -l < "$EXCLUDE_LIST" 2>/dev/null || echo 0)
         excl_dirs=$(wc -l < "$EXCLUDE_DIRS_LIST" 2>/dev/null || echo 0)
+        incl_files=$(wc -l < "$BUILD_INCLUDE_LIST" 2>/dev/null || echo 0)
         
         echo "=== BUILD CONFIGURATION ==="
         if [ -z "$SELECTED_COMMIT" ]; then
@@ -738,7 +1010,7 @@ build_config_interface() {
         fi
         
         size_display=$(format_file_size "$build_size")
-        echo "Output: ${out_display} | Size: ${size_display} | Files: ${build_file_count} | Excl: ${excl_files}f/${excl_dirs}d"
+        echo "Output: ${out_display} | Size: ${size_display} | Files: ${build_file_count} | Excl: ${excl_files}f/${excl_dirs}d | InclFS: ${incl_files}"
         
         if [ -s "$EXCLUDE_DIRS_LIST" ] || [ -s "$EXCLUDE_LIST" ]; then
             echo "Excluded:"
@@ -770,6 +1042,18 @@ build_config_interface() {
             echo "No files or directories excluded"
         fi
         
+        if [ -s "$BUILD_INCLUDE_LIST" ]; then
+            echo "Included from filesystem:"
+            count=0
+            while IFS= read -r file; do
+                count=$((count + 1))
+                if [ $count -le 3 ]; then
+                    echo "  + ${file}"
+                fi
+            done < "$BUILD_INCLUDE_LIST"
+            [ "$incl_files" -gt 3 ] && echo "  ... and $((incl_files - 3)) more files"
+        fi
+        
         echo "---"
         echo "Actions:"
         echo "1. Exclude directories"
@@ -780,9 +1064,10 @@ build_config_interface() {
         echo "6. Clear all exclusions"
         echo "7. Change source commit"
         echo "8. Toggle output format (${out_display})"
+        echo "9. Navigate filesystem to INCLUDE files"
         echo "---"
         echo "s. Save config | l. Load config | d. Delete config"
-        echo "9. Done | 0. Quit"
+        echo "0. Done | q. Quit"
         printf "Choice: "
         read action
         
@@ -973,8 +1258,7 @@ build_config_interface() {
                         [ "$line_num" -gt "$end_line" ] && break
                         [ -z "$filename" ] && continue
                         size_display=$(format_file_size "$size_bytes")
-                        printf "  %2s. %8s  %s
-" "$counter" "$size_display" "$filename"
+                        printf "  %2s. %8s  %s\n" "$counter" "$size_display" "$filename"
                         counter=$((counter + 1))
                     done < "$AVAILABLE_LIST"
                     echo ""; echo "n=next p=previous b=back"
@@ -1025,8 +1309,7 @@ build_config_interface() {
                         counter=1
                         while IFS='|' read -r size_bytes filename; do
                             size_display=$(format_file_size "$size_bytes")
-                            printf "  %2s. %8s  %s
-" "$counter" "$size_display" "$filename"
+                            printf "  %2s. %8s  %s\n" "$counter" "$size_display" "$filename"
                             counter=$((counter + 1))
                         done < "$SEARCH_RESULTS"
                         echo ""; echo "Enter number to exclude | a=exclude all | b=back"
@@ -1063,8 +1346,7 @@ build_config_interface() {
                     counter=1
                     > "/tmp/build_remove_$$.txt"
                     while IFS= read -r file; do
-                        printf "  %2s. %s
-" "$counter" "$file"
+                        printf "  %2s. %s\n" "$counter" "$file"
                         echo "${counter}|${file}" >> "/tmp/build_remove_$$.txt"
                         counter=$((counter + 1))
                     done < "$EXCLUDE_LIST"
@@ -1095,8 +1377,7 @@ build_config_interface() {
                     counter=1
                     > "/tmp/build_remove_dirs_$$.txt"
                     while IFS= read -r dir; do
-                        printf "  %2s. %s
-" "$counter" "$dir"
+                        printf "  %2s. %s\n" "$counter" "$dir"
                         echo "${counter}|${dir}" >> "/tmp/build_remove_dirs_$$.txt"
                         counter=$((counter + 1))
                     done < "$EXCLUDE_DIRS_LIST"
@@ -1127,7 +1408,8 @@ build_config_interface() {
             6)
                 > "$EXCLUDE_LIST"
                 > "$EXCLUDE_DIRS_LIST"
-                echo ""; echo "  All exclusions cleared!"; sleep 1
+                > "$BUILD_INCLUDE_LIST"
+                echo ""; echo "  All exclusions and inclusions cleared!"; sleep 1
                 ;;
             7)
                 # Change source commit (with month and version filters)
@@ -1194,8 +1476,7 @@ build_config_interface() {
                         short_hash=$(echo "$hash" | cut -c1-7)
                         shortened_msg=$(echo "$msg" | cut -c1-30)
                         marker=""; [ -n "$SELECTED_COMMIT" ] && [ "$hash" = "$SELECTED_COMMIT" ] && marker=" << SELECTED"
-                        printf "  %2s. %8s %s %s %s%s
-" "$counter" "$size_display" "$short_hash" "$date" "$shortened_msg" "$marker"
+                        printf "  %2s. %8s %s %s %s%s\n" "$counter" "$size_display" "$short_hash" "$date" "$shortened_msg" "$marker"
                         echo "${counter}|${hash}|${msg}" >> "/tmp/build_commit_map_$$.txt"
                         counter=$((counter+1))
                     done < "$FILTERED_COMMITS"
@@ -1219,8 +1500,7 @@ build_config_interface() {
                                     [ "$month_counter" -lt "$month_start" ] && month_counter=$((month_counter+1)) && continue
                                     [ "$month_counter" -gt "$month_end" ] && break
                                     marker=""; [ "$ym" = "$date_filter" ] && marker=" << SELECTED"
-                                    printf "  %2s. %s %s (%s commits)%s
-" "$month_counter" "$month_name" "$year" "$commit_count" "$marker"
+                                    printf "  %2s. %s %s (%s commits)%s\n" "$month_counter" "$month_name" "$year" "$commit_count" "$marker"
                                     month_counter=$((month_counter+1))
                                 done < "$MONTH_CACHE"
                                 echo ""; echo "n=next p=previous c=clear b=back"
@@ -1270,6 +1550,10 @@ build_config_interface() {
                 fi
                 sleep 1
                 ;;
+            9)
+                # NEW: Navigate filesystem to include files
+                navigate_filesystem_for_inclusion
+                ;;
             s|S)
                 clear; echo "=== Save Build Configuration ==="
                 list_saved_configurations || echo "No saved configurations yet."
@@ -1286,8 +1570,7 @@ build_config_interface() {
                 while IFS= read -r line; do
                     case "$line" in
                         \[SAVE:*) name=$(echo "$line" | sed 's/^\[SAVE://;s/\]$//')
-                            printf "  %2s. %s
-" "$save_number" "$name"
+                            printf "  %2s. %s\n" "$save_number" "$name"
                             echo "${save_number}|${name}" >> "$SAVE_COUNT_FILE"
                             save_number=$((save_number+1)) ;;
                     esac
@@ -1330,8 +1613,7 @@ build_config_interface() {
                 while IFS= read -r line; do
                     case "$line" in
                         \[SAVE:*) name=$(echo "$line" | sed 's/^\[SAVE://;s/\]$//')
-                            printf "  %2s. %s
-" "$save_number" "$name"
+                            printf "  %2s. %s\n" "$save_number" "$name"
                             echo "${save_number}|${name}" >> "$SAVE_COUNT_FILE"
                             save_number=$((save_number+1)) ;;
                     esac
@@ -1358,29 +1640,35 @@ build_config_interface() {
                 fi
                 rm -f "$SAVE_COUNT_FILE"
                 ;;
-            9) break ;;
-            0)
-                rm -f "$EXCLUDE_LIST" "$EXCLUDE_DIRS_LIST" "$BUILD_FILES_LIST" "$BUILD_DIRS_LIST" "$COMMIT_CACHE" "$MONTH_CACHE"
+            0) break ;;
+            q|Q)
+                rm -f "$EXCLUDE_LIST" "$EXCLUDE_DIRS_LIST" "$BUILD_INCLUDE_LIST" "$BUILD_FILES_LIST" "$BUILD_DIRS_LIST" "$COMMIT_CACHE" "$MONTH_CACHE"
                 echo ""; echo "  Build cancelled."; exit 0
                 ;;
             *) echo ""; echo "  Invalid choice. Press Enter..."; read dummy ;;
         esac
     done
     
+    # CRITICAL FIX: Export all configuration variables explicitly
     export BUILD_SELECTED_COMMIT="$SELECTED_COMMIT"
     export BUILD_SELECTED_COMMIT_MSG="$SELECTED_COMMIT_MSG"
     export BUILD_EXCLUDE_DIRS_LIST="$EXCLUDE_DIRS_LIST"
+    export BUILD_INCLUDE_LIST
+    export EXCLUDE_LIST
+    export EXCLUDE_DIRS_LIST
     
     clear
     stats=$(calculate_build_stats)
     build_size=$(echo "$stats" | cut -d'|' -f1)
     build_file_count=$(echo "$stats" | cut -d'|' -f2)
+    incl_files=$(wc -l < "$BUILD_INCLUDE_LIST" 2>/dev/null || echo 0)
     echo "=== FINAL BUILD SUMMARY ==="
     if [ -z "$SELECTED_COMMIT" ]; then echo "Source: HEAD (current working tree)"
     else echo "Source: $(echo "$SELECTED_COMMIT_MSG" | cut -c1-30)"; fi
     echo "Output: $([ "$BUILD_TAR" = true ] && echo "Tar.gz Archive" || echo "Directory")"
     echo "Size: $(format_file_size "$build_size") | Files: $build_file_count"
     echo "Excluded: $(wc -l < "$EXCLUDE_LIST" 2>/dev/null || echo 0) files, $(wc -l < "$EXCLUDE_DIRS_LIST" 2>/dev/null || echo 0) directories"
+    echo "Included from filesystem: $incl_files files"
     if [ -s "$EXCLUDE_DIRS_LIST" ]; then
         echo "Excluded directories:"; disp_count=0
         while IFS= read -r dir; do
@@ -1398,7 +1686,7 @@ build_config_interface() {
     return 0
 }
 
-# Main build function (full version)
+# Main build function - CRITICAL FIX: Properly handles filesystem inclusions from saved configs
 do_build() {
     log_message "Starting build process..."
     
@@ -1492,43 +1780,188 @@ do_build() {
     
     log_message "Build name: $build_name"
     log_message "Build path: $build_path"
+    log_message "Output format: $([ "$BUILD_TAR" = true ] && echo "Tar.gz Archive" || echo "Directory")"
     
     temp_build="/tmp/build_$$"
     rm -rf "$temp_build"; mkdir -p "$temp_build"
     
-    has_exclusions=false
-    [ -f "$EXCLUDE_LIST" ] && [ -s "$EXCLUDE_LIST" ] && has_exclusions=true
-    [ -n "$BUILD_EXCLUDE_DIRS_LIST" ] && [ -f "$BUILD_EXCLUDE_DIRS_LIST" ] && [ -s "$BUILD_EXCLUDE_DIRS_LIST" ] && has_exclusions=true
+    # =========================================================================
+    # CRITICAL FIX: Determine the correct include list to use
+    # =========================================================================
+    # The include list can come from multiple sources:
+    # 1. BUILD_INCLUDE_LIST variable (set by build_config_interface or load_build_configuration)
+    # 2. SAVED_INCLUDE_LIST variable (persistent copy created by load_build_configuration)
+    # 3. Standard temp file pattern: /tmp/build_include_$$.txt
+    #
+    # We need to find the actual file that has the inclusions
+    # =========================================================================
     
-    if [ "$has_exclusions" = true ]; then
-        git archive "$BUILD_COMMIT" | (cd "$temp_build" && tar xf -)
-        if [ $? -ne 0 ]; then
-            echo "Error: Failed to extract files from git"; rm -rf "$temp_build"; exit 1
-        fi
-        if [ -n "$BUILD_EXCLUDE_DIRS_LIST" ] && [ -f "$BUILD_EXCLUDE_DIRS_LIST" ] && [ -s "$BUILD_EXCLUDE_DIRS_LIST" ]; then
-            while IFS= read -r excluded_dir; do
-                [ -e "$temp_build/$excluded_dir" ] && rm -rf "$temp_build/$excluded_dir"
-            done < "$BUILD_EXCLUDE_DIRS_LIST"
-        fi
-        if [ -f "$EXCLUDE_LIST" ] && [ -s "$EXCLUDE_LIST" ]; then
-            while IFS= read -r excluded_file; do
-                [ -e "$temp_build/$excluded_file" ] && rm -rf "$temp_build/$excluded_file"
-            done < "$EXCLUDE_LIST"
-        fi
-        find "$temp_build" -type d -empty -delete 2>/dev/null
-    else
-        git archive "$BUILD_COMMIT" | (cd "$temp_build" && tar xf -)
-        [ $? -ne 0 ] && echo "Error: Failed to extract files" && rm -rf "$temp_build" && exit 1
+    ACTUAL_INCLUDE_LIST=""
+    
+    # Check if BUILD_INCLUDE_LIST points to an existing file with content
+    if [ -n "$BUILD_INCLUDE_LIST" ] && [ -f "$BUILD_INCLUDE_LIST" ] && [ -s "$BUILD_INCLUDE_LIST" ]; then
+        ACTUAL_INCLUDE_LIST="$BUILD_INCLUDE_LIST"
+        log_message "Found include list from BUILD_INCLUDE_LIST: $BUILD_INCLUDE_LIST ($(wc -l < "$BUILD_INCLUDE_LIST") files)"
     fi
     
-    file_count=$(find "$temp_build" -type f | wc -l)
-    rm -f "$EXCLUDE_LIST" "$EXCLUDE_DIRS_LIST" "$BUILD_FILES_LIST" "$BUILD_DIRS_LIST" "$BUILD_EXCLUDE_DIRS_LIST"
+    # If not found, check SAVED_INCLUDE_LIST (persistent copy from load)
+    if [ -z "$ACTUAL_INCLUDE_LIST" ] && [ -n "$SAVED_INCLUDE_LIST" ] && [ -f "$SAVED_INCLUDE_LIST" ] && [ -s "$SAVED_INCLUDE_LIST" ]; then
+        ACTUAL_INCLUDE_LIST="$SAVED_INCLUDE_LIST"
+        log_message "Found include list from SAVED_INCLUDE_LIST: $SAVED_INCLUDE_LIST ($(wc -l < "$SAVED_INCLUDE_LIST") files)"
+    fi
     
-       if [ "$BUILD_TAR" = true ]; then
+    # If still not found, look for any build_include_*.txt files that might have been created
+    if [ -z "$ACTUAL_INCLUDE_LIST" ]; then
+        for possible_file in /tmp/build_include_*.txt; do
+            if [ -f "$possible_file" ] && [ -s "$possible_file" ]; then
+                # Skip the template file itself if it exists empty
+                [ "$possible_file" = "/tmp/build_include_$$.txt" ] && [ ! -s "$possible_file" ] && continue
+                ACTUAL_INCLUDE_LIST="$possible_file"
+                log_message "Found include list by pattern matching: $possible_file ($(wc -l < "$possible_file") files)"
+                break
+            fi
+        done
+    fi
+    
+    # =========================================================================
+    # Also determine exclusion lists
+    # =========================================================================
+    
+    ACTUAL_EXCLUDE_LIST=""
+    ACTUAL_EXCLUDE_DIRS_LIST=""
+    
+    if [ -n "$EXCLUDE_LIST" ] && [ -f "$EXCLUDE_LIST" ] && [ -s "$EXCLUDE_LIST" ]; then
+        ACTUAL_EXCLUDE_LIST="$EXCLUDE_LIST"
+        log_message "Found exclude list: $EXCLUDE_LIST ($(wc -l < "$EXCLUDE_LIST") files)"
+    fi
+    
+    if [ -n "$BUILD_EXCLUDE_DIRS_LIST" ] && [ -f "$BUILD_EXCLUDE_DIRS_LIST" ] && [ -s "$BUILD_EXCLUDE_DIRS_LIST" ]; then
+        ACTUAL_EXCLUDE_DIRS_LIST="$BUILD_EXCLUDE_DIRS_LIST"
+        log_message "Found exclude dirs list: $BUILD_EXCLUDE_DIRS_LIST ($(wc -l < "$BUILD_EXCLUDE_DIRS_LIST") directories)"
+    elif [ -n "$EXCLUDE_DIRS_LIST" ] && [ -f "$EXCLUDE_DIRS_LIST" ] && [ -s "$EXCLUDE_DIRS_LIST" ]; then
+        ACTUAL_EXCLUDE_DIRS_LIST="$EXCLUDE_DIRS_LIST"
+        log_message "Found exclude dirs list: $EXCLUDE_DIRS_LIST ($(wc -l < "$EXCLUDE_DIRS_LIST") directories)"
+    fi
+    
+    # =========================================================================
+    # STEP 1: Extract files from git
+    # =========================================================================
+    
+    git archive "$BUILD_COMMIT" | (cd "$temp_build" && tar xf -)
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to extract files from git"; rm -rf "$temp_build"; exit 1
+    fi
+    
+    log_message "Extracted git archive to temporary build directory"
+    
+    # =========================================================================
+    # STEP 2: Apply exclusions (remove unwanted files/directories)
+    # =========================================================================
+    
+    if [ -n "$ACTUAL_EXCLUDE_DIRS_LIST" ]; then
+        while IFS= read -r excluded_dir; do
+            [ -z "$excluded_dir" ] && continue
+            if [ -e "$temp_build/$excluded_dir" ]; then
+                rm -rf "$temp_build/$excluded_dir"
+                log_message "Excluded directory: $excluded_dir"
+            fi
+        done < "$ACTUAL_EXCLUDE_DIRS_LIST"
+    fi
+    
+    if [ -n "$ACTUAL_EXCLUDE_LIST" ]; then
+        while IFS= read -r excluded_file; do
+            [ -z "$excluded_file" ] && continue
+            if [ -e "$temp_build/$excluded_file" ]; then
+                rm -rf "$temp_build/$excluded_file"
+                log_message "Excluded file: $excluded_file"
+            fi
+        done < "$ACTUAL_EXCLUDE_LIST"
+    fi
+    
+    # =========================================================================
+    # STEP 3: Apply inclusions (copy gitignored files from filesystem)
+    # THIS IS THE CRITICAL FIX - was missing/not working for saved configs
+    # =========================================================================
+    
+    if [ -n "$ACTUAL_INCLUDE_LIST" ]; then
+        log_message "========================================="
+        log_message "Applying filesystem inclusions..."
+        log_message "Include list: $ACTUAL_INCLUDE_LIST"
+        log_message "Files to include: $(wc -l < "$ACTUAL_INCLUDE_LIST")"
+        log_message "========================================="
+        
+        while IFS= read -r included_file; do
+            [ -z "$included_file" ] && continue
+            
+            # Remove any leading/trailing whitespace
+            included_file=$(echo "$included_file" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            [ -z "$included_file" ] && continue
+            
+            source_path="$REPO_DIR/$included_file"
+            dest_path="$temp_build/$included_file"
+            
+            if [ -f "$source_path" ]; then
+                # Create parent directory if needed
+                mkdir -p "$(dirname "$dest_path")"
+                # Copy file preserving permissions and timestamps
+                cp -p "$source_path" "$dest_path"
+                log_message "  ✓ Included file from filesystem: $included_file"
+            elif [ -d "$source_path" ]; then
+                # Create directory and copy contents
+                mkdir -p "$dest_path"
+                # Copy visible files
+                cp -rp "$source_path"/* "$dest_path"/ 2>/dev/null || true
+                # Copy hidden files
+                cp -rp "$source_path"/.[!.]* "$dest_path"/ 2>/dev/null || true
+                log_message "  ✓ Included directory from filesystem: $included_file"
+            else
+                log_message "  ⚠ Warning: Included path not found on filesystem: $included_file (source: $source_path)"
+            fi
+        done < "$ACTUAL_INCLUDE_LIST"
+        
+        log_message "========================================="
+        log_message "Filesystem inclusion complete"
+        log_message "========================================="
+    else
+        log_message "No filesystem inclusions specified (no include list found)"
+    fi
+    
+    # =========================================================================
+    # STEP 4: Clean up empty directories and finalize
+    # =========================================================================
+    
+    find "$temp_build" -type d -empty -delete 2>/dev/null
+    
+    file_count=$(find "$temp_build" -type f | wc -l)
+    
+    # Clean up temp files (but keep the include list if it's from a saved config)
+    # Only clean up exclusion lists that are PID-specific
+    for cleanup_file in "$EXCLUDE_LIST" "$EXCLUDE_DIRS_LIST" "$BUILD_EXCLUDE_DIRS_LIST"; do
+        if [ -n "$cleanup_file" ] && [ -f "$cleanup_file" ]; then
+            case "$cleanup_file" in
+                */build_exclude_$$.txt|*/build_exclude_dirs_$$.txt)
+                    rm -f "$cleanup_file"
+                    ;;
+            esac
+        fi
+    done
+    
+    # Clean up build files lists
+    rm -f "$BUILD_FILES_LIST" "$BUILD_DIRS_LIST" 2>/dev/null
+    
+    # NOTE: We intentionally keep the include list file so it can be reused
+    # The SAVED_INCLUDE_LIST persists across runs
+    
+    # =========================================================================
+    # STEP 5: Create the final output (tar.gz or directory)
+    # =========================================================================
+    
+    if [ "$BUILD_TAR" = true ]; then
         tar_file="$build_path.tar.gz"
         [ -f "$tar_file" ] && rm -f "$tar_file"
         # Wrap files in directory to prevent tar bomb on extraction
         mkdir -p "$temp_build/$build_name"
+        # Move all files including hidden ones
         for item in "$temp_build"/* "$temp_build"/.[!.]* "$temp_build"/..?*; do
             [ -e "$item" ] || continue
             [ "$item" = "$temp_build/$build_name" ] && continue
@@ -1539,6 +1972,9 @@ do_build() {
             archive_size=$(ls -lh "$tar_file" | awk '{print $5}')
             echo ""; echo "========================================="; echo "  BUILD COMPLETE"; echo "========================================="
             echo "  Archive: $tar_file"; echo "  Size: $archive_size"; echo "  Files: $file_count"; echo "  Source: $BUILD_COMMIT_MSG"
+            if [ -n "$ACTUAL_INCLUDE_LIST" ]; then
+                echo "  Included from filesystem: $(wc -l < "$ACTUAL_INCLUDE_LIST" 2>/dev/null || echo 0) files"
+            fi
             echo ""
             cat > "${tar_file}.info" <<EOF
 Build Name: $build_name
@@ -1546,6 +1982,7 @@ Build Date: $(date)
 Source Commit: $(git rev-parse "$BUILD_COMMIT" 2>/dev/null)
 Commit Message: $BUILD_COMMIT_MSG
 Files: $file_count
+Filesystem Inclusions: $(wc -l < "$ACTUAL_INCLUDE_LIST" 2>/dev/null || echo 0)
 EOF
         else
             echo "Error: Failed to create tar.gz archive"; cd "$REPO_DIR"; rm -rf "$temp_build"; exit 1
@@ -1559,6 +1996,9 @@ EOF
             dir_size=$(du -sh "$build_path" 2>/dev/null | awk '{print $1}')
             echo ""; echo "========================================="; echo "  BUILD COMPLETE"; echo "========================================="
             echo "  Directory: $build_path"; echo "  Size: $dir_size"; echo "  Files: $file_count"; echo "  Source: $BUILD_COMMIT_MSG"
+            if [ -n "$ACTUAL_INCLUDE_LIST" ]; then
+                echo "  Included from filesystem: $(wc -l < "$ACTUAL_INCLUDE_LIST" 2>/dev/null || echo 0) files"
+            fi
             echo ""
             cat > "$build_path/BUILD_INFO.txt" <<EOF
 Build Name: $build_name
@@ -1566,6 +2006,7 @@ Build Date: $(date)
 Source Commit: $(git rev-parse "$BUILD_COMMIT" 2>/dev/null)
 Commit Message: $BUILD_COMMIT_MSG
 Files: $file_count
+Filesystem Inclusions: $(wc -l < "$ACTUAL_INCLUDE_LIST" 2>/dev/null || echo 0)
 EOF
         else
             echo "Error: Failed to create build directory"; rm -rf "$temp_build"; exit 1
@@ -1607,7 +2048,8 @@ show_help() {
     echo "  $0 --build --config           Interactive exclusion before directory build"
     echo "  $0 --build --tar --config     Interactive exclusion before tar.gz build"
     echo "  $0 --build --message          Use commit message for naming"
-    echo "  $0 --build mybuild            Build using saved configuration 'mybuild'"
+    echo "  $0 --build mysave             Build using saved configuration 'mysave' (uses saved tar setting)"
+    echo "  $0 --build --tar mysave       Build using saved config but force tar.gz output"
     echo
     echo "Commands will be created for:"
     
@@ -3098,7 +3540,8 @@ interrupt_handler() {
 
 trap interrupt_handler INT TERM
 
-# Parse command line arguments (enhanced with new build flags)
+# Parse command line arguments
+# CRITICAL FIX: --tar flag is parsed BEFORE the save name, so it overrides saved tar setting
 prev_arg=""
 for arg in "$@"; do
     case "$arg" in
@@ -3115,6 +3558,7 @@ for arg in "$@"; do
         --version) BUILD_MODE=true; BUILD_VERSION="latest" ;;
     esac
     # Handle --build with optional save name
+    # This catches: ./install.sh --build mysave  OR  ./install.sh --build --tar mysave
     if [ "$prev_arg" = "--build" ] && [ "$arg" != "--build" ] && [ "$arg" != "--tar" ] && [ "$arg" != "--config" ] && [ "$arg" != "--message" ] && [ "$arg" != "--version" ] && [ "$arg" != "-log" ] && [ "$arg" != "--skip-debs" ] && [ "$arg" != "--local-dir" ] && [ "$arg" != "--no-preserve" ] && [ "$arg" != "--node" ] && [ "$arg" != "--nodejs" ] && [ "$arg" != "-h" ] && [ "$arg" != "--help" ]; then
         BUILD_SAVE_NAME="$arg"
     fi
@@ -3127,14 +3571,30 @@ done
 
 # Handle build mode (exit early if only building)
 if [ "$BUILD_MODE" = true ]; then
+    # CRITICAL FIX: Save the current BUILD_TAR value before loading a save
+    # If --tar was specified on command line, it should override the saved setting
+    command_line_tar="$BUILD_TAR"
+    
     # If save name is provided, load it before building
     if [ -n "$BUILD_SAVE_NAME" ]; then
         EXCLUDE_LIST="/tmp/build_exclude_$$.txt"
         EXCLUDE_DIRS_LIST="/tmp/build_exclude_dirs_$$.txt"
         > "$EXCLUDE_LIST"
         > "$EXCLUDE_DIRS_LIST"
+        > "$BUILD_INCLUDE_LIST"
         if load_build_configuration "$BUILD_SAVE_NAME"; then
             log_message "Loaded build configuration: $BUILD_SAVE_NAME"
+            # CRITICAL FIX: If --tar was specified on command line, override the saved setting
+            if [ "$command_line_tar" = true ]; then
+                BUILD_TAR=true
+                log_message "Command line --tar flag overrides saved setting (forcing Tar.gz output)"
+            fi
+            # CRITICAL FIX: Also set SAVED_INCLUDE_LIST for do_build to find
+            SAVED_INCLUDE_LIST="/tmp/build_include_saved_${BUILD_SAVE_NAME}.txt"
+            if [ -f "$SAVED_INCLUDE_LIST" ] && [ -s "$SAVED_INCLUDE_LIST" ]; then
+                export SAVED_INCLUDE_LIST
+                log_message "Saved include list found: $SAVED_INCLUDE_LIST ($(wc -l < "$SAVED_INCLUDE_LIST") files)"
+            fi
         else
             log_message "Error: Could not load save '$BUILD_SAVE_NAME'"
             exit 1
@@ -3150,8 +3610,7 @@ ensure_nodejs
 
 if [ -d "$INSTALL_DIR" ]; then
     log_message "Existing installation found."
-    printf "Choose: 1=Update, 2=Remove, 3=Exit
-"
+    printf "Choose: 1=Update, 2=Remove, 3=Exit\n"
     printf "Enter choice: "
     read choice
     case "$choice" in
