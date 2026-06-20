@@ -3198,13 +3198,13 @@ class SyAPP_Func {
     this.UserStorage = new Map()
 
     // ============================================================
-    // LIFECYCLE HOOKS SYSTEM
+    // LIFECYCLE HOOKS SYSTEM (unchanged)
     // ============================================================
     
     /**
      * Lifecycle hooks storage
      * Organized by level (function/page) and type (enter/leave)
-     * Each stores arrays of { handler: Function, once: boolean, executed: Set }
+     * Each stores arrays of { handler: Function, once: boolean, executedData }
      * @private
      */
     this._lifecycleHooks = {
@@ -3573,7 +3573,7 @@ this.Admin = {
 };
 
     // ============================================================
-    // LIFECYCLE HOOKS - PUBLIC API
+    // LIFECYCLE HOOKS - PUBLIC API (unchanged)
     // ============================================================
 
     /**
@@ -3827,11 +3827,12 @@ this.Admin = {
     };
 
     // ============================================================
-    // LIFECYCLE EXECUTION METHODS (Internal)
+    // LIFECYCLE EXECUTION METHODS (Internal) – unchanged
     // ============================================================
 
     /**
-     * Execute function-level enter hooks
+     * Execute function-level enter hooks (global scope)
+     * For "once" hooks, the executed flag is set BEFORE calling the handler to prevent double execution.
      * @param {Object} props - Build props
      * @returns {Promise<void>}
      * @private
@@ -3840,12 +3841,14 @@ this.Admin = {
       const hooks = this._lifecycleHooks.function.enter;
       for (const hook of hooks) {
         if (hook.once && hook.executed) continue;
+        if (hook.once) {
+          hook.executed = true;
+        }
         try {
           const result = hook.handler(props);
           if (result instanceof Promise) {
             await result;
           }
-          hook.executed = true;
         } catch (error) {
           console.error(`Function enter hook error in ${this.Name}:`, error);
         }
@@ -3853,7 +3856,7 @@ this.Admin = {
     };
 
     /**
-     * Execute function-level leave hooks
+     * Execute function-level leave hooks (global scope)
      * @param {Object} props - Build props
      * @returns {Promise<void>}
      * @private
@@ -3862,12 +3865,14 @@ this.Admin = {
       const hooks = this._lifecycleHooks.function.leave;
       for (const hook of hooks) {
         if (hook.once && hook.executed) continue;
+        if (hook.once) {
+          hook.executed = true;
+        }
         try {
           const result = hook.handler(props);
           if (result instanceof Promise) {
             await result;
           }
-          hook.executed = true;
         } catch (error) {
           console.error(`Function leave hook error in ${this.Name}:`, error);
         }
@@ -3890,7 +3895,9 @@ this.Admin = {
           if (result instanceof Promise) {
             await result;
           }
-          hook.executedSessions.add(sessionId);
+          if (hook.once) {
+            hook.executedSessions.add(sessionId);
+          }
         } catch (error) {
           console.error(`Session enter hook error in ${this.Name}:`, error);
         }
@@ -3913,7 +3920,9 @@ this.Admin = {
           if (result instanceof Promise) {
             await result;
           }
-          hook.executedSessions.add(sessionId);
+          if (hook.once) {
+            hook.executedSessions.add(sessionId);
+          }
         } catch (error) {
           console.error(`Session leave hook error in ${this.Name}:`, error);
         }
@@ -3937,7 +3946,9 @@ this.Admin = {
           if (result instanceof Promise) {
             await result;
           }
-          hook.executedSessions.add(sessionId);
+          if (hook.once) {
+            hook.executedSessions.add(sessionId);
+          }
         } catch (error) {
           console.error(`Page enter hook error in ${this.Name} page ${pageName}:`, error);
         }
@@ -3961,7 +3972,9 @@ this.Admin = {
           if (result instanceof Promise) {
             await result;
           }
-          hook.executedSessions.add(sessionId);
+          if (hook.once) {
+            hook.executedSessions.add(sessionId);
+          }
         } catch (error) {
           console.error(`Page leave hook error in ${this.Name} page ${pageName}:`, error);
         }
@@ -4128,7 +4141,7 @@ this.Delete = (id, path, handler, config = {
         const currentPage = currentProps.page || '';
         const previousPage = currentProps._previousPage || '';
 
-        // Handle page leave hooks for previous page
+        // Handle page leave hooks for previous page (unchanged)
         if (previousPage && previousPage !== name && name === currentPage) {
           await this._executePageLeaveHooks(previousPage, { session: userBuild.Session, ...currentProps });
         }
@@ -4154,8 +4167,13 @@ this.Delete = (id, path, handler, config = {
         const shouldExecute = (name === currentPage) || (name === '' && !currentPage);
 
         if (shouldExecute) {
-          // Execute page enter hooks
-          await this._executePageEnterHooks(name, { session: userBuild.Session, ...currentProps });
+          // ──────────────────────────────────────────────
+          // FIX: Only fire page‑enter hooks on a real
+          //      navigation, not on automatic refreshes.
+          // ──────────────────────────────────────────────
+          if (!currentProps._isRefresh) {
+            await this._executePageEnterHooks(name, { session: userBuild.Session, ...currentProps });
+          }
 
           // Track page change for leave hooks
           if (name !== previousPage) {
@@ -5679,9 +5697,6 @@ this.Build = async (props = { session: new Session }) => {
   const sessionId = props.session.UniqueID;
   const previousFuncName = props.session.PreviousPath;
   const currentFuncName = props.session.ActualPath || this.Name;
-  const isFirstSessionEntry = !this._lifecycleHooks.session.enter.some(
-    hook => hook.executedSessions.has(sessionId)
-  );
   
   // Execute function leave hooks for previous function if changing functions
   if (previousFuncName && previousFuncName !== currentFuncName) {
@@ -5695,13 +5710,17 @@ this.Build = async (props = { session: new Session }) => {
   this.Builds.set(sessionId, new userBuild({ session: props.session }))
 
   try {
-    // Execute function enter hooks
-    await this._executeFunctionEnterHooks(props);
+    // ────────────────────────────────────────────────────
+    // FIX: Function‑level and session‑level enter hooks
+    //      must only run on a real navigation, not on
+    //      an automatic screen refresh.
+    // ────────────────────────────────────────────────────
+    if (!props._isRefresh) {
+      await this._executeFunctionEnterHooks(props);
+      await this._executeSessionEnterHooks(props);
+    }
     
-    // Execute session enter hooks
-    await this._executeSessionEnterHooks(props);
-    
-    // Legacy OnEnter support
+    // Legacy OnEnter support – already guarded by !props._isRefresh
     if (!props._isRefresh && typeof this.OnEnter === 'function') {
       const onEnterOnceKey = `_onEnter_${this.Name}`;
       let shouldExecuteLegacy = true;
@@ -6008,7 +6027,7 @@ class TemplateFunc extends SyAPP_Func {
   }
 }
 
-// --------------------------- SyAPP Class ---------------------------
+// --------------------------- HTTPRoutesStorage Class ---------------------------
 
 class HTTPRoutesStorage {
   constructor() {
@@ -6479,10 +6498,6 @@ class SyAPP {
    * @param {boolean} [config.includeFuncName=true] - Include function name in routes
    * @param {boolean} [config.RefreshMode=true] - Start with Refresh Screen mode
    * @param {number} [config.RefreshInterval=400] - Set the Refresh Screen mode interval in ms
-   * 
-   * // ============================================================
-   * // NEW: Configuration for function history tracking
-   * // ============================================================
    * @param {number} [config.maxFuncHistorySize=20] - Maximum size of function history array per session
    */
   constructor(mainFuncOrConfig, config = {}) {
@@ -6550,9 +6565,6 @@ class SyAPP {
       includeFuncName: userConfig.includeFuncName !== false
     };
 
-    // ============================================================
-    // NEW: Function history configuration
-    // ============================================================
     /** 
      * Maximum number of function paths to keep in history per session
      * @type {number}
@@ -6820,7 +6832,7 @@ class SyAPP {
         const previousPage = session.ActualProps?.page || '';
         
         // ============================================================
-        // NEW: Real function tracking (not affected by refreshes)
+        // REAL FUNCTION TRACKING (not affected by refreshes)
         // ============================================================
         
         // Only update PreviousFuncPath when navigating to a DIFFERENT function
@@ -6850,32 +6862,6 @@ class SyAPP {
         session.PreviousProps = session.ActualProps;
         config.props.session = session;
         session.ActualProps = config.props;
-
-        // --- Execute function leave hooks if changing functions ---
-        if (previousPath && previousPath !== targetFuncName) {
-          const previousFunc = this.Funcs.get(previousPath);
-          if (previousFunc) {
-            // Execute page leave hooks for the page being left
-            if (previousPage) {
-              await previousFunc._executePageLeaveHooks(previousPage, { 
-                session: session, 
-                ...session.PreviousProps 
-              });
-            }
-            
-            // Execute session leave hooks
-            await previousFunc._executeSessionLeaveHooks({ 
-              session: session, 
-              ...session.PreviousProps 
-            });
-            
-            // Execute function leave hooks
-            await previousFunc._executeFunctionLeaveHooks({ 
-              session: session, 
-              ...session.PreviousProps 
-            });
-          }
-        }
 
         try {
           const return_obj = await this.Funcs.get(targetFuncName).Build(config.props);
