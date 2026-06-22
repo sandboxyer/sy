@@ -4,6 +4,8 @@ import ColorText from '../../../._/Util/ColorText.js'
 import Qemu from '../../../._/Qemu/Qemu.js'
 import fs from 'fs'
 import VM from "./entities/VM.js";
+import objToArray from "../../../._/Util/objToArray.js";
+
 
 function getTotalSize(paths) {
     const bytes = paths.reduce((sum, p) => {
@@ -44,6 +46,9 @@ class RacksLab extends SyAPP.Func(){
                     //await this.WaitLog(racks)
    
                     this.Text(uid,`• Racks Lab | ${racks.cacheAge}`)
+
+               
+
    
                     if(props.connect){
                        await SSH.connect(props.connect)
@@ -113,19 +118,83 @@ class RacksLab extends SyAPP.Func(){
                     {name : this.TextColor.cyan('Config'),props : {page : 'config'}}
                    ])
 
-this.OnEnter
 
                  }) 
 
                  await this.Page(uid,'customvm',async () => {
-                   // await this.WaitLog(await VM.Config.create())
-                   // await this.WaitLog(await VM.Config.find())
+
+                    //whil
+                    this.OnPageEveryEnter(uid,'customvm',async () => {
+                        if(this.Storages.Has(uid,'vmconfigid')){
+                            VM.Config.Model.delete(this.Storages.Get(uid,'vmconfigid'))
+                        }
+                        let vmconfigid = await VM.Config.Model.create()
+                        this.Storages.Set(uid,'vmconfigid',vmconfigid.id)
+                    })
+
+                   // await this.WaitLog(await VM.Config.Model.create())
+                   // await this.WaitLog(await VM.Config.Model.find())
                     this.Text(uid,'• Racks Lab / Custom VM')
-                    this.Button(uid,'customvmtest')
-                    this.Button(uid,'<- Return',{props : {page : ''}})
+
+                    if(props.valuechange){
+                        VM.Config.Model.update(this.Storages.Get(uid,'vmconfigid'),{[props.valuechange.key] : props.valuechange.value})
+                    }
+
+                    if(this.Storages.Has(uid,'vmconfigid') &&  await VM.Config.Model.findById(this.Storages.Get(uid,'vmconfigid'))){
+                        let config = await VM.Config.Model.findById(this.Storages.Get(uid,'vmconfigid'))
+                        if(config){
+                            let keys_array = objToArray(config,{blacklistKeys : ['createdAt','_id','_created_at']})
+                            for(let instance of keys_array){
+
+                                let index = VM.Config.fields.findIndex(e => e.name == instance.key)
+
+                                if(index != -1){
+                                    if(VM.Config.fields[index].possibleValues){
+                                        await this.DropDown(uid,instance.key,async () => {
+                                            let buttons = []
+                                            VM.Config.fields[VM.Config.fields.findIndex(e => e.name == instance.key)].possibleValues.forEach(e => {
+                                                if(e == instance.value){
+                                                    buttons.push({name : `» ${String(e)}`})
+                                                } else {
+                                                    buttons.push({name : String(e),props : {valuechange : {key : instance.key,value : e}}})
+                                                }
+                                                
+                                            })
+                                            this.Buttons(uid,buttons)
+                                        },{down_buttontext : `${instance.key} : ${instance.value}`,up_buttontext : `${instance.key} : ${instance.value}`})
+                                    } else {
+                                        this.Button(uid,`${instance.key} without fields`)
+                                    }
+                                   
+                                } else {
+                                    this.Button(uid,instance.key)
+                                }
+
+                            
+
+                               
+
+                            }
+                        } else {
+                            this.Button(uid,'Loading...')
+                           
+                        }
+                   
+                        
+                    } else {
+                        this.Button(uid,'Loading...')
+                    }
+                    
+                    this.Button(uid,' ')
+                    this.Button(uid,ColorText.brightYellow('Launch VM'))
+                    this.Button(uid,' ')
+                    this.Buttons(uid,[{name : '<- Return',props : {page : ''}},{name : 'Save'}])
                  })
 
                  await this.Page(uid,'config',async () => {
+
+                   
+                  
                     this.Text(uid,'• Racks Lab / Config')
                     this.Button(uid,'configtest')
                     this.Button(uid,'<- Return',{props : {page : ''}})
