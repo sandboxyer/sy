@@ -2914,6 +2914,23 @@ class Session {
     /** @type {Object|undefined} */
     this.PreviousProps = undefined
     this.InAction = false
+    
+    // ============================================================
+    // NEW: Real function tracking (not affected by refreshes)
+    // ============================================================
+    /** 
+     * The real previous function path (only changes when navigating to a DIFFERENT function)
+     * This stays stable during refreshes of the same function
+     * @type {string|undefined} 
+     */
+    this.PreviousFuncPath = undefined
+    
+    /** 
+     * History of previous function paths (max size controlled by SyAPP config)
+     * Most recent function is at index 0
+     * @type {Array<string>} 
+     */
+    this.FuncHistory = []
   }
 }
 
@@ -3129,6 +3146,8 @@ class SyAPP_Func {
    * @param {Array<Function>} [config.linked=[]] - Linked functions
    * @param {string} [config.group=''] - Group name for routes
    * @param {boolean|null} [config.refreshMode=null] - Refresh mode override (null=use global, true=force on, false=force off)
+   * @param {Function} [config.onEnter] - Deprecated: Use Lifecycle hooks instead
+   * @param {boolean} [config.onEnterOnce=false] - Deprecated: Use Lifecycle hooks instead
    */
   constructor(name, build = async (props = { session: new Session }) => { }, config = {
     routes: [{ name: '', stream: false, method: '', input_model: {}, output_model: {}, input_validate: {} }],
@@ -3136,7 +3155,9 @@ class SyAPP_Func {
     log: false,
     linked: [],
     group: '',
-    refreshMode: null
+    refreshMode: null,
+    onEnter: undefined,
+    onEnterOnce: false
   }) {
     /** @type {string} */
     this.Name = name
@@ -3153,22 +3174,75 @@ class SyAPP_Func {
     /** @type {boolean|null} Refresh mode override */
     this.RefreshMode = config.refreshMode !== undefined ? config.refreshMode : null
 
-/** @type {Map<string, Map<string, {data: Object, expiry: number, position: number, textLineIndex: number}>>} */
-this.AlertStorage = new Map()
+    // Legacy onEnter support (backward compatibility)
+    /** @type {Function|undefined} Hook executed on each manual entry (not on refresh) */
+    this.OnEnter = config.onEnter
+    /** @type {boolean} If true, OnEnter runs only once per user session */
+    this.OnEnterOnce = config.onEnterOnce || false
 
-// Alert configuration
-/** @type {Object} */
-this.AlertConfig = {
-  defaultDuration: 5000,
-  maxAlerts: 100,
-  allowDuplicates: false // Default: don't allow duplicate alert names
-}
+    /** @type {Map<string, Map<string, {data: Object, expiry: number, position: number, textLineIndex: number}>>} */
+    this.AlertStorage = new Map()
+
+    // Alert configuration
+    /** @type {Object} */
+    this.AlertConfig = {
+      defaultDuration: 5000,
+      maxAlerts: 100,
+      allowDuplicates: false // Default: don't allow duplicate alert names
+    }
 
     /** @type {Map<string, userBuild>} */
     this.Builds = new Map()
 
     /** @type {Map<string, Object>} */
     this.UserStorage = new Map()
+
+    // ============================================================
+    // LIFECYCLE HOOKS SYSTEM
+    // ============================================================
+
+    /**
+     * Lifecycle hooks storage
+     * Organized by level (function/page) and type (enter/leave)
+     * Each stores arrays of { handler: Function, once: boolean, executedData }
+     * @private
+     */
+    this._lifecycleHooks = {
+      function: {
+        enter: [],      // { handler: Function, once: boolean, executed: boolean }
+        leave: [],      // { handler: Function, once: boolean, executed: boolean }
+      },
+      session: {
+        enter: [],      // { handler: Function, once: boolean, executedSessions: Set }
+        leave: [],      // { handler: Function, once: boolean, executedSessions: Set }
+      },
+      page: {
+        enter: new Map(),  // Map<pageName, Array<{ handler, once, executedSessions, _pageName }>>
+        leave: new Map(),  // Map<pageName, Array<{ handler, once, executedSessions, _pageName }>>
+      }
+    }
+
+    /**
+     * Execution context for dynamic hook registration.
+     * When a lifecycle phase is active, this object holds the type, associated data,
+     * and the session ID. New hooks registered while this is set will be executed immediately.
+     * @type {{ type: string, pageName?: string, props: Object, sessionId: string } | null}
+     * @private
+     */
+    this._lifecycleExecutionContext = null;
+
+    // Private helper: execute a single hook handler with error handling
+    const executeHookHandler = async (handler, props, onSuccess = null) => {
+      try {
+        const result = handler(props);
+        if (result instanceof Promise) {
+          await result;
+        }
+        if (onSuccess) onSuccess();
+      } catch (error) {
+        console.error(`Lifecycle hook error in ${this.Name}:`, error);
+      }
+    };
 
     /**
      * Storage utilities for user data
@@ -3339,321 +3413,783 @@ this.AlertConfig = {
     }
 
     /**
- * Admin interface for managing SyAPP instance
- * @namespace
- */
-this.Admin = {
-  /**
-   * Check if current user is admin
-   * @param {string} id - User/build ID
-   * @returns {boolean} Whether user is admin
-   */
-  IsAdmin: (id) => {
-    if (!this._syappInstance) return false;
-    return this._syappInstance._adminManager.isAdmin(id);
-  },
-
-  /**
-   * Get SyAPP instance configuration (admin only)
-   * @param {string} id - User/build ID
-   * @returns {Object|null} Instance configuration or null if not admin
-   */
-  GetConfig: (id) => {
-    if (!this.Admin.IsAdmin(id)) {
-      if (this.Log) {
-        console.log(`Admin.GetConfig() - Access denied for ${id}`);
-      }
-      return null;
-    }
-    return this._syappInstance._adminManager.getConfig();
-  },
-
-  /**
-   * Update SyAPP instance configuration (admin only)
-   * @param {string} id - User/build ID
-   * @param {Object} updates - Configuration updates
-   * @returns {Object} Result of the operation
-   */
-  UpdateConfig: (id, updates) => {
-    if (!this.Admin.IsAdmin(id)) {
-      if (this.Log) {
-        console.log(`Admin.UpdateConfig() - Access denied for ${id}`);
-      }
-      return { success: false, error: 'Not authorized' };
-    }
-    return this._syappInstance._adminManager.queueUpdate(id, 'updateConfig', updates);
-  },
-
-  /**
-   * Get server statistics (admin only)
-   * @param {string} id - User/build ID
-   * @returns {Object|null} Server statistics or null if not admin
-   */
-  GetStats: (id) => {
-    if (!this.Admin.IsAdmin(id)) {
-      if (this.Log) {
-        console.log(`Admin.GetStats() - Access denied for ${id}`);
-      }
-      return null;
-    }
-    return this._syappInstance._adminManager.getStats();
-  },
-
-  /**
-   * Get active sessions list (admin only)
-   * @param {string} id - User/build ID
-   * @returns {Array|null} Array of session info or null if not admin
-   */
-  GetSessions: (id) => {
-    if (!this.Admin.IsAdmin(id)) {
-      if (this.Log) {
-        console.log(`Admin.GetSessions() - Access denied for ${id}`);
-      }
-      return null;
-    }
-    return this._syappInstance._adminManager.getSessions();
-  },
-
-  /**
-   * Add admin user (admin only)
-   * @param {string} id - User/build ID
-   * @param {string} newAdminId - ID to add as admin
-   * @returns {Object} Result of the operation
-   */
-  AddAdmin: (id, newAdminId) => {
-    if (!this.Admin.IsAdmin(id)) {
-      if (this.Log) {
-        console.log(`Admin.AddAdmin() - Access denied for ${id}`);
-      }
-      return { success: false, error: 'Not authorized' };
-    }
-    return this._syappInstance._adminManager.queueUpdate(id, 'addAdmin', { adminId: newAdminId });
-  },
-
-  /**
-   * Remove admin user (admin only)
-   * @param {string} id - User/build ID
-   * @param {string} adminId - ID to remove from admins
-   * @returns {Object} Result of the operation
-   */
-  RemoveAdmin: (id, adminId) => {
-    if (!this.Admin.IsAdmin(id)) {
-      if (this.Log) {
-        console.log(`Admin.RemoveAdmin() - Access denied for ${id}`);
-      }
-      return { success: false, error: 'Not authorized' };
-    }
-    return this._syappInstance._adminManager.queueUpdate(id, 'removeAdmin', { adminId });
-  },
-
-  /**
-   * Get HTTP server configuration (admin only)
-   * @param {string} id - User/build ID
-   * @returns {Object|null} HTTP config or null if not admin
-   */
-  GetHTTPConfig: (id) => {
-    if (!this.Admin.IsAdmin(id)) {
-      if (this.Log) {
-        console.log(`Admin.GetHTTPConfig() - Access denied for ${id}`);
-      }
-      return null;
-    }
-    return this._syappInstance._adminManager.getHTTPConfig();
-  },
-
-  /**
-   * Update HTTP server configuration (admin only)
-   * @param {string} id - User/build ID
-   * @param {Object} updates - HTTP config updates
-   * @returns {Object} Result of the operation
-   */
-  UpdateHTTPConfig: (id, updates) => {
-    if (!this.Admin.IsAdmin(id)) {
-      if (this.Log) {
-        console.log(`Admin.UpdateHTTPConfig() - Access denied for ${id}`);
-      }
-      return { success: false, error: 'Not authorized' };
-    }
-    return this._syappInstance._adminManager.queueUpdate(id, 'updateHTTPConfig', updates);
-  },
-
-  /**
-   * Get function information (admin only)
-   * @param {string} id - User/build ID
-   * @param {string} funcName - Function name to get info about
-   * @returns {Object|null} Function info or null if not admin
-   */
-  GetFunctionInfo: (id, funcName) => {
-    if (!this.Admin.IsAdmin(id)) {
-      if (this.Log) {
-        console.log(`Admin.GetFunctionInfo() - Access denied for ${id}`);
-      }
-      return null;
-    }
-    return this._syappInstance._adminManager.getFunctionInfo(funcName);
-  },
-
-  /**
-   * Get admin commands help
-   * @returns {Object} Available admin commands
-   */
-  Help: () => {
-    return {
-      commands: {
-        'IsAdmin': 'Check if user is admin',
-        'GetConfig': 'Get instance configuration',
-        'UpdateConfig': 'Update instance configuration',
-        'GetStats': 'Get server statistics',
-        'GetSessions': 'Get active sessions',
-        'AddAdmin': 'Add admin user',
-        'RemoveAdmin': 'Remove admin user',
-        'GetHTTPConfig': 'Get HTTP configuration',
-        'UpdateHTTPConfig': 'Update HTTP configuration',
-        'GetFunctionInfo': 'Get function information'
+     * Admin interface for managing SyAPP instance
+     * @namespace
+     */
+    this.Admin = {
+      /**
+       * Check if current user is admin
+       * @param {string} id - User/build ID
+       * @returns {boolean} Whether user is admin
+       */
+      IsAdmin: (id) => {
+        if (!this._syappInstance) return false;
+        return this._syappInstance._adminManager.isAdmin(id);
       },
-      usage: 'Replace "this" with the function instance and provide your user ID as first parameter'
+
+      /**
+       * Get SyAPP instance configuration (admin only)
+       * @param {string} id - User/build ID
+       * @returns {Object|null} Instance configuration or null if not admin
+       */
+      GetConfig: (id) => {
+        if (!this.Admin.IsAdmin(id)) {
+          if (this.Log) {
+            console.log(`Admin.GetConfig() - Access denied for ${id}`);
+          }
+          return null;
+        }
+        return this._syappInstance._adminManager.getConfig();
+      },
+
+      /**
+       * Update SyAPP instance configuration (admin only)
+       * @param {string} id - User/build ID
+       * @param {Object} updates - Configuration updates
+       * @returns {Object} Result of the operation
+       */
+      UpdateConfig: (id, updates) => {
+        if (!this.Admin.IsAdmin(id)) {
+          if (this.Log) {
+            console.log(`Admin.UpdateConfig() - Access denied for ${id}`);
+          }
+          return { success: false, error: 'Not authorized' };
+        }
+        return this._syappInstance._adminManager.queueUpdate(id, 'updateConfig', updates);
+      },
+
+      /**
+       * Get server statistics (admin only)
+       * @param {string} id - User/build ID
+       * @returns {Object|null} Server statistics or null if not admin
+       */
+      GetStats: (id) => {
+        if (!this.Admin.IsAdmin(id)) {
+          if (this.Log) {
+            console.log(`Admin.GetStats() - Access denied for ${id}`);
+          }
+          return null;
+        }
+        return this._syappInstance._adminManager.getStats();
+      },
+
+      /**
+       * Get active sessions list (admin only)
+       * @param {string} id - User/build ID
+       * @returns {Array|null} Array of session info or null if not admin
+       */
+      GetSessions: (id) => {
+        if (!this.Admin.IsAdmin(id)) {
+          if (this.Log) {
+            console.log(`Admin.GetSessions() - Access denied for ${id}`);
+          }
+          return null;
+        }
+        return this._syappInstance._adminManager.getSessions();
+      },
+
+      /**
+       * Add admin user (admin only)
+       * @param {string} id - User/build ID
+       * @param {string} newAdminId - ID to add as admin
+       * @returns {Object} Result of the operation
+       */
+      AddAdmin: (id, newAdminId) => {
+        if (!this.Admin.IsAdmin(id)) {
+          if (this.Log) {
+            console.log(`Admin.AddAdmin() - Access denied for ${id}`);
+          }
+          return { success: false, error: 'Not authorized' };
+        }
+        return this._syappInstance._adminManager.queueUpdate(id, 'addAdmin', { adminId: newAdminId });
+      },
+
+      /**
+       * Remove admin user (admin only)
+       * @param {string} id - User/build ID
+       * @param {string} adminId - ID to remove from admins
+       * @returns {Object} Result of the operation
+       */
+      RemoveAdmin: (id, adminId) => {
+        if (!this.Admin.IsAdmin(id)) {
+          if (this.Log) {
+            console.log(`Admin.RemoveAdmin() - Access denied for ${id}`);
+          }
+          return { success: false, error: 'Not authorized' };
+        }
+        return this._syappInstance._adminManager.queueUpdate(id, 'removeAdmin', { adminId });
+      },
+
+      /**
+       * Get HTTP server configuration (admin only)
+       * @param {string} id - User/build ID
+       * @param {string} funcName - Function name to get info about
+       * @returns {Object|null} HTTP config or null if not admin
+       */
+      GetHTTPConfig: (id) => {
+        if (!this.Admin.IsAdmin(id)) {
+          if (this.Log) {
+            console.log(`Admin.GetHTTPConfig() - Access denied for ${id}`);
+          }
+          return null;
+        }
+        return this._syappInstance._adminManager.getHTTPConfig();
+      },
+
+      /**
+       * Update HTTP server configuration (admin only)
+       * @param {string} id - User/build ID
+       * @param {Object} updates - HTTP config updates
+       * @returns {Object} Result of the operation
+       */
+      UpdateHTTPConfig: (id, updates) => {
+        if (!this.Admin.IsAdmin(id)) {
+          if (this.Log) {
+            console.log(`Admin.UpdateHTTPConfig() - Access denied for ${id}`);
+          }
+          return { success: false, error: 'Not authorized' };
+        }
+        return this._syappInstance._adminManager.queueUpdate(id, 'updateHTTPConfig', updates);
+      },
+
+      /**
+       * Get function information (admin only)
+       * @param {string} id - User/build ID
+       * @param {string} funcName - Function name to get info about
+       * @returns {Object|null} Function info or null if not admin
+       */
+      GetFunctionInfo: (id, funcName) => {
+        if (!this.Admin.IsAdmin(id)) {
+          if (this.Log) {
+            console.log(`Admin.GetFunctionInfo() - Access denied for ${id}`);
+          }
+          return null;
+        }
+        return this._syappInstance._adminManager.getFunctionInfo(funcName);
+      },
+
+      /**
+       * Get admin commands help
+       * @returns {Object} Available admin commands
+       */
+      Help: () => {
+        return {
+          commands: {
+            'IsAdmin': 'Check if user is admin',
+            'GetConfig': 'Get instance configuration',
+            'UpdateConfig': 'Update instance configuration',
+            'GetStats': 'Get server statistics',
+            'GetSessions': 'Get active sessions',
+            'AddAdmin': 'Add admin user',
+            'RemoveAdmin': 'Remove admin user',
+            'GetHTTPConfig': 'Get HTTP configuration',
+            'UpdateHTTPConfig': 'Update HTTP configuration',
+            'GetFunctionInfo': 'Get function information'
+          },
+          usage: 'Replace "this" with the function instance and provide your user ID as first parameter'
+        };
+      }
     };
-  }
-};
+
+    // ============================================================
+    // LIFECYCLE HOOKS - PUBLIC API
+    // ============================================================
+
+    /**
+     * Register a hook to execute when the function is entered for the FIRST TIME by any session
+     * (SyAPP level - executes only once globally, not per session)
+     * @param {string} id - User/build ID (required for consistency with other methods)
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnFunctionFirstEnter = (id, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnFunctionFirstEnter() Error - handler must be a function | BuildID: ${id}`);
+        return this;
+      }
+      this._lifecycleHooks.function.enter.push({
+        handler: handler,
+        once: true,
+        executed: false
+      });
+      return this;
+    };
+
+    /**
+     * Register a hook to execute EVERY TIME the function is entered by any session
+     * (SyAPP level - executes for each session entry)
+     * @param {string} id - User/build ID (required for consistency with other methods)
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnFunctionEnter = (id, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnFunctionEnter() Error - handler must be a function | BuildID: ${id}`);
+        return this;
+      }
+      this._lifecycleHooks.function.enter.push({
+        handler: handler,
+        once: false,
+        executed: false
+      });
+      return this;
+    };
+
+    /**
+     * Register a hook to execute EVERY TIME the function is left by any session
+     * @param {string} id - User/build ID (required for consistency with other methods)
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnFunctionLeave = (id, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnFunctionLeave() Error - handler must be a function | BuildID: ${id}`);
+        return this;
+      }
+      this._lifecycleHooks.function.leave.push({
+        handler: handler,
+        once: false,
+        executed: false
+      });
+      return this;
+    };
+
+    /**
+     * Register a hook to execute when the function is left for the FIRST TIME by any session
+     * (SyAPP level - executes only once globally)
+     * @param {string} id - User/build ID (required for consistency with other methods)
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnFunctionFirstLeave = (id, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnFunctionFirstLeave() Error - handler must be a function | BuildID: ${id}`);
+        return this;
+      }
+      this._lifecycleHooks.function.leave.push({
+        handler: handler,
+        once: true,
+        executed: false
+      });
+      return this;
+    };
+
+    /**
+     * Register a hook to execute when a SESSION enters the function for the FIRST TIME
+     * (Session level - executes once per unique session/user)
+     * @param {string} id - User/build ID (the session identifier)
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnSessionEnter = (id, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnSessionEnter() Error - handler must be a function | BuildID: ${id}`);
+        return this;
+      }
+      const hookEntry = {
+        handler: handler,
+        once: true,
+        executedSessions: new Set()
+      };
+      this._lifecycleHooks.session.enter.push(hookEntry);
+      return this;
+    };
+
+    /**
+     * Register a hook to execute EVERY TIME a session enters the function
+     * @param {string} id - User/build ID (the session identifier)
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnSessionEveryEnter = (id, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnSessionEveryEnter() Error - handler must be a function | BuildID: ${id}`);
+        return this;
+      }
+      this._lifecycleHooks.session.enter.push({
+        handler: handler,
+        once: false,
+        executedSessions: new Set()
+      });
+      return this;
+    };
+
+    /**
+     * Register a hook to execute when a SESSION leaves the function
+     * @param {string} id - User/build ID (the session identifier)
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnSessionLeave = (id, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnSessionLeave() Error - handler must be a function | BuildID: ${id}`);
+        return this;
+      }
+      this._lifecycleHooks.session.leave.push({
+        handler: handler,
+        once: false,
+        executedSessions: new Set()
+      });
+      return this;
+    };
+
+    /**
+     * Register a hook to execute when a SESSION leaves the function for the FIRST TIME
+     * @param {string} id - User/build ID (the session identifier)
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnSessionFirstLeave = (id, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnSessionFirstLeave() Error - handler must be a function | BuildID: ${id}`);
+        return this;
+      }
+      const hookEntry = {
+        handler: handler,
+        once: true,
+        executedSessions: new Set()
+      };
+      this._lifecycleHooks.session.leave.push(hookEntry);
+      return this;
+    };
+
+    /**
+     * Register a hook to execute when a SESSION enters a specific PAGE for the FIRST TIME
+     * @param {string} id - User/build ID (the session identifier)
+     * @param {string} pageName - Name of the page
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnPageEnter = (id, pageName, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnPageEnter() Error - handler must be a function | BuildID: ${id} | Page: ${pageName}`);
+        return this;
+      }
+      if (!this._lifecycleHooks.page.enter.has(pageName)) {
+        this._lifecycleHooks.page.enter.set(pageName, []);
+      }
+      const hookEntry = {
+        handler: handler,
+        once: true,
+        executedSessions: new Set(),
+        _pageName: pageName
+      };
+      this._lifecycleHooks.page.enter.get(pageName).push(hookEntry);
+
+      // Immediate execution ONLY when we are inside a real page‑enter phase
+      const ctx = this._lifecycleExecutionContext;
+      if (ctx && ctx.type === 'pageEnter' && ctx.pageName === pageName && ctx.sessionId === id) {
+        // The flag _isRealPageEnter guarantees we only fire during genuine page changes
+        if (ctx.props._isRealPageEnter && !hookEntry.executedSessions.has(id)) {
+          executeHookHandler(hookEntry.handler, ctx.props, () => {
+            hookEntry.executedSessions.add(id);
+          });
+        }
+      }
+      return this;
+    };
+
+    /**
+     * Register a hook to execute EVERY TIME a session enters a specific PAGE
+     * @param {string} id - User/build ID (the session identifier)
+     * @param {string} pageName - Name of the page
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnPageEveryEnter = (id, pageName, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnPageEveryEnter() Error - handler must be a function | BuildID: ${id} | Page: ${pageName}`);
+        return this;
+      }
+      if (!this._lifecycleHooks.page.enter.has(pageName)) {
+        this._lifecycleHooks.page.enter.set(pageName, []);
+      }
+      const hookEntry = {
+        handler: handler,
+        once: false,
+        executedSessions: new Set(),
+        _pageName: pageName
+      };
+      this._lifecycleHooks.page.enter.get(pageName).push(hookEntry);
+
+      // Immediate execution if currently inside a real page‑enter phase
+      const ctx = this._lifecycleExecutionContext;
+      if (ctx && ctx.type === 'pageEnter' && ctx.pageName === pageName && ctx.sessionId === id) {
+        if (ctx.props._isRealPageEnter) {
+          executeHookHandler(hookEntry.handler, ctx.props, null);
+        }
+      }
+      return this;
+    };
+
+    /**
+     * Register a hook to execute when a SESSION leaves a specific PAGE
+     * @param {string} id - User/build ID (the session identifier)
+     * @param {string} pageName - Name of the page
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnPageLeave = (id, pageName, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnPageLeave() Error - handler must be a function | BuildID: ${id} | Page: ${pageName}`);
+        return this;
+      }
+      if (!this._lifecycleHooks.page.leave.has(pageName)) {
+        this._lifecycleHooks.page.leave.set(pageName, []);
+      }
+      const hookEntry = {
+        handler: handler,
+        once: false,
+        executedSessions: new Set(),
+        _pageName: pageName
+      };
+      this._lifecycleHooks.page.leave.get(pageName).push(hookEntry);
+
+      // Immediate execution if currently inside the page leave phase for this page
+      const ctx = this._lifecycleExecutionContext;
+      if (ctx && ctx.type === 'pageLeave' && ctx.pageName === pageName && ctx.sessionId === id) {
+        executeHookHandler(hookEntry.handler, ctx.props, null);
+      }
+      return this;
+    };
+
+    /**
+     * Register a hook to execute when a SESSION leaves a specific PAGE for the FIRST TIME
+     * @param {string} id - User/build ID (the session identifier)
+     * @param {string} pageName - Name of the page
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnPageFirstLeave = (id, pageName, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnPageFirstLeave() Error - handler must be a function | BuildID: ${id} | Page: ${pageName}`);
+        return this;
+      }
+      if (!this._lifecycleHooks.page.leave.has(pageName)) {
+        this._lifecycleHooks.page.leave.set(pageName, []);
+      }
+      const hookEntry = {
+        handler: handler,
+        once: true,
+        executedSessions: new Set(),
+        _pageName: pageName
+      };
+      this._lifecycleHooks.page.leave.get(pageName).push(hookEntry);
+
+      const ctx = this._lifecycleExecutionContext;
+      if (ctx && ctx.type === 'pageLeave' && ctx.pageName === pageName && ctx.sessionId === id) {
+        if (!hookEntry.executedSessions.has(id)) {
+          executeHookHandler(hookEntry.handler, ctx.props, () => {
+            hookEntry.executedSessions.add(id);
+          });
+        }
+      }
+      return this;
+    };
+
+    // ============================================================
+    // LIFECYCLE EXECUTION METHODS (Internal)
+    // ============================================================
+
+    /**
+     * Execute function-level enter hooks (global scope)
+     * @param {Object} props - Build props
+     * @returns {Promise<void>}
+     * @private
+     */
+    this._executeFunctionEnterHooks = async (props) => {
+      const hooks = this._lifecycleHooks.function.enter;
+      for (const hook of hooks) {
+        if (hook.once && hook.executed) continue;
+        if (hook.once) {
+          hook.executed = true;
+        }
+        try {
+          const result = hook.handler(props);
+          if (result instanceof Promise) {
+            await result;
+          }
+        } catch (error) {
+          console.error(`Function enter hook error in ${this.Name}:`, error);
+        }
+      }
+    };
+
+    /**
+     * Execute function-level leave hooks (global scope)
+     * @param {Object} props - Build props
+     * @returns {Promise<void>}
+     * @private
+     */
+    this._executeFunctionLeaveHooks = async (props) => {
+      const hooks = this._lifecycleHooks.function.leave;
+      for (const hook of hooks) {
+        if (hook.once && hook.executed) continue;
+        if (hook.once) {
+          hook.executed = true;
+        }
+        try {
+          const result = hook.handler(props);
+          if (result instanceof Promise) {
+            await result;
+          }
+        } catch (error) {
+          console.error(`Function leave hook error in ${this.Name}:`, error);
+        }
+      }
+    };
+
+    /**
+     * Execute session-level enter hooks
+     * @param {Object} props - Build props
+     * @returns {Promise<void>}
+     * @private
+     */
+    this._executeSessionEnterHooks = async (props) => {
+      const sessionId = props.session.UniqueID;
+      const hooks = this._lifecycleHooks.session.enter;
+      for (const hook of hooks) {
+        if (hook.once && hook.executedSessions.has(sessionId)) continue;
+        try {
+          const result = hook.handler(props);
+          if (result instanceof Promise) {
+            await result;
+          }
+          if (hook.once) {
+            hook.executedSessions.add(sessionId);
+          }
+        } catch (error) {
+          console.error(`Session enter hook error in ${this.Name}:`, error);
+        }
+      }
+    };
+
+    /**
+     * Execute session-level leave hooks
+     * @param {Object} props - Build props
+     * @returns {Promise<void>}
+     * @private
+     */
+    this._executeSessionLeaveHooks = async (props) => {
+      const sessionId = props.session.UniqueID;
+      const hooks = this._lifecycleHooks.session.leave;
+      for (const hook of hooks) {
+        if (hook.once && hook.executedSessions.has(sessionId)) continue;
+        try {
+          const result = hook.handler(props);
+          if (result instanceof Promise) {
+            await result;
+          }
+          if (hook.once) {
+            hook.executedSessions.add(sessionId);
+          }
+        } catch (error) {
+          console.error(`Session leave hook error in ${this.Name}:`, error);
+        }
+      }
+    };
+
+    /**
+     * Execute page-level enter hooks
+     * @param {string} pageName - Page name
+     * @param {Object} props - Build props
+     * @returns {Promise<void>}
+     * @private
+     */
+    this._executePageEnterHooks = async (pageName, props) => {
+      const sessionId = props.session.UniqueID;
+      const pageHooks = this._lifecycleHooks.page.enter.get(pageName) || [];
+      for (const hook of pageHooks) {
+        if (hook.once && hook.executedSessions.has(sessionId)) continue;
+        try {
+          const result = hook.handler(props);
+          if (result instanceof Promise) {
+            await result;
+          }
+          if (hook.once) {
+            hook.executedSessions.add(sessionId);
+          }
+        } catch (error) {
+          console.error(`Page enter hook error in ${this.Name} page ${pageName}:`, error);
+        }
+      }
+    };
+
+    /**
+     * Execute page-level leave hooks
+     * @param {string} pageName - Page name
+     * @param {Object} props - Build props
+     * @returns {Promise<void>}
+     * @private
+     */
+    this._executePageLeaveHooks = async (pageName, props) => {
+      const sessionId = props.session.UniqueID;
+      const pageHooks = this._lifecycleHooks.page.leave.get(pageName) || [];
+      for (const hook of pageHooks) {
+        if (hook.once && hook.executedSessions.has(sessionId)) continue;
+        try {
+          const result = hook.handler(props);
+          if (result instanceof Promise) {
+            await result;
+          }
+          if (hook.once) {
+            hook.executedSessions.add(sessionId);
+          }
+        } catch (error) {
+          console.error(`Page leave hook error in ${this.Name} page ${pageName}:`, error);
+        }
+      }
+    };
 
     // --------------------------- HTTP Route Methods ---------------------------
 
     /**
- * Register a GET route
- * @param {string} id - User/build ID
- * @param {string} path - Route path
- * @param {Function} handler - Route handler (req, res) => {}
- * @param {Object} config - Route configuration
- * @param {boolean} [config.stream=false] - Whether route streams data
- * @param {Object} [config.input_model={}] - Input model definition
- * @param {Object} [config.output_model={}] - Output model definition
- * @param {any} [config.input_validate={}] - Response to send on validation failure
- * @param {Object} [config.validation_options] - Validation options
- * @param {boolean} [config.validation_options.includeMissingKeys=true] - Include missing keys in validation error response
- * @param {boolean} [config.baseRoute] - Override global baseRoute for this specific route
- * @param {boolean} [config.includeFuncName] - Override global includeFuncName for this specific route
- */
-this.Get = (id, path, handler, config = { 
-  stream: false, 
-  input_model: {}, 
-  output_model: {}, 
-  input_validate: {}, 
-  validation_options: { includeMissingKeys: true },
-  baseRoute: undefined, 
-  includeFuncName: undefined 
-}) => {
-  if (this.Builds.has(id)) {
-    const normalizedPath = path === '' ? '/' : (path.startsWith('/') ? path : `/${path}`)
-    
-    const routeConfig = {
-      method: 'GET',
-      path: normalizedPath,
-      originalPath: path,
-      handler,
-      stream: config.stream || false,
-      input_model: config.input_model || {},
-      output_model: config.output_model || {},
-      input_validate: config.input_validate || {},
-      validation_options: config.validation_options || { includeMissingKeys: true },
-      baseRoute: config.baseRoute,
-      includeFuncName: config.includeFuncName
+     * Register a GET route
+     * @param {string} id - User/build ID
+     * @param {string} path - Route path
+     * @param {Function} handler - Route handler (req, res) => {}
+     * @param {Object} config - Route configuration
+     * @param {boolean} [config.stream=false] - Whether route streams data
+     * @param {Object} [config.input_model={}] - Input model definition
+     * @param {Object} [config.output_model={}] - Output model definition
+     * @param {any} [config.input_validate={}] - Response to send on validation failure
+     * @param {Object} [config.validation_options] - Validation options
+     * @param {boolean} [config.validation_options.includeMissingKeys=true] - Include missing keys in validation error response
+     * @param {boolean} [config.baseRoute] - Override global baseRoute for this specific route
+     * @param {boolean} [config.includeFuncName] - Override global includeFuncName for this specific route
+     */
+    this.Get = (id, path, handler, config = { 
+      stream: false, 
+      input_model: {}, 
+      output_model: {}, 
+      input_validate: {}, 
+      validation_options: { includeMissingKeys: true },
+      baseRoute: undefined, 
+      includeFuncName: undefined 
+    }) => {
+      if (this.Builds.has(id)) {
+        const normalizedPath = path === '' ? '/' : (path.startsWith('/') ? path : `/${path}`)
+        
+        const routeConfig = {
+          method: 'GET',
+          path: normalizedPath,
+          originalPath: path,
+          handler,
+          stream: config.stream || false,
+          input_model: config.input_model || {},
+          output_model: config.output_model || {},
+          input_validate: config.input_validate || {},
+          validation_options: config.validation_options || { includeMissingKeys: true },
+          baseRoute: config.baseRoute,
+          includeFuncName: config.includeFuncName
+        }
+        this.Builds.get(id).Routes.GET.push(routeConfig)
+      }
     }
-    this.Builds.get(id).Routes.GET.push(routeConfig)
-  }
-}
 
-// Similar updates for Post, Put, Delete methods
-this.Post = (id, path, handler, config = { 
-  stream: false, 
-  input_model: {}, 
-  output_model: {}, 
-  input_validate: {}, 
-  validation_options: { includeMissingKeys: true },
-  baseRoute: undefined, 
-  includeFuncName: undefined 
-}) => {
-  if (this.Builds.has(id)) {
-    const normalizedPath = path === '' ? '/' : (path.startsWith('/') ? path : `/${path}`)
-    
-    const routeConfig = {
-      method: 'POST',
-      path: normalizedPath,
-      originalPath: path,
-      handler,
-      stream: config.stream || false,
-      input_model: config.input_model || {},
-      output_model: config.output_model || {},
-      input_validate: config.input_validate || {},
-      validation_options: config.validation_options || { includeMissingKeys: true },
-      baseRoute: config.baseRoute,
-      includeFuncName: config.includeFuncName
+    /**
+     * Register a POST route
+     */
+    this.Post = (id, path, handler, config = { 
+      stream: false, 
+      input_model: {}, 
+      output_model: {}, 
+      input_validate: {}, 
+      validation_options: { includeMissingKeys: true },
+      baseRoute: undefined, 
+      includeFuncName: undefined 
+    }) => {
+      if (this.Builds.has(id)) {
+        const normalizedPath = path === '' ? '/' : (path.startsWith('/') ? path : `/${path}`)
+        
+        const routeConfig = {
+          method: 'POST',
+          path: normalizedPath,
+          originalPath: path,
+          handler,
+          stream: config.stream || false,
+          input_model: config.input_model || {},
+          output_model: config.output_model || {},
+          input_validate: config.input_validate || {},
+          validation_options: config.validation_options || { includeMissingKeys: true },
+          baseRoute: config.baseRoute,
+          includeFuncName: config.includeFuncName
+        }
+        this.Builds.get(id).Routes.POST.push(routeConfig)
+      }
     }
-    this.Builds.get(id).Routes.POST.push(routeConfig)
-  }
-}
 
-this.Put = (id, path, handler, config = { 
-  stream: false, 
-  input_model: {}, 
-  output_model: {}, 
-  input_validate: {}, 
-  validation_options: { includeMissingKeys: true },
-  baseRoute: undefined, 
-  includeFuncName: undefined 
-}) => {
-  if (this.Builds.has(id)) {
-    const normalizedPath = path === '' ? '/' : (path.startsWith('/') ? path : `/${path}`)
-    
-    const routeConfig = {
-      method: 'PUT',
-      path: normalizedPath,
-      originalPath: path,
-      handler,
-      stream: config.stream || false,
-      input_model: config.input_model || {},
-      output_model: config.output_model || {},
-      input_validate: config.input_validate || {},
-      validation_options: config.validation_options || { includeMissingKeys: true },
-      baseRoute: config.baseRoute,
-      includeFuncName: config.includeFuncName
+    /**
+     * Register a PUT route
+     */
+    this.Put = (id, path, handler, config = { 
+      stream: false, 
+      input_model: {}, 
+      output_model: {}, 
+      input_validate: {}, 
+      validation_options: { includeMissingKeys: true },
+      baseRoute: undefined, 
+      includeFuncName: undefined 
+    }) => {
+      if (this.Builds.has(id)) {
+        const normalizedPath = path === '' ? '/' : (path.startsWith('/') ? path : `/${path}`)
+        
+        const routeConfig = {
+          method: 'PUT',
+          path: normalizedPath,
+          originalPath: path,
+          handler,
+          stream: config.stream || false,
+          input_model: config.input_model || {},
+          output_model: config.output_model || {},
+          input_validate: config.input_validate || {},
+          validation_options: config.validation_options || { includeMissingKeys: true },
+          baseRoute: config.baseRoute,
+          includeFuncName: config.includeFuncName
+        }
+        this.Builds.get(id).Routes.PUT.push(routeConfig)
+      }
     }
-    this.Builds.get(id).Routes.PUT.push(routeConfig)
-  }
-}
 
-this.Delete = (id, path, handler, config = { 
-  stream: false, 
-  input_model: {}, 
-  output_model: {}, 
-  input_validate: {}, 
-  validation_options: { includeMissingKeys: true },
-  baseRoute: undefined, 
-  includeFuncName: undefined 
-}) => {
-  if (this.Builds.has(id)) {
-    const normalizedPath = path === '' ? '/' : (path.startsWith('/') ? path : `/${path}`)
-    
-    const routeConfig = {
-      method: 'DELETE',
-      path: normalizedPath,
-      originalPath: path,
-      handler,
-      stream: config.stream || false,
-      input_model: config.input_model || {},
-      output_model: config.output_model || {},
-      input_validate: config.input_validate || {},
-      validation_options: config.validation_options || { includeMissingKeys: true },
-      baseRoute: config.baseRoute,
-      includeFuncName: config.includeFuncName
+    /**
+     * Register a DELETE route
+     */
+    this.Delete = (id, path, handler, config = { 
+      stream: false, 
+      input_model: {}, 
+      output_model: {}, 
+      input_validate: {}, 
+      validation_options: { includeMissingKeys: true },
+      baseRoute: undefined, 
+      includeFuncName: undefined 
+    }) => {
+      if (this.Builds.has(id)) {
+        const normalizedPath = path === '' ? '/' : (path.startsWith('/') ? path : `/${path}`)
+        
+        const routeConfig = {
+          method: 'DELETE',
+          path: normalizedPath,
+          originalPath: path,
+          handler,
+          stream: config.stream || false,
+          input_model: config.input_model || {},
+          output_model: config.output_model || {},
+          input_validate: config.input_validate || {},
+          validation_options: config.validation_options || { includeMissingKeys: true },
+          baseRoute: config.baseRoute,
+          includeFuncName: config.includeFuncName
+        }
+        this.Builds.get(id).Routes.DELETE.push(routeConfig)
+      }
     }
-    this.Builds.get(id).Routes.DELETE.push(routeConfig)
-  }
-}
 
     // --------------------------- Page Methods ---------------------------
 
     /**
-     * Define a page in the UI
+     * Define a page in the UI.
+     * Page‑enter hooks are executed only when the page actually changes, and
+     * newly registered hooks inside the page code fire immediately on that real entry.
+     * Same‑page button clicks never trigger the hooks.
      * @param {string} id - User/build ID
      * @param {string} name - Page name
      * @param {Function} code - Page code to execute
@@ -3674,6 +4210,13 @@ this.Delete = (id, path, handler, config = {
         const userBuild = this.Builds.get(id);
         const currentProps = userBuild.Session.ActualProps || {};
         const currentPage = currentProps.page || '';
+        // Use the persistent _previousPage stored directly on the session
+        const previousPage = userBuild.Session._previousPage || '';
+
+        // Handle page leave hooks for previous page
+        if (previousPage && previousPage !== name && name === currentPage) {
+          await this._executePageLeaveHooks(previousPage, { session: userBuild.Session, ...currentProps });
+        }
 
         if (config.lock) {
           const lockKey = config.lockKey || `page-lock-${name}`;
@@ -3696,11 +4239,48 @@ this.Delete = (id, path, handler, config = {
         const shouldExecute = (name === currentPage) || (name === '' && !currentPage);
 
         if (shouldExecute) {
-          if (config.pagelabel) {
-            this.Text(id, `• ${config.pagelabel}`);
+          // Determine if this is a real page change
+          const isNewPage = (name !== previousPage);
+
+          // Execute pre‑registered page‑enter hooks ONLY on real navigation
+          if (!currentProps._isRefresh && isNewPage) {
+            await this._executePageEnterHooks(name, { session: userBuild.Session, ...currentProps });
           }
 
-          await code();
+          // Update the persistent _previousPage on the session only when page changed
+          if (name !== previousPage) {
+            userBuild.Session._previousPage = name;
+          }
+
+          // Set a flag that guarantees immediate‑execution only for real entries
+          if (!currentProps._isRefresh && isNewPage) {
+            currentProps._isRealPageEnter = true;
+          }
+
+          // Set the execution context for dynamic hook registration
+          const previousContext = this._lifecycleExecutionContext;
+          if (!currentProps._isRefresh && isNewPage) {
+            this._lifecycleExecutionContext = {
+              type: 'pageEnter',
+              pageName: name,
+              props: { session: userBuild.Session, ...currentProps },
+              sessionId: userBuild.Session.UniqueID
+            };
+          } else {
+            // Ensure no stale context during refresh or same‑page render
+            this._lifecycleExecutionContext = null;
+          }
+
+          try {
+            if (config.pagelabel) {
+              this.Text(id, `• ${config.pagelabel}`);
+            }
+            await code();
+          } finally {
+            // Clean up the real‑page flag and restore context
+            delete currentProps._isRealPageEnter;
+            this._lifecycleExecutionContext = previousContext;
+          }
         }
       } else {
         if (this.Log) {
@@ -3750,316 +4330,808 @@ this.Delete = (id, path, handler, config = {
       return false;
     };
 
+    // --------------------------- Alert Methods (unchanged) ---------------------------
 
-
-   /**
- * Set alert configuration
- * @param {Object} config - Alert configuration
- * @param {number} [config.defaultDuration=5000] - Default duration in ms
- * @param {number} [config.maxAlerts=100] - Maximum alerts per user
- * @param {boolean} [config.allowDuplicates=false] - Allow duplicate alert names
- */
-this.SetAlertConfig = (config = {}) => {
-  this.AlertConfig = {
-    defaultDuration: config.defaultDuration || 5000,
-    maxAlerts: config.maxAlerts || 100,
-    allowDuplicates: config.allowDuplicates || false
-  }
-}
-
-/**
- * Add an alert text that persists through refreshes
- * @param {string} id - User/build ID
- * @param {string} text - Text to display
- * @param {Object} [config] - Alert configuration
- * @param {number} [config.duration] - Duration in ms (default from AlertConfig)
- * @param {string} [config.name] - Unique name for this alert (auto-generated if not provided)
- * @param {boolean} [config.allowDuplicate=false] - Allow duplicate alerts with same name
- * @returns {string} The alert name (for later removal)
- */
-this.Alert = (id, text, config = {}) => {
-  if (!this.Builds.has(id)) {
-    if (this.Log) {
-      console.log(`this.Alert() Error - userBuild not found | BuildID: ${id}`);
-    }
-    return null;
-  }
-
-  const duration = config.duration || this.AlertConfig.defaultDuration;
-  const allowDuplicate = config.allowDuplicate !== undefined ? config.allowDuplicate : this.AlertConfig.allowDuplicates;
-  
-  // Generate unique name based on text content if not provided
-  const alertName = config.name || `alert_${this._hashString(text)}`;
-
-  // Initialize storage for this user
-  if (!this.AlertStorage.has(id)) {
-    this.AlertStorage.set(id, new Map());
-  }
-
-  const userAlerts = this.AlertStorage.get(id);
-  
-  // Clean expired alerts
-  const now = Date.now();
-  for (const [name, alert] of userAlerts) {
-    if (alert.expiry <= now) {
-      userAlerts.delete(name);
-    }
-  }
-
-  // Check for duplicate if not allowed
-  if (!allowDuplicate && userAlerts.has(alertName)) {
-    // Update existing alert with new duration
-    const existingAlert = userAlerts.get(alertName);
-    existingAlert.expiry = now + duration;
-    existingAlert.data.text = text; // Update text if changed
-    
-    // DON'T call this.Text here - let ProcessAlerts handle it
-    return alertName;
-  }
-
-  // Check max alerts
-  if (userAlerts.size >= this.AlertConfig.maxAlerts) {
-    // Remove oldest alert
-    let oldestName = null;
-    let oldestTime = Infinity;
-    for (const [name, alert] of userAlerts) {
-      if (alert.expiry < oldestTime) {
-        oldestTime = alert.expiry;
-        oldestName = name;
+    /**
+     * Set alert configuration
+     * @param {Object} config - Alert configuration
+     * @param {number} [config.defaultDuration=5000] - Default duration in ms
+     * @param {number} [config.maxAlerts=100] - Maximum alerts per user
+     * @param {boolean} [config.allowDuplicates=false] - Allow duplicate alert names
+     */
+    this.SetAlertConfig = (config = {}) => {
+      this.AlertConfig = {
+        defaultDuration: config.defaultDuration || 5000,
+        maxAlerts: config.maxAlerts || 100,
+        allowDuplicates: config.allowDuplicates || false
       }
     }
-    if (oldestName) {
-      userAlerts.delete(oldestName);
+
+    /**
+     * Add an alert text that persists through refreshes
+     * @param {string} id - User/build ID
+     * @param {string} text - Text to display
+     * @param {Object} [config] - Alert configuration
+     * @param {number} [config.duration] - Duration in ms (default from AlertConfig)
+     * @param {string} [config.name] - Unique name for this alert (auto-generated if not provided)
+     * @param {boolean} [config.allowDuplicate=false] - Allow duplicate alerts with same name
+     * @returns {string} The alert name (for later removal)
+     */
+    this.Alert = (id, text, config = {}) => {
+      if (!this.Builds.has(id)) {
+        if (this.Log) {
+          console.log(`this.Alert() Error - userBuild not found | BuildID: ${id}`);
+        }
+        return null;
+      }
+
+      const duration = config.duration || this.AlertConfig.defaultDuration;
+      const allowDuplicate = config.allowDuplicate !== undefined ? config.allowDuplicate : this.AlertConfig.allowDuplicates;
+      
+      const alertName = config.name || `alert_${this._hashString(text)}`;
+
+      if (!this.AlertStorage.has(id)) {
+        this.AlertStorage.set(id, new Map());
+      }
+
+      const userAlerts = this.AlertStorage.get(id);
+      const now = Date.now();
+      
+      for (const [name, alert] of userAlerts) {
+        if (alert.expiry <= now) {
+          userAlerts.delete(name);
+        }
+      }
+
+      if (!allowDuplicate && userAlerts.has(alertName)) {
+        const existingAlert = userAlerts.get(alertName);
+        existingAlert.expiry = now + duration;
+        existingAlert.data.text = text; // Update text if changed
+        return alertName;
+      }
+
+      if (userAlerts.size >= this.AlertConfig.maxAlerts) {
+        let oldestName = null;
+        let oldestTime = Infinity;
+        for (const [name, alert] of userAlerts) {
+          if (alert.expiry < oldestTime) {
+            oldestTime = alert.expiry;
+            oldestName = name;
+          }
+        }
+        if (oldestName) {
+          userAlerts.delete(oldestName);
+        }
+      }
+
+      const currentText = this.Builds.get(id).Text || '';
+      const textLines = currentText.split('\n');
+      
+      userAlerts.set(alertName, {
+        type: 'text',
+        data: { text },
+        expiry: now + duration,
+        textLineIndex: textLines.length,
+        position: {
+          lineIndex: textLines.length,
+          beforeTextLength: currentText.length
+        },
+        alertName
+      });
+
+      this.AlertStorage.set(id, userAlerts);
+      this.Builds.get(id)._hasAlerts = true;
+      
+      return alertName;
     }
-  }
 
-  // Get current position in the build output
-  const currentText = this.Builds.get(id).Text || '';
-  const textLines = currentText.split('\n');
-  
-  // Store the alert with its position
-  userAlerts.set(alertName, {
-    type: 'text',
-    data: { text },
-    expiry: now + duration,
-    // Store the line index where this text should appear
-    textLineIndex: textLines.length,
-    // Store surrounding context for position reconstruction
-    position: {
-      lineIndex: textLines.length,
-      // Store the text that was before this point
-      beforeTextLength: currentText.length
-    },
-    alertName
-  });
+    /**
+     * Add an alert button that persists through refreshes
+     * @param {string} id - User/build ID
+     * @param {string|Object} nameOrConfig - Button name or configuration object
+     * @param {Object} [config] - Button configuration
+     * @param {number} [config.duration] - Duration in ms (default from AlertConfig)
+     * @param {string} [config.alertId] - Custom alert ID for management
+     * @param {string} [config.name] - Button name
+     * @param {string} [config.path] - Navigation path
+     * @param {Object} [config.props] - Button props
+     * @param {boolean} [config.resetSelection] - Reset selection
+     * @param {number|boolean} [config.jumpTo] - Jump to index
+     * @param {Function} [config.action] - Button action
+     */
+    this.AlertButton = (id, nameOrConfig, config = {}) => {
+      if (!this.Builds.has(id)) {
+        if (this.Log) {
+          console.log(`this.AlertButton() Error - userBuild not found | BuildID: ${id}`);
+        }
+        return;
+      }
 
-  this.AlertStorage.set(id, userAlerts);
+      const duration = config.duration || this.AlertConfig.defaultDuration;
+      const alertId = config.alertId || `alert-btn-${Date.now()}-${Math.random()}`;
+      
+      const buttonConfig = { ...config };
+      delete buttonConfig.duration;
+      delete buttonConfig.alertId;
 
-  // DO NOT call this.Text here - we'll let ProcessAlerts handle positioning
-  // Instead, mark that we need to process alerts
-  this.Builds.get(id)._hasAlerts = true;
-  
-  return alertName;
-}
+      if (!this.AlertStorage.has(id)) {
+        this.AlertStorage.set(id, []);
+      }
 
+      const alerts = this.AlertStorage.get(id);
+      const now = Date.now();
+      const activeAlerts = alerts.filter(alert => alert.expiry > now);
+      
+      if (activeAlerts.length >= this.AlertConfig.maxAlerts) {
+        activeAlerts.shift();
+      }
 
-/**
- * Add an alert button that persists through refreshes
- * @param {string} id - User/build ID
- * @param {string|Object} nameOrConfig - Button name or configuration object
- * @param {Object} [config] - Button configuration
- * @param {number} [config.duration] - Duration in ms (default from AlertConfig)
- * @param {string} [config.alertId] - Custom alert ID for management
- * @param {string} [config.name] - Button name
- * @param {string} [config.path] - Navigation path
- * @param {Object} [config.props] - Button props
- * @param {boolean} [config.resetSelection] - Reset selection
- * @param {number|boolean} [config.jumpTo] - Jump to index
- * @param {Function} [config.action] - Button action
- */
-this.AlertButton = (id, nameOrConfig, config = {}) => {
-  if (!this.Builds.has(id)) {
-    if (this.Log) {
-      console.log(`this.AlertButton() Error - userBuild not found | BuildID: ${id}`);
+      const currentButtons = this.Builds.get(id).Buttons;
+      
+      const position = {
+        buttonIndex: currentButtons.length,
+        context: {
+          dropdownColor: this.Builds.get(id).dropdown_color,
+          dropdownSpacement: this.Builds.get(id).dropdown_spacement,
+          dropdownHorizontal: this.Builds.get(id).dropdown_horizontal,
+          droplevel: this.Builds.get(id).droplevel,
+          lastDropdownButton: this.Builds.get(id).last_dropdown_button
+        }
+      };
+
+      activeAlerts.push({
+        type: 'button',
+        data: {
+          nameOrConfig,
+          buttonConfig
+        },
+        expiry: now + duration,
+        position,
+        alertId
+      });
+
+      this.AlertStorage.set(id, activeAlerts);
+      this.Button(id, nameOrConfig, buttonConfig);
     }
-    return;
-  }
 
-  // Extract alert-specific config
-  const duration = config.duration || this.AlertConfig.defaultDuration;
-  const alertId = config.alertId || `alert-btn-${Date.now()}-${Math.random()}`;
-  
-  // Create button config without alert-specific properties
-  const buttonConfig = { ...config };
-  delete buttonConfig.duration;
-  delete buttonConfig.alertId;
-
-  // Store the alert
-  if (!this.AlertStorage.has(id)) {
-    this.AlertStorage.set(id, []);
-  }
-
-  const alerts = this.AlertStorage.get(id);
-  
-  // Clean expired alerts and check max
-  const now = Date.now();
-  const activeAlerts = alerts.filter(alert => alert.expiry > now);
-  
-  if (activeAlerts.length >= this.AlertConfig.maxAlerts) {
-    // Remove oldest alert
-    activeAlerts.shift();
-  }
-
-  // Get current position
-  const currentButtons = this.Builds.get(id).Buttons;
-  
-  // Calculate position for reinsertion
-  const position = {
-    buttonIndex: currentButtons.length,
-    // Store context for proper reinsertion
-    context: {
-      dropdownColor: this.Builds.get(id).dropdown_color,
-      dropdownSpacement: this.Builds.get(id).dropdown_spacement,
-      dropdownHorizontal: this.Builds.get(id).dropdown_horizontal,
-      droplevel: this.Builds.get(id).droplevel,
-      lastDropdownButton: this.Builds.get(id).last_dropdown_button
+    /**
+     * Simple string hashing for generating alert names
+     * @private
+     */
+    this._hashString = (str) => {
+      let hash = 0;
+      for (let i = 0; i < str.length; i++) {
+        const char = str.charCodeAt(i);
+        hash = ((hash << 5) - hash) + char;
+        hash = hash & hash; // Convert to 32bit integer
+      }
+      return Math.abs(hash).toString(36);
     }
-  };
 
-  // Add new alert
-  activeAlerts.push({
-    type: 'button',
-    data: {
-      nameOrConfig,
-      buttonConfig
-    },
-    expiry: now + duration,
-    position,
-    alertId
-  });
-
-  this.AlertStorage.set(id, activeAlerts);
-
-  // Still call the original Button method for immediate display
-  this.Button(id, nameOrConfig, buttonConfig);
-}
-
-/**
- * Simple string hashing for generating alert names
- * @private
- */
-this._hashString = (str) => {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    const char = str.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash = hash & hash; // Convert to 32bit integer
-  }
-  return Math.abs(hash).toString(36);
-}
-
-/**
- * Remove a specific alert by name
- * @param {string} id - User/build ID
- * @param {string} alertName - Alert name to remove
- */
-this.RemoveAlert = (id, alertName) => {
-  if (!this.AlertStorage.has(id)) return;
-  
-  const userAlerts = this.AlertStorage.get(id);
-  userAlerts.delete(alertName);
-  
-  if (userAlerts.size === 0) {
-    this.AlertStorage.delete(id);
-  }
-}
-
-/**
- * Clear all alerts for a user
- * @param {string} id - User/build ID
- */
-this.ClearAlerts = (id) => {
-  this.AlertStorage.delete(id);
-}
-
-/**
- * Process and insert alerts at their correct positions
- * This is called after the build function executes
- * @param {string} id - User/build ID
- */
-this.ProcessAlerts = (id) => {
-  if (!this.Builds.has(id) || !this.AlertStorage.has(id)) return;
-
-  const now = Date.now();
-  const userAlerts = this.AlertStorage.get(id);
-  
-  // Remove expired alerts
-  for (const [name, alert] of userAlerts) {
-    if (alert.expiry <= now) {
-      userAlerts.delete(name);
+    /**
+     * Remove a specific alert by name
+     * @param {string} id - User/build ID
+     * @param {string} alertName - Alert name to remove
+     */
+    this.RemoveAlert = (id, alertName) => {
+      if (!this.AlertStorage.has(id)) return;
+      
+      const userAlerts = this.AlertStorage.get(id);
+      userAlerts.delete(alertName);
+      
+      if (userAlerts.size === 0) {
+        this.AlertStorage.delete(id);
+      }
     }
-  }
 
-  if (userAlerts.size === 0) {
-    this.AlertStorage.delete(id);
-    return;
-  }
+    /**
+     * Clear all alerts for a user
+     * @param {string} id - User/build ID
+     */
+    this.ClearAlerts = (id) => {
+      this.AlertStorage.delete(id);
+    }
 
-  // Get current text
-  const currentText = this.Builds.get(id).Text || '';
-  const currentLines = currentText.split('\n');
-  
-  // Get all text alerts sorted by their original line index
-  const textAlerts = Array.from(userAlerts.values())
-    .filter(a => a.type === 'text')
-    .sort((a, b) => a.position.lineIndex - b.position.lineIndex);
+    /**
+     * Process and insert alerts at their correct positions
+     * This is called after the build function executes
+     * @param {string} id - User/build ID
+     */
+    this.ProcessAlerts = (id) => {
+      if (!this.Builds.has(id) || !this.AlertStorage.has(id)) return;
 
-  if (textAlerts.length === 0) return;
+      const now = Date.now();
+      const userAlerts = this.AlertStorage.get(id);
+      
+      for (const [name, alert] of userAlerts) {
+        if (alert.expiry <= now) {
+          userAlerts.delete(name);
+        }
+      }
 
-  // Build the final text by inserting alerts at their correct positions
-  const finalLines = [];
-  let alertIndex = 0;
-  let currentAlert = textAlerts[alertIndex];
-  
-  // If there are no current lines (first build), just add alerts
-  if (currentLines.length === 0 || (currentLines.length === 1 && currentLines[0] === '')) {
-    textAlerts.forEach(alert => {
-      finalLines.push(alert.data.text);
-    });
-  } else {
-    // Reconstruct text with alerts in their original positions
-    for (let i = 0; i < currentLines.length; i++) {
-      // Insert any alerts that should appear before this line
-      while (currentAlert && currentAlert.position.lineIndex <= i) {
-        finalLines.push(currentAlert.data.text);
-        alertIndex++;
-        currentAlert = textAlerts[alertIndex];
+      if (userAlerts.size === 0) {
+        this.AlertStorage.delete(id);
+        return;
+      }
+
+      const currentText = this.Builds.get(id).Text || '';
+      const currentLines = currentText.split('\n');
+      
+      const textAlerts = Array.from(userAlerts.values())
+        .filter(a => a.type === 'text')
+        .sort((a, b) => a.position.lineIndex - b.position.lineIndex);
+
+      if (textAlerts.length === 0) return;
+
+      const finalLines = [];
+      let alertIndex = 0;
+      let currentAlert = textAlerts[alertIndex];
+      
+      if (currentLines.length === 0 || (currentLines.length === 1 && currentLines[0] === '')) {
+        textAlerts.forEach(alert => {
+          finalLines.push(alert.data.text);
+        });
+      } else {
+        for (let i = 0; i < currentLines.length; i++) {
+          while (currentAlert && currentAlert.position.lineIndex <= i) {
+            finalLines.push(currentAlert.data.text);
+            alertIndex++;
+            currentAlert = textAlerts[alertIndex];
+          }
+          
+          const isAlertText = textAlerts.some(alert => alert.data.text === currentLines[i]);
+          if (!isAlertText) {
+            finalLines.push(currentLines[i]);
+          }
+        }
+        
+        while (currentAlert) {
+          finalLines.push(currentAlert.data.text);
+          alertIndex++;
+          currentAlert = textAlerts[alertIndex];
+        }
+      }
+
+      this.Builds.get(id).Text = finalLines.join('\n');
+      
+      textAlerts.forEach((alert, index) => {
+        alert.position.lineIndex = finalLines.indexOf(alert.data.text);
+      });
+    }
+
+    // --------------------------- File Browser (unchanged) ---------------------------
+
+    /**
+     * File browser with recursive dropdown navigation and pagination
+     * @param {string} id - User/build ID
+     * @param {Object} config - File browser configuration
+     * @param {string} [config.name='fileBrowser'] - Unique name for this file browser instance
+     * @param {string} [config.startPath] - Starting directory path (default: OS root)
+     * @param {string} [config.displayName] - Custom display name for the browser button (default: 'Browse: {current folder}')
+     * @param {boolean} [config.multiple=true] - Allow multiple file selection
+     * @param {boolean} [config.showMessages=false] - Show status messages via Text/Alert
+     * @param {number} [config.itemsPerPage=5] - Items per page in dropdown
+     * @param {Function} [config.filter] - Filter function for files/dirs: (itemPath, isDir) => boolean
+     * @param {Object} [config.icons] - Custom icons
+     * @param {string} [config.icons.folder='📁'] - Folder icon
+     * @param {string} [config.icons.file='📄'] - File icon
+     * @param {string} [config.icons.selected='✅'] - Selected indicator
+     * @param {string} [config.icons.openFolder='📂'] - Open folder icon
+     * @param {string} [config.icons.back='⬆️'] - Back navigation icon
+     * @param {string} [config.icons.error='❌'] - Error icon
+     * @param {string} [config.icons.clear='🗑️'] - Clear selection icon
+     * @returns {Array<string>} Array of selected file paths
+     */
+    this.File = async (id, config = {}) => {
+      // Default configuration
+      const defaultConfig = {
+        name: 'fileBrowser',
+        startPath: os.platform() === 'win32' ? process.cwd().split(path.sep)[0] + path.sep : '/',
+        displayName: null, // null means auto-generate from current path
+        multiple: true,
+        showMessages: false,
+        itemsPerPage: 5,
+        filter: null,
+        icons: {
+          folder: '📁',
+          file: '📄',
+          selected: '✅',
+          openFolder: '📂',
+          back: '⬆️',
+          error: '❌',
+          clear: '🗑️'
+        }
+      };
+
+      const finalConfig = { ...defaultConfig, ...config };
+      finalConfig.icons = { ...defaultConfig.icons, ...(config.icons || {}) };
+
+      const instanceName = finalConfig.name;
+      const storageKey = `fileBrowser_${instanceName}`;
+      
+      if (!this.Storages.Has(id, storageKey)) {
+        this.Storages.Set(id, storageKey, {
+          instanceName: instanceName,
+          displayName: finalConfig.displayName,
+          selectedFiles: [],
+          currentPath: finalConfig.startPath,
+          currentPage: 0,
+          totalPages: 1
+        });
+      }
+
+      const storage = this.Storages.Get(id, storageKey);
+      
+      if (finalConfig.displayName !== undefined && storage.displayName !== finalConfig.displayName) {
+        storage.displayName = finalConfig.displayName;
+        this.Storages.Set(id, storageKey, storage);
       }
       
-      // Add the current line (skip if it's an alert text that's already added)
-      const isAlertText = textAlerts.some(alert => alert.data.text === currentLines[i]);
-      if (!isAlertText) {
-        finalLines.push(currentLines[i]);
+      const currentProps = this.Builds.get(id).Session.ActualProps || {};
+      
+      const navigateProp = `${storageKey}_navigate`;
+      if (currentProps[navigateProp]) {
+        storage.currentPath = currentProps[navigateProp];
+        storage.currentPage = 0;
+        this.Storages.Set(id, storageKey, storage);
+        delete this.Builds.get(id).Session.ActualProps[navigateProp];
       }
-    }
-    
-    // Add any remaining alerts that should appear after all current lines
-    while (currentAlert) {
-      finalLines.push(currentAlert.data.text);
-      alertIndex++;
-      currentAlert = textAlerts[alertIndex];
-    }
-  }
 
-  // Update the build text
-  this.Builds.get(id).Text = finalLines.join('\n');
-  
-  // Update alert positions for next refresh
-  textAlerts.forEach((alert, index) => {
-    alert.position.lineIndex = finalLines.indexOf(alert.data.text);
-  });
-}
+      const selectProp = `${storageKey}_select`;
+      if (currentProps[selectProp]) {
+        const selectedPath = currentProps[selectProp];
+        
+        if (storage.selectedFiles.includes(selectedPath)) {
+          storage.selectedFiles = storage.selectedFiles.filter(f => f !== selectedPath);
+        } else {
+          if (finalConfig.multiple) {
+            storage.selectedFiles.push(selectedPath);
+          } else {
+            storage.selectedFiles = [selectedPath];
+          }
+        }
+        
+        this.Storages.Set(id, storageKey, storage);
+        delete this.Builds.get(id).Session.ActualProps[selectProp];
+      }
 
+      const pageProp = `${storageKey}_page`;
+      if (currentProps[pageProp] !== undefined) {
+        const newPage = parseInt(currentProps[pageProp]);
+        if (!isNaN(newPage) && newPage >= 0) {
+          storage.currentPage = newPage;
+        }
+        this.Storages.Set(id, storageKey, storage);
+        delete this.Builds.get(id).Session.ActualProps[pageProp];
+      }
+
+      const clearProp = `${storageKey}_clear`;
+      if (currentProps[clearProp]) {
+        storage.selectedFiles = [];
+        storage.currentPage = 0;
+        this.Storages.Set(id, storageKey, storage);
+        delete this.Builds.get(id).Session.ActualProps[clearProp];
+      }
+
+      const currentPath = storage.currentPath;
+      
+      const getDisplayName = () => {
+        if (storage.displayName) {
+          return storage.displayName;
+        } else {
+          const folderName = path.basename(currentPath) || currentPath;
+          return `Browse: ${folderName}`;
+        }
+      };
+      
+      const getOpenDisplayName = () => {
+        if (storage.displayName) {
+          return storage.displayName;
+        } else {
+          const folderName = path.basename(currentPath) || currentPath;
+          return `${folderName}`;
+        }
+      };
+      
+      if (finalConfig.showMessages) {
+        this.Text(id, `${finalConfig.icons.openFolder} ${currentPath}`);
+        if (storage.selectedFiles.length > 0) {
+          this.Text(id, `${finalConfig.icons.selected} ${storage.selectedFiles.length} file(s) selected`);
+        }
+      }
+
+      try {
+        const allItems = fs.readdirSync(currentPath, { withFileTypes: true });
+        
+        const items = [];
+        
+        const parentPath = path.dirname(currentPath);
+        if (currentPath !== parentPath) {
+          items.push({
+            name: '..',
+            path: parentPath,
+            isDirectory: true,
+            isParent: true
+          });
+        }
+        
+        for (const item of allItems) {
+          const itemPath = path.join(currentPath, item.name);
+          
+          if (finalConfig.filter && !finalConfig.filter(itemPath, item.isDirectory())) {
+            continue;
+          }
+          
+          try {
+            if (item.isDirectory()) {
+              items.push({
+                name: item.name,
+                path: itemPath,
+                isDirectory: true,
+                isParent: false
+              });
+            } else if (item.isFile()) {
+              items.push({
+                name: item.name,
+                path: itemPath,
+                isDirectory: false,
+                isParent: false
+              });
+            }
+          } catch (error) {
+            continue;
+          }
+        }
+        
+        const parentItems = items.filter(i => i.isParent);
+        const directories = items.filter(i => i.isDirectory && !i.isParent).sort((a, b) => a.name.localeCompare(b.name));
+        const files = items.filter(i => !i.isDirectory).sort((a, b) => a.name.localeCompare(b.name));
+        const sortedItems = [...parentItems, ...directories, ...files];
+        
+        const totalPages = Math.max(1, Math.ceil(sortedItems.length / finalConfig.itemsPerPage));
+        storage.totalPages = totalPages;
+        
+        if (storage.currentPage >= totalPages) {
+          storage.currentPage = 0;
+        }
+        if (storage.currentPage < 0) {
+          storage.currentPage = totalPages - 1;
+        }
+        
+        const currentPage = storage.currentPage;
+        const startIdx = currentPage * finalConfig.itemsPerPage;
+        const endIdx = Math.min(startIdx + finalConfig.itemsPerPage, sortedItems.length);
+        const pageItems = sortedItems.slice(startIdx, endIdx);
+        
+        this.Storages.Set(id, storageKey, storage);
+        
+        const baseDisplayName = getDisplayName();
+        
+        let closedButtonText = `${finalConfig.icons.folder} ${baseDisplayName}`;
+        
+        if (storage.selectedFiles.length > 0) {
+          closedButtonText += ` (${storage.selectedFiles.length} selected)`;
+        }
+        
+        const openDisplayName = getOpenDisplayName();
+        let openButtonText = `${finalConfig.icons.openFolder} Hide ${openDisplayName}`;
+        if (totalPages > 1) {
+          openButtonText += ` [Page ${currentPage + 1}/${totalPages}]`;
+        }
+        if (storage.selectedFiles.length > 0) {
+          openButtonText += ` (${storage.selectedFiles.length} selected)`;
+        }
+        
+        const dropdownName = `${storageKey}_browser`;
+        
+        await this.DropDown(id, dropdownName, async () => {
+          for (const item of pageItems) {
+            if (item.isDirectory) {
+              const hasSelectedContent = storage.selectedFiles.some(f => f.startsWith(item.path + path.sep));
+              
+              let icon = item.isParent ? finalConfig.icons.back : 
+                       (hasSelectedContent ? finalConfig.icons.selected : finalConfig.icons.folder);
+              
+              this.Button(id, {
+                name: `${icon} ${item.name}${hasSelectedContent && !item.isParent ? ' (has selected)' : ''}`,
+                path: this.Name,
+                props: { 
+                  [navigateProp]: item.path,
+                  page: currentProps.page 
+                }
+              });
+            } else {
+              const isSelected = storage.selectedFiles.includes(item.path);
+              const icon = isSelected ? finalConfig.icons.selected : finalConfig.icons.file;
+              
+              this.Button(id, {
+                name: `${icon} ${item.name}`,
+                path: this.Name,
+                props: { 
+                  [selectProp]: item.path,
+                  page: currentProps.page 
+                }
+              });
+            }
+          }
+          
+          if (totalPages > 1 || storage.selectedFiles.length > 0) {
+            this.Button(id, { name: ' ' });
+            
+            const controlButtons = [];
+            
+            if (totalPages > 1) {
+              controlButtons.push({
+                name: `◀ Prev`,
+                path: this.Name,
+                props: { 
+                  [pageProp]: currentPage > 0 ? currentPage - 1 : totalPages - 1,
+                  page: currentProps.page 
+                }
+              });
+            }
+            
+            if (totalPages > 1) {
+              controlButtons.push({
+                name: `Next ▶`,
+                path: this.Name,
+                props: { 
+                  [pageProp]: currentPage < totalPages - 1 ? currentPage + 1 : 0,
+                  page: currentProps.page 
+                }
+              });
+            }
+            
+            if (storage.selectedFiles.length > 0) {
+              controlButtons.push({
+                name: `${finalConfig.icons.clear} Clear (${storage.selectedFiles.length})`,
+                path: this.Name,
+                props: { 
+                  [clearProp]: true,
+                  page: currentProps.page 
+                }
+              });
+            }
+            
+            if (controlButtons.length > 0) {
+              this.Buttons(id, controlButtons);
+            }
+          }
+          
+          if (sortedItems.length === 0) {
+            this.Button(id, {
+              name: '(empty directory)',
+              path: this.Name,
+              props: {}
+            });
+          }
+          
+        }, {
+          up_buttontext: closedButtonText,
+          down_buttontext: openButtonText,
+          down_emoji: '▼',
+          up_emoji: '▶'
+        });
+        
+        if (finalConfig.showMessages && storage.selectedFiles.length > 0) {
+          this.Text(id, '');
+          this.Text(id, '📋 Selected Files:');
+          storage.selectedFiles.forEach((filePath, index) => {
+            const relativePath = path.relative(finalConfig.startPath, filePath);
+            this.Text(id, `  ${index + 1}. ${relativePath}`);
+          });
+        }
+      } catch (error) {
+        if (finalConfig.showMessages) {
+          this.Alert(id, `Error reading directory: ${error.message}`, { duration: 3000 });
+        }
+        
+        const baseDisplayName = getDisplayName();
+        let errorClosedText = `${finalConfig.icons.error} Error: ${baseDisplayName}`;
+        let errorOpenText = `${finalConfig.icons.error} Hide Error`;
+        
+        const dropdownName = `${storageKey}_browser`;
+        await this.DropDown(id, dropdownName, async () => {
+          this.Text(id, `${finalConfig.icons.error} Error reading directory:`);
+          this.Text(id, error.message);
+          
+          const parentPath = path.dirname(currentPath);
+          if (currentPath !== parentPath) {
+            this.Button(id, {
+              name: `${finalConfig.icons.back} Go back to parent`,
+              path: this.Name,
+              props: { 
+                [navigateProp]: parentPath,
+                page: currentProps.page 
+              }
+            });
+          }
+        }, {
+          up_buttontext: errorClosedText,
+          down_buttontext: errorOpenText,
+          up_emoji: '▶'
+        });
+      }
+
+      return storage.selectedFiles;
+    };
+
+    /**
+     * File manager methods for managing file selections
+     * @namespace
+     */
+    this.FileManager = {
+      /**
+       * Get selected files array
+       * @param {string} id - User/build ID
+       * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
+       * @returns {Array<string>} Array of selected file paths
+       */
+      GetSelected: (id, instanceName = 'fileBrowser') => {
+        const storageKey = `fileBrowser_${instanceName}`;
+        const storage = this.Storages.Get(id, storageKey);
+        return storage?.selectedFiles || [];
+      },
+
+      /**
+       * Clear all selected files
+       * @param {string} id - User/build ID
+       * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
+       */
+      ClearSelection: (id, instanceName = 'fileBrowser') => {
+        const storageKey = `fileBrowser_${instanceName}`;
+        const storage = this.Storages.Get(id, storageKey);
+        if (storage) {
+          storage.selectedFiles = [];
+          storage.currentPage = 0;
+          this.Storages.Set(id, storageKey, storage);
+        }
+      },
+
+      /**
+       * Remove a specific file from selection
+       * @param {string} id - User/build ID
+       * @param {string} filePath - File path to remove from selection
+       * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
+       */
+      RemoveFile: (id, filePath, instanceName = 'fileBrowser') => {
+        const storageKey = `fileBrowser_${instanceName}`;
+        const storage = this.Storages.Get(id, storageKey);
+        if (storage) {
+          storage.selectedFiles = storage.selectedFiles.filter(f => f !== filePath);
+        }
+      },
+
+      /**
+       * Set a specific file as the only selected file (clears others)
+       * @param {string} id - User/build ID
+       * @param {string} filePath - File path to set as selected
+       * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
+       */
+      SetFile: (id, filePath, instanceName = 'fileBrowser') => {
+        const storageKey = `fileBrowser_${instanceName}`;
+        const storage = this.Storages.Get(id, storageKey);
+        if (storage) {
+          storage.selectedFiles = [filePath];
+        }
+      },
+
+      /**
+       * Add a file to selection without clearing others
+       * @param {string} id - User/build ID
+       * @param {string} filePath - File path to add to selection
+       * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
+       */
+      AddFile: (id, filePath, instanceName = 'fileBrowser') => {
+        const storageKey = `fileBrowser_${instanceName}`;
+        const storage = this.Storages.Get(id, storageKey);
+        if (storage && !storage.selectedFiles.includes(filePath)) {
+          storage.selectedFiles.push(filePath);
+        }
+      },
+
+      /**
+       * Check if a specific file is selected
+       * @param {string} id - User/build ID
+       * @param {string} filePath - File path to check
+       * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
+       * @returns {boolean} Whether the file is selected
+       */
+      IsSelected: (id, filePath, instanceName = 'fileBrowser') => {
+        const storageKey = `fileBrowser_${instanceName}`;
+        const storage = this.Storages.Get(id, storageKey);
+        return storage?.selectedFiles?.includes(filePath) || false;
+      },
+
+      /**
+       * Get current browsing path
+       * @param {string} id - User/build ID
+       * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
+       * @returns {string} Current directory path being browsed
+       */
+      GetCurrentPath: (id, instanceName = 'fileBrowser') => {
+        const storageKey = `fileBrowser_${instanceName}`;
+        const storage = this.Storages.Get(id, storageKey);
+        return storage?.currentPath || '';
+      },
+
+      /**
+       * Get selection count
+       * @param {string} id - User/build ID
+       * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
+       * @returns {number} Number of selected files
+       */
+      GetCount: (id, instanceName = 'fileBrowser') => {
+        const storageKey = `fileBrowser_${instanceName}`;
+        const storage = this.Storages.Get(id, storageKey);
+        return storage?.selectedFiles?.length || 0;
+      },
+
+      /**
+       * Get current page number (0-based)
+       * @param {string} id - User/build ID
+       * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
+       * @returns {number} Current page number
+       */
+      GetCurrentPage: (id, instanceName = 'fileBrowser') => {
+        const storageKey = `fileBrowser_${instanceName}`;
+        const storage = this.Storages.Get(id, storageKey);
+        return storage?.currentPage || 0;
+      },
+
+      /**
+       * Reset file browser to initial state (clears everything)
+       * @param {string} id - User/build ID
+       * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
+       */
+      Reset: (id, instanceName = 'fileBrowser') => {
+        const storageKey = `fileBrowser_${instanceName}`;
+        this.Storages.Delete(id, storageKey);
+      },
+
+      /**
+       * Get selected files with relative paths
+       * @param {string} id - User/build ID
+       * @param {string} [basePath] - Base path for relative paths (default: startPath from storage)
+       * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
+       * @returns {Array<string>} Array of relative file paths
+       */
+      GetSelectedRelative: (id, basePath = null, instanceName = 'fileBrowser') => {
+        const storageKey = `fileBrowser_${instanceName}`;
+        const storage = this.Storages.Get(id, storageKey);
+        if (!storage || storage.selectedFiles.length === 0) return [];
+        
+        const base = basePath || storage.startPath || '/';
+        return storage.selectedFiles.map(filePath => path.relative(base, filePath));
+      },
+
+      /**
+       * Update the display name of a file browser instance
+       * @param {string} id - User/build ID
+       * @param {string} displayName - New display name
+       * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
+       */
+      SetDisplayName: (id, displayName, instanceName = 'fileBrowser') => {
+        const storageKey = `fileBrowser_${instanceName}`;
+        const storage = this.Storages.Get(id, storageKey);
+        if (storage) {
+          storage.displayName = displayName;
+          this.Storages.Set(id, storageKey, storage);
+        }
+      },
+
+      /**
+       * Get the display name of a file browser instance
+       * @param {string} id - User/build ID
+       * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
+       * @returns {string} Current display name
+       */
+      GetDisplayName: (id, instanceName = 'fileBrowser') => {
+        const storageKey = `fileBrowser_${instanceName}`;
+        const storage = this.Storages.Get(id, storageKey);
+        return storage?.displayName || `Browse: ${path.basename(storage?.currentPath || '')}`;
+      }
+    };
 
     // --------------------------- GotoNow Method ---------------------------
 
@@ -4100,577 +5172,6 @@ this.ProcessAlerts = (id) => {
 
       return true;
     };
-    
-  
-/**
- * File browser with recursive dropdown navigation and pagination
- * @param {string} id - User/build ID
- * @param {Object} config - File browser configuration
- * @param {string} [config.name='fileBrowser'] - Unique name for this file browser instance
- * @param {string} [config.startPath] - Starting directory path (default: OS root)
- * @param {string} [config.displayName] - Custom display name for the browser button (default: 'Browse: {current folder}')
- * @param {boolean} [config.multiple=true] - Allow multiple file selection
- * @param {boolean} [config.showMessages=false] - Show status messages via Text/Alert
- * @param {number} [config.itemsPerPage=5] - Items per page in dropdown
- * @param {Function} [config.filter] - Filter function for files/dirs: (itemPath, isDir) => boolean
- * @param {Object} [config.icons] - Custom icons
- * @param {string} [config.icons.folder='📁'] - Folder icon
- * @param {string} [config.icons.file='📄'] - File icon
- * @param {string} [config.icons.selected='✅'] - Selected indicator
- * @param {string} [config.icons.openFolder='📂'] - Open folder icon
- * @param {string} [config.icons.back='⬆️'] - Back navigation icon
- * @param {string} [config.icons.error='❌'] - Error icon
- * @param {string} [config.icons.clear='🗑️'] - Clear selection icon
- * @returns {Array<string>} Array of selected file paths
- */
-this.File = async (id, config = {}) => {
-  // Default configuration
-  const defaultConfig = {
-    name: 'fileBrowser',
-    startPath: os.platform() === 'win32' ? process.cwd().split(path.sep)[0] + path.sep : '/',
-    displayName: null, // null means auto-generate from current path
-    multiple: true,
-    showMessages: false,
-    itemsPerPage: 5,
-    filter: null,
-    icons: {
-      folder: '📁',
-      file: '📄',
-      selected: '✅',
-      openFolder: '📂',
-      back: '⬆️',
-      error: '❌',
-      clear: '🗑️'
-    }
-  };
-
-  const finalConfig = { ...defaultConfig, ...config };
-  finalConfig.icons = { ...defaultConfig.icons, ...(config.icons || {}) };
-
-  const instanceName = finalConfig.name;
-  const storageKey = `fileBrowser_${instanceName}`;
-  
-  // Initialize storage if needed
-  if (!this.Storages.Has(id, storageKey)) {
-    this.Storages.Set(id, storageKey, {
-      instanceName: instanceName,
-      displayName: finalConfig.displayName, // Store the custom display name
-      selectedFiles: [],
-      currentPath: finalConfig.startPath,
-      currentPage: 0,
-      totalPages: 1
-    });
-  }
-
-  const storage = this.Storages.Get(id, storageKey);
-  
-  // Update display name if it was provided in config
-  if (finalConfig.displayName !== undefined && storage.displayName !== finalConfig.displayName) {
-    storage.displayName = finalConfig.displayName;
-    this.Storages.Set(id, storageKey, storage);
-  }
-  
-  // Get current props from session
-  const currentProps = this.Builds.get(id).Session.ActualProps || {};
-  
-  // Handle navigation
-  const navigateProp = `${storageKey}_navigate`;
-  if (currentProps[navigateProp]) {
-    storage.currentPath = currentProps[navigateProp];
-    storage.currentPage = 0; // Reset page on navigation
-    this.Storages.Set(id, storageKey, storage);
-    delete this.Builds.get(id).Session.ActualProps[navigateProp];
-  }
-
-  // Handle file selection
-  const selectProp = `${storageKey}_select`;
-  if (currentProps[selectProp]) {
-    const selectedPath = currentProps[selectProp];
-    
-    if (storage.selectedFiles.includes(selectedPath)) {
-      // Deselect
-      storage.selectedFiles = storage.selectedFiles.filter(f => f !== selectedPath);
-    } else {
-      // Select
-      if (finalConfig.multiple) {
-        storage.selectedFiles.push(selectedPath);
-      } else {
-        storage.selectedFiles = [selectedPath];
-      }
-    }
-    
-    this.Storages.Set(id, storageKey, storage);
-    delete this.Builds.get(id).Session.ActualProps[selectProp];
-  }
-
-  // Handle pagination
-  const pageProp = `${storageKey}_page`;
-  if (currentProps[pageProp] !== undefined) {
-    const newPage = parseInt(currentProps[pageProp]);
-    if (!isNaN(newPage) && newPage >= 0) {
-      storage.currentPage = newPage;
-    }
-    this.Storages.Set(id, storageKey, storage);
-    delete this.Builds.get(id).Session.ActualProps[pageProp];
-  }
-
-  // Handle clear selection
-  const clearProp = `${storageKey}_clear`;
-  if (currentProps[clearProp]) {
-    storage.selectedFiles = [];
-    storage.currentPage = 0;
-    this.Storages.Set(id, storageKey, storage);
-    delete this.Builds.get(id).Session.ActualProps[clearProp];
-  }
-
-  const currentPath = storage.currentPath;
-  
-  // Generate display name for the browser button
-  const getDisplayName = () => {
-    if (storage.displayName) {
-      // Use custom display name
-      return storage.displayName;
-    } else {
-      // Auto-generate from current path
-      const folderName = path.basename(currentPath) || currentPath;
-      return `Browse: ${folderName}`;
-    }
-  };
-  
-  const getOpenDisplayName = () => {
-    if (storage.displayName) {
-      return storage.displayName;
-    } else {
-      const folderName = path.basename(currentPath) || currentPath;
-      return `${folderName}`;
-    }
-  };
-  
-  // Show current path header (only if messages enabled)
-  if (finalConfig.showMessages) {
-    this.Text(id, `${finalConfig.icons.openFolder} ${currentPath}`);
-    if (storage.selectedFiles.length > 0) {
-      this.Text(id, `${finalConfig.icons.selected} ${storage.selectedFiles.length} file(s) selected`);
-    }
-  }
-
-  // Read directory
-  try {
-    const allItems = fs.readdirSync(currentPath, { withFileTypes: true });
-    
-    // Process items
-    const items = [];
-    
-    // Add parent directory if not at root
-    const parentPath = path.dirname(currentPath);
-    if (currentPath !== parentPath) {
-      items.push({
-        name: '..',
-        path: parentPath,
-        isDirectory: true,
-        isParent: true
-      });
-    }
-    
-    for (const item of allItems) {
-      const itemPath = path.join(currentPath, item.name);
-      
-      // Apply filter if provided
-      if (finalConfig.filter && !finalConfig.filter(itemPath, item.isDirectory())) {
-        continue;
-      }
-      
-      try {
-        if (item.isDirectory()) {
-          items.push({
-            name: item.name,
-            path: itemPath,
-            isDirectory: true,
-            isParent: false
-          });
-        } else if (item.isFile()) {
-          items.push({
-            name: item.name,
-            path: itemPath,
-            isDirectory: false,
-            isParent: false
-          });
-        }
-      } catch (error) {
-        // Skip inaccessible items
-        continue;
-      }
-    }
-    
-    // Sort: directories first (except parent), then files, all alphabetically
-    const parentItems = items.filter(i => i.isParent);
-    const directories = items.filter(i => i.isDirectory && !i.isParent).sort((a, b) => a.name.localeCompare(b.name));
-    const files = items.filter(i => !i.isDirectory).sort((a, b) => a.name.localeCompare(b.name));
-    const sortedItems = [...parentItems, ...directories, ...files];
-    
-    // Calculate pagination
-    const totalPages = Math.max(1, Math.ceil(sortedItems.length / finalConfig.itemsPerPage));
-    storage.totalPages = totalPages;
-    
-    // Validate and adjust current page
-    if (storage.currentPage >= totalPages) {
-      storage.currentPage = 0;
-    }
-    if (storage.currentPage < 0) {
-      storage.currentPage = totalPages - 1;
-    }
-    
-    const currentPage = storage.currentPage;
-    const startIdx = currentPage * finalConfig.itemsPerPage;
-    const endIdx = Math.min(startIdx + finalConfig.itemsPerPage, sortedItems.length);
-    const pageItems = sortedItems.slice(startIdx, endIdx);
-    
-    // Update storage with validated page
-    this.Storages.Set(id, storageKey, storage);
-    
-    // Build button texts with customizable display name
-    const baseDisplayName = getDisplayName();
-    
-    // Closed dropdown button
-    let closedButtonText = `${finalConfig.icons.folder} ${baseDisplayName}`;
-    
-    // Add selection count if any
-    if (storage.selectedFiles.length > 0) {
-      closedButtonText += ` (${storage.selectedFiles.length} selected)`;
-    }
-    
-    // Open dropdown button
-    const openDisplayName = getOpenDisplayName();
-    let openButtonText = `${finalConfig.icons.openFolder} Hide ${openDisplayName}`;
-    if (totalPages > 1) {
-      openButtonText += ` [Page ${currentPage + 1}/${totalPages}]`;
-    }
-    if (storage.selectedFiles.length > 0) {
-      openButtonText += ` (${storage.selectedFiles.length} selected)`;
-    }
-    
-    // Create dropdown with all items
-    const dropdownName = `${storageKey}_browser`;
-    
-    await this.DropDown(id, dropdownName, async () => {
-      // Display items for current page
-      for (const item of pageItems) {
-        if (item.isDirectory) {
-          const hasSelectedContent = storage.selectedFiles.some(f => f.startsWith(item.path + path.sep));
-          
-          let icon = item.isParent ? finalConfig.icons.back : 
-                   (hasSelectedContent ? finalConfig.icons.selected : finalConfig.icons.folder);
-          
-          this.Button(id, {
-            name: `${icon} ${item.name}${hasSelectedContent && !item.isParent ? ' (has selected)' : ''}`,
-            path: this.Name,
-            props: { 
-              [navigateProp]: item.path,
-              page: currentProps.page 
-            }
-          });
-        } else {
-          const isSelected = storage.selectedFiles.includes(item.path);
-          const icon = isSelected ? finalConfig.icons.selected : finalConfig.icons.file;
-          
-          this.Button(id, {
-            name: `${icon} ${item.name}`,
-            path: this.Name,
-            props: { 
-              [selectProp]: item.path,
-              page: currentProps.page 
-            }
-          });
-        }
-      }
-      
-      // Navigation and controls
-      if (totalPages > 1 || storage.selectedFiles.length > 0) {
-        this.Button(id, { name: ' ' }); // Spacer
-        
-        const controlButtons = [];
-        
-        // Prev button
-        if (totalPages > 1) {
-          controlButtons.push({
-            name: `◀ Prev`,
-            path: this.Name,
-            props: { 
-              [pageProp]: currentPage > 0 ? currentPage - 1 : totalPages - 1,
-              page: currentProps.page 
-            }
-          });
-        }
-        
-        // Next button
-        if (totalPages > 1) {
-          controlButtons.push({
-            name: `Next ▶`,
-            path: this.Name,
-            props: { 
-              [pageProp]: currentPage < totalPages - 1 ? currentPage + 1 : 0,
-              page: currentProps.page 
-            }
-          });
-        }
-        
-        // Clear selection button
-        if (storage.selectedFiles.length > 0) {
-          controlButtons.push({
-            name: `${finalConfig.icons.clear} Clear (${storage.selectedFiles.length})`,
-            path: this.Name,
-            props: { 
-              [clearProp]: true,
-              page: currentProps.page 
-            }
-          });
-        }
-        
-        if (controlButtons.length > 0) {
-          this.Buttons(id, controlButtons);
-        }
-      }
-      
-      // Empty directory message
-      if (sortedItems.length === 0) {
-        this.Button(id, {
-          name: '(empty directory)',
-          path: this.Name,
-          props: {}
-        });
-      }
-      
-    }, {
-      up_buttontext: closedButtonText,
-      down_buttontext: openButtonText,
-      down_emoji: '▼',
-      up_emoji: '▶'
-    });
-    
-    // Show selected files summary if messages enabled
-    if (finalConfig.showMessages && storage.selectedFiles.length > 0) {
-      this.Text(id, '');
-      this.Text(id, '📋 Selected Files:');
-      storage.selectedFiles.forEach((filePath, index) => {
-        const relativePath = path.relative(finalConfig.startPath, filePath);
-        this.Text(id, `  ${index + 1}. ${relativePath}`);
-      });
-    }
-
-  } catch (error) {
-    if (finalConfig.showMessages) {
-      this.Alert(id, `Error reading directory: ${error.message}`, { duration: 3000 });
-    }
-    
-    const baseDisplayName = getDisplayName();
-    let errorClosedText = `${finalConfig.icons.error} Error: ${baseDisplayName}`;
-    let errorOpenText = `${finalConfig.icons.error} Hide Error`;
-    
-    const dropdownName = `${storageKey}_browser`;
-    await this.DropDown(id, dropdownName, async () => {
-      this.Text(id, `${finalConfig.icons.error} Error reading directory:`);
-      this.Text(id, error.message);
-      
-      const parentPath = path.dirname(currentPath);
-      if (currentPath !== parentPath) {
-        this.Button(id, {
-          name: `${finalConfig.icons.back} Go back to parent`,
-          path: this.Name,
-          props: { 
-            [navigateProp]: parentPath,
-            page: currentProps.page 
-          }
-        });
-      }
-    }, {
-      up_buttontext: errorClosedText,
-      down_buttontext: errorOpenText,
-      up_emoji: '▶'
-    });
-  }
-
-  return storage.selectedFiles;
-};
-
-/**
- * File manager methods for managing file selections
- * @namespace
- */
-this.FileManager = {
-  /**
-   * Get selected files array
-   * @param {string} id - User/build ID
-   * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
-   * @returns {Array<string>} Array of selected file paths
-   */
-  GetSelected: (id, instanceName = 'fileBrowser') => {
-    const storageKey = `fileBrowser_${instanceName}`;
-    const storage = this.Storages.Get(id, storageKey);
-    return storage?.selectedFiles || [];
-  },
-
-  /**
-   * Clear all selected files
-   * @param {string} id - User/build ID
-   * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
-   */
-  ClearSelection: (id, instanceName = 'fileBrowser') => {
-    const storageKey = `fileBrowser_${instanceName}`;
-    const storage = this.Storages.Get(id, storageKey);
-    if (storage) {
-      storage.selectedFiles = [];
-      storage.currentPage = 0;
-      this.Storages.Set(id, storageKey, storage);
-    }
-  },
-
-  /**
-   * Remove a specific file from selection
-   * @param {string} id - User/build ID
-   * @param {string} filePath - File path to remove from selection
-   * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
-   */
-  RemoveFile: (id, filePath, instanceName = 'fileBrowser') => {
-    const storageKey = `fileBrowser_${instanceName}`;
-    const storage = this.Storages.Get(id, storageKey);
-    if (storage) {
-      storage.selectedFiles = storage.selectedFiles.filter(f => f !== filePath);
-      this.Storages.Set(id, storageKey, storage);
-    }
-  },
-
-  /**
-   * Set a specific file as the only selected file (clears others)
-   * @param {string} id - User/build ID
-   * @param {string} filePath - File path to set as selected
-   * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
-   */
-  SetFile: (id, filePath, instanceName = 'fileBrowser') => {
-    const storageKey = `fileBrowser_${instanceName}`;
-    const storage = this.Storages.Get(id, storageKey);
-    if (storage) {
-      storage.selectedFiles = [filePath];
-      this.Storages.Set(id, storageKey, storage);
-    }
-  },
-
-  /**
-   * Add a file to selection without clearing others
-   * @param {string} id - User/build ID
-   * @param {string} filePath - File path to add to selection
-   * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
-   */
-  AddFile: (id, filePath, instanceName = 'fileBrowser') => {
-    const storageKey = `fileBrowser_${instanceName}`;
-    const storage = this.Storages.Get(id, storageKey);
-    if (storage && !storage.selectedFiles.includes(filePath)) {
-      storage.selectedFiles.push(filePath);
-      this.Storages.Set(id, storageKey, storage);
-    }
-  },
-
-  /**
-   * Check if a specific file is selected
-   * @param {string} id - User/build ID
-   * @param {string} filePath - File path to check
-   * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
-   * @returns {boolean} Whether the file is selected
-   */
-  IsSelected: (id, filePath, instanceName = 'fileBrowser') => {
-    const storageKey = `fileBrowser_${instanceName}`;
-    const storage = this.Storages.Get(id, storageKey);
-    return storage?.selectedFiles?.includes(filePath) || false;
-  },
-
-  /**
-   * Get current browsing path
-   * @param {string} id - User/build ID
-   * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
-   * @returns {string} Current directory path being browsed
-   */
-  GetCurrentPath: (id, instanceName = 'fileBrowser') => {
-    const storageKey = `fileBrowser_${instanceName}`;
-    const storage = this.Storages.Get(id, storageKey);
-    return storage?.currentPath || '';
-  },
-
-  /**
-   * Get selection count
-   * @param {string} id - User/build ID
-   * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
-   * @returns {number} Number of selected files
-   */
-  GetCount: (id, instanceName = 'fileBrowser') => {
-    const storageKey = `fileBrowser_${instanceName}`;
-    const storage = this.Storages.Get(id, storageKey);
-    return storage?.selectedFiles?.length || 0;
-  },
-
-  /**
-   * Get current page number (0-based)
-   * @param {string} id - User/build ID
-   * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
-   * @returns {number} Current page number
-   */
-  GetCurrentPage: (id, instanceName = 'fileBrowser') => {
-    const storageKey = `fileBrowser_${instanceName}`;
-    const storage = this.Storages.Get(id, storageKey);
-    return storage?.currentPage || 0;
-  },
-
-  /**
-   * Reset file browser to initial state (clears everything)
-   * @param {string} id - User/build ID
-   * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
-   */
-  Reset: (id, instanceName = 'fileBrowser') => {
-    const storageKey = `fileBrowser_${instanceName}`;
-    this.Storages.Delete(id, storageKey);
-  },
-
-  /**
-   * Get selected files with relative paths
-   * @param {string} id - User/build ID
-   * @param {string} [basePath] - Base path for relative paths (default: startPath from storage)
-   * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
-   * @returns {Array<string>} Array of relative file paths
-   */
-  GetSelectedRelative: (id, basePath = null, instanceName = 'fileBrowser') => {
-    const storageKey = `fileBrowser_${instanceName}`;
-    const storage = this.Storages.Get(id, storageKey);
-    if (!storage || storage.selectedFiles.length === 0) return [];
-    
-    const base = basePath || storage.startPath || '/';
-    return storage.selectedFiles.map(filePath => path.relative(base, filePath));
-  },
-
-  /**
-   * Update the display name of a file browser instance
-   * @param {string} id - User/build ID
-   * @param {string} displayName - New display name
-   * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
-   */
-  SetDisplayName: (id, displayName, instanceName = 'fileBrowser') => {
-    const storageKey = `fileBrowser_${instanceName}`;
-    const storage = this.Storages.Get(id, storageKey);
-    if (storage) {
-      storage.displayName = displayName;
-      this.Storages.Set(id, storageKey, storage);
-    }
-  },
-
-  /**
-   * Get the display name of a file browser instance
-   * @param {string} id - User/build ID
-   * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
-   * @returns {string} Current display name
-   */
-  GetDisplayName: (id, instanceName = 'fileBrowser') => {
-    const storageKey = `fileBrowser_${instanceName}`;
-    const storage = this.Storages.Get(id, storageKey);
-    return storage?.displayName || `Browse: ${path.basename(storage?.currentPath || '')}`;
-  }
-};
 
     // --------------------------- SetPage Method ---------------------------
 
@@ -4686,6 +5187,19 @@ this.FileManager = {
         if (!userBuild.Session.ActualProps) {
           userBuild.Session.ActualProps = {};
         }
+        
+        const previousPage = userBuild.Session.ActualProps.page;
+        if (previousPage && previousPage !== page) {
+          userBuild.Session.ActualProps._previousPage = previousPage;
+          
+          this._executePageLeaveHooks(previousPage, { 
+            session: userBuild.Session, 
+            ...userBuild.Session.ActualProps 
+          }).catch(err => {
+            if (this.Log) console.error(`Page leave hook error:`, err);
+          });
+        }
+        
         userBuild.Session.ActualProps.page = page;
 
         if (unlock && page) {
@@ -5192,93 +5706,123 @@ this.FileManager = {
 
     // --------------------------- Build Method ---------------------------
 
-   // In the Build method, modify it like this:
-
-this.Build = async (props = { session: new Session }) => {
-  this.Builds.set(props.session.UniqueID, new userBuild({ session: props.session }))
-
-  try {
-    await build(props)
-
-    const userBuild = this.Builds.get(props.session.UniqueID)
-
-    // Process alerts AFTER build but BEFORE creating return object
-    // Only process on refresh or if has alerts
-    if (userBuild._hasAlerts || this.AlertStorage.has(props.session.UniqueID)) {
-      this.ProcessAlerts(props.session.UniqueID);
-    }
-
-    if (userBuild && userBuild.GotoNow) {
-      const gotoInfo = userBuild.GotoNow
-
-      let obj_return = {
-        hud_obj: {
-          title: '',
-          options: []
-        },
-        wait_input: false,
-        input_obj: {},
-        goto_now: {
-          path: gotoInfo.path,
-          props: gotoInfo.props
-        },
-        routes: userBuild.Routes
+    this.Build = async (props = { session: new Session }) => {
+      const sessionId = props.session.UniqueID;
+      const previousFuncName = props.session.PreviousPath;
+      const currentFuncName = props.session.ActualPath || this.Name;
+      
+      if (previousFuncName && previousFuncName !== currentFuncName) {
+        const previousFunc = this._syappInstance?.Funcs?.get(previousFuncName);
+        if (previousFunc) {
+          await previousFunc._executeSessionLeaveHooks(props);
+          await previousFunc._executeFunctionLeaveHooks(props);
+        }
       }
+      
+      this.Builds.set(sessionId, new userBuild({ session: props.session }))
 
-      this.Builds.delete(props.session.UniqueID)
-      return obj_return
-    }
+      try {
+        if (!props._isRefresh) {
+          await this._executeFunctionEnterHooks(props);
+          await this._executeSessionEnterHooks(props);
+        }
+        
+        if (!props._isRefresh && typeof this.OnEnter === 'function') {
+          const onEnterOnceKey = `_onEnter_${this.Name}`;
+          let shouldExecuteLegacy = true;
+          
+          if (this.OnEnterOnce) {
+            if (this.Storages.Has(sessionId, onEnterOnceKey) && 
+                this.Storages.Get(sessionId, onEnterOnceKey) === true) {
+              shouldExecuteLegacy = false;
+            }
+          }
+          
+          if (shouldExecuteLegacy) {
+            try {
+              await this.OnEnter(props);
+              if (this.OnEnterOnce) {
+                this.Storages.Set(sessionId, onEnterOnceKey, true);
+              }
+            } catch (onEnterError) {
+              console.error(`OnEnter error for function ${this.Name}:`, onEnterError);
+            }
+          }
+        }
 
-    let obj_return = {
-      hud_obj: {
-        title: this.Builds.get(props.session.UniqueID).Text,
-        options: this.Builds.get(props.session.UniqueID).Buttons
-      },
-      wait_input: this.Builds.get(props.session.UniqueID).WaitInput,
-      input_obj: {
-        path: this.Builds.get(props.session.UniqueID).InputPath,
-        props: this.Builds.get(props.session.UniqueID).InputProps,
-        question: this.Builds.get(props.session.UniqueID).InputQuestion,
-        password: this.Builds.get(props.session.UniqueID).InputPassword
-      },
-      goto_now: undefined,
-      routes: this.Builds.get(props.session.UniqueID).Routes
-    }
+        await build(props)
 
-    this.Builds.delete(props.session.UniqueID)
-    return obj_return
+        const userBuild = this.Builds.get(sessionId)
 
-  } catch (error) {
-    if (error.message === 'GOTO_NOW_BREAK' && error.gotoInfo) {
-      this.Builds.delete(props.session.UniqueID)
+        if (userBuild._hasAlerts || this.AlertStorage.has(sessionId)) {
+          this.ProcessAlerts(sessionId);
+        }
 
-      return {
-        hud_obj: {
-          title: '',
-          options: []
-        },
-        wait_input: false,
-        input_obj: {},
-        goto_now: {
-          path: error.gotoInfo.path,
-          props: error.gotoInfo.props
-        },
-        routes: {}
+        if (userBuild && userBuild.GotoNow) {
+          const gotoInfo = userBuild.GotoNow
+
+          let obj_return = {
+            hud_obj: {
+              title: '',
+              options: []
+            },
+            wait_input: false,
+            input_obj: {},
+            goto_now: {
+              path: gotoInfo.path,
+              props: gotoInfo.props
+            },
+            routes: userBuild.Routes
+          }
+
+          this.Builds.delete(sessionId)
+          return obj_return
+        }
+
+        let obj_return = {
+          hud_obj: {
+            title: this.Builds.get(sessionId).Text,
+            options: this.Builds.get(sessionId).Buttons
+          },
+          wait_input: this.Builds.get(sessionId).WaitInput,
+          input_obj: {
+            path: this.Builds.get(sessionId).InputPath,
+            props: this.Builds.get(sessionId).InputProps,
+            question: this.Builds.get(sessionId).InputQuestion,
+            password: this.Builds.get(sessionId).InputPassword
+          },
+          goto_now: undefined,
+          routes: this.Builds.get(sessionId).Routes
+        }
+
+        this.Builds.delete(sessionId)
+        return obj_return
+
+      } catch (error) {
+        if (error.message === 'GOTO_NOW_BREAK' && error.gotoInfo) {
+          this.Builds.delete(sessionId)
+
+          return {
+            hud_obj: {
+              title: '',
+              options: []
+            },
+            wait_input: false,
+            input_obj: {},
+            goto_now: {
+              path: error.gotoInfo.path,
+              props: error.gotoInfo.props
+            },
+            routes: {}
+          }
+        }
+
+        throw error
       }
     }
-
-    throw error
-  }
-}
 
     // --------------------------- Route Discovery Method ---------------------------
 
-    /**
-     * Discover HTTP routes from this function
-     * @param {Object} [discoveryProps] - Discovery properties
-     * @returns {Promise<{GET: Array, POST: Array, PUT: Array, DELETE: Array}>} Discovered routes
-     * @private
-     */
     this.DiscoverRoutes = async (discoveryProps = {}) => {
       const discoveryId = `route-discovery-${this.Name}-${Date.now()}`
       const discoverySession = new Session({
@@ -5482,7 +6026,7 @@ class TemplateFunc extends SyAPP_Func {
   }
 }
 
-// --------------------------- SyAPP Class ---------------------------
+// --------------------------- HTTPRoutesStorage Class ---------------------------
 
 class HTTPRoutesStorage {
   constructor() {
@@ -5633,6 +6177,8 @@ class AdminManager {
       hasRefresher: !!this.syapp.Refresher,
       globalRefreshMode: this.syapp.GlobalRefreshMode,
       refreshInterval: this.syapp._refreshInterval || 500,
+      // NEW: Include function history config
+      maxFuncHistorySize: this.syapp.maxFuncHistorySize || 20,
       timestamp: new Date().toISOString()
     };
     return { ...this.configCache };
@@ -5670,7 +6216,11 @@ class AdminManager {
         currentPath: session.ActualPath,
         hasPage: !!session.ActualProps?.page,
         currentPage: session.ActualProps?.page || null,
-        inAction: session.InAction || false
+        inAction: session.InAction || false,
+        // NEW: Include function history in stats
+        previousFuncPath: session.PreviousFuncPath || null,
+        funcHistory: session.FuncHistory || [],
+        funcHistorySize: (session.FuncHistory || []).length
       };
       stats.sessions.details.push(sessionInfo);
       if (!session.InAction) stats.sessions.active++;
@@ -5696,6 +6246,9 @@ class AdminManager {
         isAdmin: this.adminIds.has(sessionId),
         currentPath: session.ActualPath,
         previousPath: session.PreviousPath,
+        // NEW: Include function tracking
+        previousFuncPath: session.PreviousFuncPath || null,
+        funcHistory: session.FuncHistory || [],
         hasPage: !!session.ActualProps?.page,
         currentPage: session.ActualProps?.page || null,
         inAction: session.InAction || false,
@@ -5747,6 +6300,16 @@ class AdminManager {
       refreshMode: func.RefreshMode,
       refreshStatus: func.RefreshMode === null ? 'using global' : 
                      func.RefreshMode === true ? 'always on' : 'always off',
+      hasOnEnter: !!func.OnEnter,
+      onEnterOnce: func.OnEnterOnce || false,
+      lifecycleHooks: {
+        functionEnter: func._lifecycleHooks?.function?.enter?.length || 0,
+        functionLeave: func._lifecycleHooks?.function?.leave?.length || 0,
+        sessionEnter: func._lifecycleHooks?.session?.enter?.length || 0,
+        sessionLeave: func._lifecycleHooks?.session?.leave?.length || 0,
+        pageEnter: Array.from(func._lifecycleHooks?.page?.enter?.keys() || []).length,
+        pageLeave: Array.from(func._lifecycleHooks?.page?.leave?.keys() || []).length
+      },
       storageStats: {
         userStorage: func.UserStorage ? func.UserStorage.size : 0,
         alertStorage: func.AlertStorage ? func.AlertStorage.size : 0,
@@ -5934,6 +6497,7 @@ class SyAPP {
    * @param {boolean} [config.includeFuncName=true] - Include function name in routes
    * @param {boolean} [config.RefreshMode=true] - Start with Refresh Screen mode
    * @param {number} [config.RefreshInterval=400] - Set the Refresh Screen mode interval in ms
+   * @param {number} [config.maxFuncHistorySize=20] - Maximum size of function history array per session
    */
   constructor(mainFuncOrConfig, config = {}) {
     /** @type {TerminalHUD} */
@@ -5999,6 +6563,12 @@ class SyAPP {
       baseRoute: userConfig.baseRoute || false,
       includeFuncName: userConfig.includeFuncName !== false
     };
+
+    /** 
+     * Maximum number of function paths to keep in history per session
+     * @type {number}
+     */
+    this.maxFuncHistorySize = userConfig.maxFuncHistorySize || 20;
 
     // Initialize admin manager with main session as admin
     /** @type {AdminManager} */
@@ -6256,6 +6826,36 @@ class SyAPP {
           config.props._httpConfig = this.serverConfig.httpConfig;
         }
 
+        // Track previous path and page for lifecycle hooks
+        const previousPath = session.ActualPath;
+        const previousPage = session.ActualProps?.page || '';
+        
+        // ============================================================
+        // REAL FUNCTION TRACKING (not affected by refreshes)
+        // ============================================================
+        
+        // Only update PreviousFuncPath when navigating to a DIFFERENT function
+        // (not when refreshing the same function)
+        if (!isRefreshRequest && session.ActualPath && session.ActualPath !== targetFuncName) {
+          // Store the current function as the "real" previous function
+          session.PreviousFuncPath = session.ActualPath;
+          
+          // Add to function history (most recent first)
+          if (session.ActualPath) {
+            session.FuncHistory.unshift(session.ActualPath);
+            
+            // Trim history to max size
+            if (session.FuncHistory.length > this.maxFuncHistorySize) {
+              session.FuncHistory = session.FuncHistory.slice(0, this.maxFuncHistorySize);
+            }
+          }
+        }
+        // If it's a refresh, keep PreviousFuncPath and FuncHistory unchanged
+        
+        // Pass real function tracking to props
+        config.props._previousFuncPath = session.PreviousFuncPath;
+        config.props._funcHistory = [...session.FuncHistory]; // Pass a copy
+        
         session.PreviousPath = session.ActualPath;
         session.ActualPath = targetFuncName;
         session.PreviousProps = session.ActualProps;
@@ -6626,7 +7226,8 @@ class SyAPP {
       console.log(`   ${ColorText.brightWhite('URL:')} http://${this.serverConfig.host}:${this.serverConfig.port}/`);
       console.log(`   ${ColorText.brightWhite('Mode:')} ${this.serverConfig.baseRoute ? 'Root level' : 'With function names'}${this.serverConfig.includeFuncName ? '' : ' (no func name)'}`);
       console.log(`   ${ColorText.brightWhite('Routes:')} ${this.routeStorage.getStats().total} total`);
-      console.log(`   ${ColorText.brightWhite('Admin:')} ${this._adminManager.adminIds.size} admin(s) registered\n`);
+      console.log(`   ${ColorText.brightWhite('Admin:')} ${this._adminManager.adminIds.size} admin(s) registered
+`);
       
       console.log(ColorText.brightGreen('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━') + '\n');
     });

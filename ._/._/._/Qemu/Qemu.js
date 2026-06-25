@@ -3,7 +3,7 @@ import { spawn, exec } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve, basename } from 'node:path';
 import { 
-    readFile, writeFile, access, readdir, stat, unlink 
+    readFile, writeFile, access, readdir, stat, unlink, rm 
 } from 'node:fs/promises';
 import { createWriteStream } from 'node:fs';
 import { networkInterfaces } from 'node:os';
@@ -16,6 +16,7 @@ const QEMU_SCRIPT_DIR = dirname(QEMU_SCRIPT_PATH);
 
 const VM_IPS_FILE = '/tmp/qemu_vm_ips.txt';
 const IP_LOCK_DIR = '/tmp/qemu_vm_ip_locks';
+const DOWNLOAD_LOCK_DIR = '/tmp/qemu_vm_download_locks';
 
 const managedProcesses = new Map();
 
@@ -728,6 +729,634 @@ class Qemu {
         return { ready: false, vmName, timeout: true, waited: timeout };
     }
 
+    /**
+ * Clear VM files and data.
+ * 
+ * Modes:
+ * - safe (default):  Remove persistent VM directories for non-running UNNAMED VMs + associated files.
+ *                    Named VMs are NEVER touched.
+ * - hard:            Stop running UNNAMED VMs, then remove all persistent UNNAMED VM directories.
+ *                    Named VMs are NEVER touched (even if running).
+ * - super-hard:      Kill ALL qemu processes, remove ALL VM directories (named + unnamed),
+ *                    ALL /tmp/qemu_* files, ALL IP locks, ALL download locks. Complete nuke.
+ * 
+ * A "named" VM is one that was created with an explicit --name by the user.
+ * Auto-generated names (vm_xxxxxxxxx pattern from startVM default) are considered unnamed.
+ * VMs started via qemu.sh directly without a name (temp mode) are also unnamed.
+ * 
+ * @param {Object} options - Clear options
+ * @param {boolean} [options.hard=false] - If true, stops running unnamed VMs then clears them
+ * @param {boolean} [options.superHard=false] - If true, complete nuclear cleanup of everything (named + unnamed)
+ * @param {string[]} [options.include=[]] - Specific VM names to clear (overrides default scope)
+ * @param {boolean} [options.dryRun=false] - If true, only return what would be deleted without actually deleting
+ * @returns {Object} Results of the clear operation
+ */
+static async clearVMs(options = {}) {
+    const {
+        hard = false,
+        superHard = false,
+        include = [],
+        dryRun = false
+    } = options;
+
+    const mode = superHard ? 'super-hard' : hard ? 'hard' : 'safe';
+
+    const result = {
+        success: true,
+        timestamp: new Date().toISOString(),
+        mode,
+        dryRun,
+        deleted: {
+            directories: [],
+            logFiles: [],
+            pidFiles: [],
+            ipLocks: [],
+            tempFiles: [],
+            downloadLocks: [],
+            otherFiles: []
+        },
+        stopped: [],
+        skipped: [],
+        errors: [],
+        summary: {
+            totalProcessed: 0,
+            totalDeleted: 0,
+            totalStopped: 0,
+            totalSkipped: 0,
+            totalErrors: 0
+        }
+    };
+
+    try {
+        // ================================================================
+        // SUPER HARD MODE: Nuclear cleanup - kill everything QEMU-related
+        // Only this mode can touch NAMED VMs
+        // ================================================================
+        if (superHard) {
+            // Step 1: Kill ALL qemu processes forcefully
+            try {
+                const { stdout: allQemuPids } = await this.#exec(
+                    `ps aux | grep -E "qemu-system-x86_64|qemu-system" | grep -v grep | awk '{print $2}'`,
+                    { timeout: 5000, cwd: '/tmp' }
+                );
+
+                if (allQemuPids) {
+                    const pids = allQemuPids.split('\n').filter(Boolean);
+                    for (const pid of pids) {
+                        const pidNum = parseInt(pid);
+                        if (!dryRun) {
+                            try {
+                                process.kill(pidNum, 'SIGKILL');
+                            } catch {}
+                        }
+                        result.stopped.push({
+                            pid: pidNum,
+                            note: dryRun ? '[DRY RUN] Would kill' : 'Killed'
+                        });
+                        result.summary.totalStopped++;
+                    }
+                    if (!dryRun) {
+                        await new Promise(resolve => setTimeout(resolve, 2000));
+                    }
+                }
+            } catch {}
+
+            // Step 2: Clear managed processes tracking
+            const managedCount = managedProcesses.size;
+            if (!dryRun) {
+                managedProcesses.clear();
+            }
+            result.summary.totalStopped += managedCount;
+
+            // Step 3: Remove ALL VM directories (named + unnamed)
+            try {
+                const entries = await readdir(QEMU_SCRIPT_DIR);
+                for (const entry of entries) {
+                    if (!entry.includes('-vm-')) continue;
+                    const fullPath = join(QEMU_SCRIPT_DIR, entry);
+
+                    let statInfo;
+                    try {
+                        statInfo = await stat(fullPath);
+                    } catch { continue; }
+
+                    if (!statInfo.isDirectory()) continue;
+
+                    const nameMatch = entry.match(/-vm-(.+)$/);
+                    const vmName = nameMatch ? nameMatch[1] : 'unknown';
+
+                    const dirInfo = {
+                        path: fullPath,
+                        directory: entry,
+                        vmName
+                    };
+
+                    if (!dryRun) {
+                        try {
+                            await rm(fullPath, { recursive: true, force: true });
+                            result.deleted.directories.push(dirInfo);
+                            result.summary.totalDeleted++;
+                        } catch (rmErr) {
+                            result.errors.push({
+                                operation: 'delete_directory',
+                                path: fullPath,
+                                error: rmErr.message
+                            });
+                            result.summary.totalErrors++;
+                        }
+                    } else {
+                        dirInfo.note = '[DRY RUN] Would delete';
+                        result.deleted.directories.push(dirInfo);
+                        result.summary.totalDeleted++;
+                    }
+                }
+            } catch {}
+
+            // Step 4: Nuke ALL /tmp/qemu_* files
+            try {
+                const { stdout: tmpFiles } = await this.#exec(
+                    `ls /tmp/qemu_* 2>/dev/null`,
+                    { timeout: 5000, cwd: '/tmp' }
+                );
+                if (tmpFiles) {
+                    const files = tmpFiles.split('\n').filter(Boolean);
+                    for (const file of files) {
+                        if (file === IP_LOCK_DIR || file === DOWNLOAD_LOCK_DIR) continue;
+
+                        const fileInfo = { path: file };
+                        if (!dryRun) {
+                            try {
+                                await rm(file, { recursive: true, force: true });
+                                result.deleted.otherFiles.push(fileInfo);
+                                result.summary.totalDeleted++;
+                            } catch {}
+                        } else {
+                            fileInfo.note = '[DRY RUN] Would delete';
+                            result.deleted.otherFiles.push(fileInfo);
+                            result.summary.totalDeleted++;
+                        }
+                    }
+                }
+            } catch {}
+
+            // Step 5: Clear ALL IP locks
+            try {
+                const entries = await readdir(IP_LOCK_DIR).catch(() => []);
+                for (const entry of entries) {
+                    const lockPath = join(IP_LOCK_DIR, entry);
+                    const lockInfo = { path: lockPath, ip: entry.startsWith('ip_') ? entry.substring(3) : entry };
+                    if (!dryRun) {
+                        try {
+                            await rm(lockPath, { recursive: true, force: true });
+                            result.deleted.ipLocks.push(lockInfo);
+                            result.summary.totalDeleted++;
+                        } catch {}
+                    } else {
+                        lockInfo.note = '[DRY RUN] Would delete';
+                        result.deleted.ipLocks.push(lockInfo);
+                        result.summary.totalDeleted++;
+                    }
+                }
+            } catch {}
+
+            // Step 6: Clear ALL download locks
+            try {
+                const entries = await readdir(DOWNLOAD_LOCK_DIR).catch(() => []);
+                for (const entry of entries) {
+                    const lockPath = join(DOWNLOAD_LOCK_DIR, entry);
+                    const lockInfo = { path: lockPath };
+                    if (!dryRun) {
+                        try {
+                            await rm(lockPath, { recursive: true, force: true });
+                            result.deleted.downloadLocks.push(lockInfo);
+                            result.summary.totalDeleted++;
+                        } catch {}
+                    } else {
+                        lockInfo.note = '[DRY RUN] Would delete';
+                        result.deleted.downloadLocks.push(lockInfo);
+                        result.summary.totalDeleted++;
+                    }
+                }
+            } catch {}
+
+            // Step 7: Wipe the IPs file
+            if (!dryRun) {
+                try {
+                    await writeFile(VM_IPS_FILE, '');
+                } catch {}
+            }
+
+            return result;
+        }
+
+        // ================================================================
+        // SAFE & HARD MODE: Only touch UNNAMED VMs
+        // Named VMs are ALWAYS skipped in safe and hard modes
+        // ================================================================
+        
+        // A "named" VM = the user explicitly gave it a name via --name
+        // Auto-generated names from startVM() follow pattern: vm_ + base36 timestamp (e.g., vm_mqi2v926)
+        // These auto-generated names are 11-13 chars: "vm_" + 8-10 random chars
+        // Temp VMs from qemu.sh: start with "tmp." or "temp-"
+        //
+        // Strategy: Collect user-named VMs from managedProcesses args
+        // A VM is "user-named" if it was started with an explicit --name that doesn't match the auto-gen pattern
+        const userNamedVMs = new Set();
+        
+        // Check managedProcesses for VMs started with explicit names
+        for (const [vmName, procInfo] of managedProcesses) {
+            // If the VM was started via startVM() with an explicit name config
+            // The auto-generated name pattern is: vm_ + 8-10 chars from Date.now().toString(36)
+            // Example: vm_mqi2v926, vm_mqhzl0xr
+            const isAutoGenerated = /^vm_[a-z0-9]{8,10}$/.test(vmName);
+            
+            if (!isAutoGenerated && !vmName.startsWith('tmp.') && !vmName.startsWith('temp-')) {
+                userNamedVMs.add(vmName);
+            }
+        }
+        
+        // Also check persistent directories for non-auto-generated names
+        const allVMs = await this.listVMs();
+        const runningVMs = allVMs.running;
+        const persistentVMs = allVMs.persistent;
+        
+        for (const vm of persistentVMs) {
+            const isAutoGenerated = /^vm_[a-z0-9]{8,10}$/.test(vm.vmName);
+            if (!isAutoGenerated && !vm.vmName.startsWith('tmp.') && !vm.vmName.startsWith('temp-')) {
+                userNamedVMs.add(vm.vmName);
+            }
+        }
+
+        // Determine which VMs to process
+        let vmsToProcess = [];
+        // Use a Set to track already-processed VM names to avoid duplicates
+        const processedVMNames = new Set();
+
+        if (include.length > 0) {
+            // Specific VMs requested - skip the named/unnamed logic
+            for (const vmName of include) {
+                if (processedVMNames.has(vmName)) continue;
+                processedVMNames.add(vmName);
+                
+                const persistent = persistentVMs.find(v => v.vmName === vmName);
+                const running = runningVMs.find(v => v.vmName === vmName);
+
+                if (persistent || running) {
+                    vmsToProcess.push({
+                        vmName,
+                        persistent: persistent || null,
+                        running: running || null,
+                        isRunning: !!running
+                    });
+                } else {
+                    result.skipped.push({ vmName, reason: 'VM not found' });
+                    result.summary.totalSkipped++;
+                }
+            }
+        } else if (hard) {
+            // Hard mode: process all UNNAMED persistent VMs (running + non-running)
+            // Named VMs are always skipped
+            
+            for (const vm of persistentVMs) {
+                if (processedVMNames.has(vm.vmName)) continue;
+                processedVMNames.add(vm.vmName);
+                
+                // Check if this is a user-named VM
+                if (userNamedVMs.has(vm.vmName)) {
+                    result.skipped.push({
+                        vmName: vm.vmName,
+                        reason: 'Named VM protected (use superHard=true to force)',
+                        running: vm.running,
+                        pid: vm.pid || null
+                    });
+                    result.summary.totalSkipped++;
+                    continue;
+                }
+
+                const running = runningVMs.find(v => v.vmName === vm.vmName);
+                vmsToProcess.push({
+                    vmName: vm.vmName,
+                    persistent: vm,
+                    running: running || null,
+                    isRunning: !!running
+                });
+            }
+
+            // Also catch running unnamed VMs that might not have persistent dirs
+            // (e.g., temp VMs from qemu.sh direct invocation)
+            for (const vm of runningVMs) {
+                if (processedVMNames.has(vm.vmName)) continue;
+                processedVMNames.add(vm.vmName);
+                
+                if (userNamedVMs.has(vm.vmName)) {
+                    result.skipped.push({
+                        vmName: vm.vmName,
+                        reason: 'Named VM protected (use superHard=true to force)',
+                        running: true,
+                        pid: vm.pid
+                    });
+                    result.summary.totalSkipped++;
+                    continue;
+                }
+                
+                vmsToProcess.push({
+                    vmName: vm.vmName,
+                    persistent: null,
+                    running: vm,
+                    isRunning: true
+                });
+            }
+        } else {
+            // Safe mode: only non-running UNNAMED persistent VMs
+            
+            for (const vm of persistentVMs) {
+                if (processedVMNames.has(vm.vmName)) continue;
+                processedVMNames.add(vm.vmName);
+                
+                // Check if this is a user-named VM
+                if (userNamedVMs.has(vm.vmName)) {
+                    result.skipped.push({
+                        vmName: vm.vmName,
+                        reason: 'Named VM protected (use superHard=true to force)',
+                        running: vm.running,
+                        pid: vm.pid || null
+                    });
+                    result.summary.totalSkipped++;
+                    continue;
+                }
+
+                if (!vm.running) {
+                    vmsToProcess.push({
+                        vmName: vm.vmName,
+                        persistent: vm,
+                        running: null,
+                        isRunning: false
+                    });
+                } else {
+                    result.skipped.push({
+                        vmName: vm.vmName,
+                        reason: 'VM is currently running (use hard=true to force)',
+                        pid: vm.pid
+                    });
+                    result.summary.totalSkipped++;
+                }
+            }
+        }
+
+        result.summary.totalProcessed = vmsToProcess.length;
+
+        // Process each VM
+        for (const vm of vmsToProcess) {
+            try {
+                // Stop running VMs in hard mode
+                if (vm.isRunning && vm.running) {
+                    if (!dryRun) {
+                        const stopResult = await this.stopVM(vm.running.pid);
+                        if (stopResult.success) {
+                            result.stopped.push({
+                                vmName: vm.vmName,
+                                pid: vm.running.pid
+                            });
+                            result.summary.totalStopped++;
+                        } else {
+                            result.errors.push({
+                                vmName: vm.vmName,
+                                operation: 'stop',
+                                error: stopResult.error || 'Failed to stop VM'
+                            });
+                            result.summary.totalErrors++;
+                            continue;
+                        }
+                    } else {
+                        result.stopped.push({
+                            vmName: vm.vmName,
+                            pid: vm.running.pid,
+                            note: '[DRY RUN] Would stop'
+                        });
+                        result.summary.totalStopped++;
+                    }
+                }
+
+                // Delete VM directory
+                if (vm.persistent && vm.persistent.directory) {
+                    const dirInfo = {
+                        vmName: vm.vmName,
+                        path: vm.persistent.directory,
+                        diskSize: vm.persistent.diskSize || 'unknown'
+                    };
+
+                    if (!dryRun) {
+                        try {
+                            await rm(vm.persistent.directory, { recursive: true, force: true });
+                            result.deleted.directories.push(dirInfo);
+                            result.summary.totalDeleted++;
+                        } catch (rmErr) {
+                            result.errors.push({
+                                vmName: vm.vmName,
+                                operation: 'delete_directory',
+                                path: vm.persistent.directory,
+                                error: rmErr.message
+                            });
+                            result.summary.totalErrors++;
+                        }
+                    } else {
+                        dirInfo.note = '[DRY RUN] Would delete';
+                        result.deleted.directories.push(dirInfo);
+                        result.summary.totalDeleted++;
+                    }
+                }
+
+                // Clean up associated files for this VM
+                const vmPattern = vm.vmName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+                // Log files
+                try {
+                    const { stdout: logFiles } = await this.#exec(
+                        `ls /tmp/qemu_vm_${vmPattern}_*.log 2>/dev/null`,
+                        { timeout: 2000, cwd: '/tmp' }
+                    );
+                    if (logFiles) {
+                        const logs = logFiles.split('\n').filter(Boolean);
+                        for (const logFile of logs) {
+                            const logInfo = { vmName: vm.vmName, path: logFile };
+                            if (!dryRun) {
+                                try {
+                                    await unlink(logFile);
+                                    result.deleted.logFiles.push(logInfo);
+                                    result.summary.totalDeleted++;
+                                } catch {}
+                            } else {
+                                logInfo.note = '[DRY RUN] Would delete';
+                                result.deleted.logFiles.push(logInfo);
+                                result.summary.totalDeleted++;
+                            }
+                        }
+                    }
+                } catch {}
+
+                // PID files
+                try {
+                    const { stdout: pidFiles } = await this.#exec(
+                        `ls /tmp/qemu_vm_${vmPattern}.pid 2>/dev/null`,
+                        { timeout: 2000, cwd: '/tmp' }
+                    );
+                    if (pidFiles) {
+                        const pids = pidFiles.split('\n').filter(Boolean);
+                        for (const pidFile of pids) {
+                            const pidInfo = { vmName: vm.vmName, path: pidFile };
+                            if (!dryRun) {
+                                try {
+                                    await unlink(pidFile);
+                                    result.deleted.pidFiles.push(pidInfo);
+                                    result.summary.totalDeleted++;
+                                } catch {}
+                            } else {
+                                pidInfo.note = '[DRY RUN] Would delete';
+                                result.deleted.pidFiles.push(pidInfo);
+                                result.summary.totalDeleted++;
+                            }
+                        }
+                    }
+                } catch {}
+
+                if (!dryRun) {
+                    managedProcesses.delete(vm.vmName);
+                }
+
+            } catch (vmErr) {
+                result.errors.push({
+                    vmName: vm.vmName,
+                    operation: 'process',
+                    error: vmErr.message
+                });
+                result.summary.totalErrors++;
+            }
+        }
+
+        // Release IP locks for deleted VMs
+        try {
+            const currentIPs = await this.#getVMIPs();
+            const remainingVMNames = new Set(
+                (await this.listVMs()).all.map(v => v.vmName)
+            );
+
+            for (const [vmName, ip] of currentIPs) {
+                if (!remainingVMNames.has(vmName)) {
+                    const lockDir = `${IP_LOCK_DIR}/ip_${ip}`;
+                    const ipInfo = { vmName, ip, path: lockDir };
+                    if (!dryRun) {
+                        try {
+                            await rm(lockDir, { recursive: true, force: true });
+                            result.deleted.ipLocks.push(ipInfo);
+                            result.summary.totalDeleted++;
+                        } catch {}
+                    } else {
+                        ipInfo.note = '[DRY RUN] Would release';
+                        result.deleted.ipLocks.push(ipInfo);
+                        result.summary.totalDeleted++;
+                    }
+                }
+            }
+
+            if (!dryRun) {
+                try {
+                    const remaining = new Map();
+                    for (const [name, ip] of currentIPs) {
+                        if (remainingVMNames.has(name)) {
+                            remaining.set(name, ip);
+                        }
+                    }
+                    let newContent = '';
+                    for (const [name, ip] of remaining) {
+                        newContent += `${name}=${ip}\n`;
+                    }
+                    await writeFile(VM_IPS_FILE, newContent);
+                } catch {}
+            }
+        } catch {}
+
+        // Clean up orphaned temp files
+        try {
+            const { stdout: tempFiles } = await this.#exec(
+                `ls /tmp/qemu_vm_tmp.* /tmp/qemu_vm_ssh_setup_*.log /tmp/qemu_vm_ssh_done_*.marker /tmp/qemu_vm_download_pid_* 2>/dev/null`,
+                { timeout: 2000, cwd: '/tmp' }
+            );
+            if (tempFiles) {
+                const temps = tempFiles.split('\n').filter(Boolean);
+                const remainingVMNames = new Set(
+                    (await this.listVMs()).all.map(v => v.vmName)
+                );
+                for (const tempFile of temps) {
+                    const baseName = tempFile.split('/').pop();
+                    const isOrphaned = Array.from(remainingVMNames).every(
+                        name => !baseName.includes(name)
+                    );
+                    if (isOrphaned) {
+                        const tempInfo = { path: tempFile };
+                        if (!dryRun) {
+                            try {
+                                await unlink(tempFile);
+                                result.deleted.tempFiles.push(tempInfo);
+                                result.summary.totalDeleted++;
+                            } catch {}
+                        } else {
+                            tempInfo.note = '[DRY RUN] Would delete';
+                            result.deleted.tempFiles.push(tempInfo);
+                            result.summary.totalDeleted++;
+                        }
+                    }
+                }
+            }
+        } catch {}
+
+        // Clean up stale download locks (older than 1 hour)
+        try {
+            const entries = await readdir(DOWNLOAD_LOCK_DIR).catch(() => []);
+            for (const entry of entries) {
+                const lockPath = join(DOWNLOAD_LOCK_DIR, entry);
+                try {
+                    const lockStat = await stat(lockPath);
+                    const age = Date.now() - lockStat.mtimeMs;
+                    if (age > 3600000) {
+                        const lockInfo = { path: lockPath, entry, age: Math.floor(age / 1000) + 's' };
+                        if (!dryRun) {
+                            await rm(lockPath, { recursive: true, force: true });
+                            result.deleted.downloadLocks.push(lockInfo);
+                            result.summary.totalDeleted++;
+                        } else {
+                            lockInfo.note = '[DRY RUN] Would delete (stale)';
+                            result.deleted.downloadLocks.push(lockInfo);
+                            result.summary.totalDeleted++;
+                        }
+                    }
+                } catch {}
+            }
+        } catch {}
+
+    } catch (err) {
+        result.success = false;
+        result.errors.push({
+            vmName: 'global',
+            operation: 'clearVMs',
+            error: err.message
+        });
+        result.summary.totalErrors++;
+    }
+
+    result.summary.totalDeleted =
+        result.deleted.directories.length +
+        result.deleted.logFiles.length +
+        result.deleted.pidFiles.length +
+        result.deleted.ipLocks.length +
+        result.deleted.tempFiles.length +
+        result.deleted.downloadLocks.length +
+        result.deleted.otherFiles.length;
+
+    result.summary.totalSkipped = result.skipped.length;
+
+    return result;
+}
+
     static async getSystemInfo() {
         const info = {
             timestamp: new Date().toISOString(),
@@ -807,6 +1436,266 @@ class Qemu {
 
         return info;
     }
+}
+
+// ==================== CLI INTERFACE ====================
+// Run directly: node qemu-interface.mjs <command> [options]
+
+async function cli() {
+    const args = process.argv.slice(2);
+    const command = args[0]?.toLowerCase();
+
+    if (!command) {
+        console.log(`
+Qemu VM Manager - CLI Interface
+===============================
+
+Usage: node qemu-interface.mjs <command> [options]
+
+Commands:
+  list                    List all VMs (running and persistent)
+  running                 List only running VMs
+  info <vm-name>          Get detailed info for a specific VM
+  logs <vm-name> [lines]  Get recent logs for a VM (default: 100 lines)
+  start [options]         Start a new VM (detached, returns immediately)
+  stop <vm-name|pid>      Stop a running VM
+  stop-all                Stop all running VMs
+  delete <vm-name>        Delete a persistent VM
+  clear [options]         Clear VM files (see options below)
+  system                  Show system info
+  help                    Show this help
+
+Start options (after start command):
+  --os <alpine|ubuntu>    OS type (default: alpine)
+  --name <name>           VM name (default: auto-generated)
+  --size <size>           Disk size (default: 5G)
+  --memory <mb>           RAM in MB (default: auto)
+  --cpu <cores>           CPU cores (default: 1)
+  --port <port>           SSH port (default: auto)
+  --no-bridge             Disable bridge networking
+  --no-kvm                Disable KVM acceleration
+  --no-ssh-setup          Skip SSH key setup
+
+Clear modes:
+  clear                   SAFE: Remove only non-running UNNAMED VMs
+                          (Named VMs are ALWAYS protected)
+  clear --hard            HARD: Stop running UNNAMED VMs, then remove them
+                          (Named VMs are ALWAYS protected)
+  clear --super-hard      SUPER HARD: Kill ALL qemu, nuke EVERYTHING
+                          (named + unnamed). Complete reset.
+
+Clear options:
+  --include <names...>    Only clear specific VMs (comma-separated or multiple args)
+  --dry-run               Show what would be deleted without actually deleting
+
+Examples:
+  node qemu-interface.mjs list
+  node qemu-interface.mjs start --os alpine --name myvm --size 10G
+  node qemu-interface.mjs clear                          # Safe: only unnamed non-running
+  node qemu-interface.mjs clear --hard                   # Hard: unnamed only
+  node qemu-interface.mjs clear --super-hard             # Nuclear: wipe everything
+  node qemu-interface.mjs clear --include vm_abc,vm_def  # Only specific VMs
+  node qemu-interface.mjs clear --super-hard --dry-run   # Preview nuke
+`);
+        process.exit(0);
+    }
+
+    try {
+        switch (command) {
+            case 'list': {
+                const result = await Qemu.listVMs();
+                console.log(JSON.stringify(result, null, 2));
+                break;
+            }
+
+            case 'running': {
+                const result = await Qemu.getRunningVMs();
+                console.log(JSON.stringify(result, null, 2));
+                break;
+            }
+
+            case 'info': {
+                const vmName = args[1];
+                if (!vmName) {
+                    console.error('ERROR: VM name required');
+                    process.exit(1);
+                }
+                const result = await Qemu.getVMInfo(vmName);
+                console.log(JSON.stringify(result, null, 2));
+                break;
+            }
+
+            case 'logs': {
+                const vmName = args[1];
+                const lines = parseInt(args[2]) || 100;
+                if (!vmName) {
+                    console.error('ERROR: VM name required');
+                    process.exit(1);
+                }
+                const result = await Qemu.getVMLogs(vmName, lines);
+                console.log(JSON.stringify(result, null, 2));
+                break;
+            }
+
+            case 'start': {
+                const config = {};
+                for (let i = 1; i < args.length; i++) {
+                    const arg = args[i];
+                    switch (arg) {
+                        case '--os':
+                            config.os = args[++i];
+                            break;
+                        case '--name':
+                            config.name = args[++i];
+                            break;
+                        case '--size':
+                            config.size = args[++i];
+                            break;
+                        case '--memory':
+                            config.memory = parseInt(args[++i]);
+                            break;
+                        case '--cpu':
+                            config.cpu = parseInt(args[++i]);
+                            break;
+                        case '--port':
+                            config.port = parseInt(args[++i]);
+                            break;
+                        case '--no-bridge':
+                            config.bridge = false;
+                            break;
+                        case '--no-kvm':
+                            config.kvm = false;
+                            break;
+                        case '--no-ssh-setup':
+                            config.sshSetup = false;
+                            break;
+                    }
+                }
+
+                // Start VM in detached mode - do NOT await the full result
+                // Fire and forget, print the result as JSON
+                Qemu.startVM(config).then(result => {
+                    // Write result to a temp file so the user can check it
+                    const resultFile = `/tmp/qemu_start_${result.vmName || Date.now()}.json`;
+                    writeFile(resultFile, JSON.stringify(result, null, 2)).catch(() => {});
+                });
+
+                // Print immediate response and exit
+                console.log(JSON.stringify({
+                    status: 'started',
+                    message: 'VM start initiated. The VM will boot in the background.',
+                    hint: 'Use "list" command to check status, or check /tmp/qemu_start_*.json for result.',
+                    config: config
+                }, null, 2));
+
+                // Force exit after a short delay to let the spawn happen
+                setTimeout(() => process.exit(0), 500);
+                return;
+            }
+
+            case 'stop': {
+                const identifier = args[1];
+                if (!identifier) {
+                    console.error('ERROR: VM name or PID required');
+                    process.exit(1);
+                }
+                const result = await Qemu.stopVM(identifier);
+                console.log(JSON.stringify(result, null, 2));
+                break;
+            }
+
+            case 'stop-all': {
+                console.log('Stopping all VMs...');
+                const result = await Qemu.stopAllVMs();
+                console.log(JSON.stringify(result, null, 2));
+                break;
+            }
+
+            case 'delete': {
+                const vmName = args[1];
+                if (!vmName) {
+                    console.error('ERROR: VM name required');
+                    process.exit(1);
+                }
+                const result = await Qemu.deleteVM(vmName);
+                console.log(JSON.stringify(result, null, 2));
+                break;
+            }
+
+            case 'clear': {
+                const options = {};
+                for (let i = 1; i < args.length; i++) {
+                    const arg = args[i];
+                    switch (arg) {
+                        case '--hard':
+                            options.hard = true;
+                            break;
+                        case '--super-hard':
+                            options.superHard = true;
+                            break;
+                        case '--dry-run':
+                            options.dryRun = true;
+                            break;
+                        case '--include': {
+                            i++;
+                            const includeVMs = [];
+                            while (i < args.length && !args[i].startsWith('--')) {
+                                const names = args[i].split(',').map(n => n.trim()).filter(Boolean);
+                                includeVMs.push(...names);
+                                i++;
+                            }
+                            i--;
+                            if (includeVMs.length > 0) {
+                                options.include = includeVMs;
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                if (options.superHard) {
+                    console.log('☢️  SUPER HARD MODE: Nuclear cleanup - killing all QEMU processes and wiping everything (named + unnamed)...');
+                } else if (options.hard) {
+                    console.log('🔴 HARD MODE: Stopping unnamed VMs and clearing all unnamed persistent VMs...');
+                    console.log('🛡️  Named VMs are PROTECTED and will NOT be touched.');
+                } else {
+                    console.log('🟢 SAFE MODE: Only clearing non-running unnamed persistent VMs...');
+                    console.log('🛡️  Named VMs are PROTECTED and will NOT be touched.');
+                }
+
+                if (options.dryRun) {
+                    console.log('🔍 DRY RUN: No files will actually be deleted...');
+                }
+
+                const result = await Qemu.clearVMs(options);
+                console.log(JSON.stringify(result, null, 2));
+                break;
+            }
+
+            case 'system': {
+                const result = await Qemu.getSystemInfo();
+                console.log(JSON.stringify(result, null, 2));
+                break;
+            }
+
+            case 'help': {
+                break;
+            }
+
+            default:
+                console.error(`Unknown command: ${command}`);
+                console.error('Run without arguments for help');
+                process.exit(1);
+        }
+    } catch (err) {
+        console.error('Error:', err.message);
+        process.exit(1);
+    }
+}
+
+// Run CLI if file is executed directly
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+    cli();
 }
 
 export default Qemu;
