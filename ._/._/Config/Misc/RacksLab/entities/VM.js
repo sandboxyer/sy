@@ -15,8 +15,7 @@ class VM {
             kvm:           { type: 'boolean', default: true },
             sshSetup:      { type: 'boolean', default: true },
             retryAttempts: { type: 'number', default: 18 },
-            retryDelay:    { type: 'number', default: 3 },
-            createdAt:     { type: 'string', default: () => new Date().toISOString() }
+            retryDelay:    { type: 'number', default: 3 }
         }),
 
         // Fallback values (original defaults)
@@ -166,13 +165,6 @@ class VM {
                     default: 3,
                     possibleValues: [1, 2, 3, 5, 10],
                     description: 'Delay between retries (seconds)'
-                },
-                {
-                    name: 'createdAt',
-                    type: 'string',
-                    default: () => new Date().toISOString(),
-                    possibleValues: null,
-                    description: 'ISO timestamp of creation'
                 }
             ]
         },

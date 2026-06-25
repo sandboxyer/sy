@@ -24,6 +24,11 @@ class RacksLab extends SyAPP.Func(){
 
                  if(!this.Storages.Has(uid,'parentfunc')){this.Storages.Set(uid,'parentfunc',props.session.PreviousPath)}
 
+                if(props.customlaunch){
+                    Qemu.startVM(props.customlaunch)
+                    this.Alert(uid,' ')
+                    this.Alert(uid,this.TextColor.green('CustomVM lauched !'))
+                }
 
                  if(props.alpine){
                     Qemu.startVM()
@@ -48,7 +53,7 @@ class RacksLab extends SyAPP.Func(){
                     this.Text(uid,`• Racks Lab | ${racks.cacheAge}`)
 
                
-
+                    
    
                     if(props.connect){
                        await SSH.connect(props.connect)
@@ -123,72 +128,93 @@ class RacksLab extends SyAPP.Func(){
 
                  await this.Page(uid,'customvm',async () => {
 
-                    //whil
-                    this.OnPageEveryEnter(uid,'customvm',async () => {
-                        if(this.Storages.Has(uid,'vmconfigid')){
-                            VM.Config.Model.delete(this.Storages.Get(uid,'vmconfigid'))
-                        }
-                        let vmconfigid = await VM.Config.Model.create()
-                        this.Storages.Set(uid,'vmconfigid',vmconfigid.id)
-                    })
-
-                   // await this.WaitLog(await VM.Config.Model.create())
-                   // await this.WaitLog(await VM.Config.Model.find())
                     this.Text(uid,'• Racks Lab / Custom VM')
 
+                   
+                    this.OnPageEveryEnter(uid,'customvm',async () => {
+                        this.Storages.Set(uid,'vmfields',VM.Config.fields)
+                    })
+
                     if(props.valuechange){
-                        VM.Config.Model.update(this.Storages.Get(uid,'vmconfigid'),{[props.valuechange.key] : props.valuechange.value})
+                        let actual = this.Storages.Get(uid,'vmfields')
+                        actual[actual.findIndex(e => e.name == props.valuechange.key)].value = props.valuechange.value
+                        this.Storages.Set(uid,'vmfields',actual)
                     }
 
-                    if(this.Storages.Has(uid,'vmconfigid') &&  await VM.Config.Model.findById(this.Storages.Get(uid,'vmconfigid'))){
-                        let config = await VM.Config.Model.findById(this.Storages.Get(uid,'vmconfigid'))
-                        if(config){
-                            let keys_array = objToArray(config,{blacklistKeys : ['createdAt','_id','_created_at']})
-                            for(let instance of keys_array){
-
-                                let index = VM.Config.fields.findIndex(e => e.name == instance.key)
-
-                                if(index != -1){
-                                    if(VM.Config.fields[index].possibleValues){
-                                        await this.DropDown(uid,instance.key,async () => {
-                                            let buttons = []
-                                            VM.Config.fields[VM.Config.fields.findIndex(e => e.name == instance.key)].possibleValues.forEach(e => {
-                                                if(e == instance.value){
-                                                    buttons.push({name : `» ${String(e)}`})
-                                                } else {
-                                                    buttons.push({name : String(e),props : {valuechange : {key : instance.key,value : e}}})
-                                                }
-                                                
-                                            })
-                                            this.Buttons(uid,buttons)
-                                        },{down_buttontext : `${instance.key} : ${instance.value}`,up_buttontext : `${instance.key} : ${instance.value}`})
-                                    } else {
-                                        this.Button(uid,`${instance.key} without fields`)
-                                    }
-                                   
-                                } else {
-                                    this.Button(uid,instance.key)
-                                }
-
-                            
-
-                               
-
-                            }
-                        } else {
-                            this.Button(uid,'Loading...')
-                           
+                    if(props.inputValue){
+                        if(props.key){
+                        let actual = this.Storages.Get(uid,'vmfields')
+                        actual[actual.findIndex(e => e.name == props.key)].value = props.inputValue
+                        this.Storages.Set(uid,'vmfields',actual)
                         }
-                   
-                        
-                    } else {
-                        this.Button(uid,'Loading...')
+                    }
+
+                    if(props.customnewvalue){
+                        this.WaitInput(uid,{props : {page : 'customvm',key : props.customnewvalue.key}})
                     }
                     
+                    
+                    await this.DropDown(uid,'vmconfig',async () => {
+                        if(this.Storages.Get(uid,'vmfields').length){
+                            for(let instance of this.Storages.Get(uid,'vmfields')){
+                                if(instance.possibleValues){
+                                    await this.DropDown(uid,instance.name,() => {
+                                        {
+                                            if(instance.possibleValues){
+                                                let buttons = []
+                                                instance.possibleValues.forEach(e => {buttons.push({props : {valuechange : {key : instance.name,value : String(e)}},name : `${instance.value ? (instance.value == e ? '» ' : '') : (instance.default && instance.default == e ? '» ' : '')}${String(e)}`})})
+                                                this.Buttons(uid,buttons)
+                                            }
+                                        }
+                                    },{up_buttontext : `${instance.name}${(instance.value) ? ` : ${instance.value}`: (instance.default) ? ` : ${instance.default}`: ''}`,down_buttontext : `${instance.name}${(instance.value) ? ` : ${instance.value}`: (instance.default) ? ` : ${instance.default}`: ''}`})
+                                } else {
+                                    this.Button(uid,`${instance.name}${(instance.value) ? ` : ${instance.value}`: (instance.default) ? ` : ${instance.default}`: ''}`,{props : {customnewvalue : {key : instance.name}}})
+                                }
+                               
+                            }
+                           }
+
+                    },{up_buttontext : 'VM Configuration',down_buttontext : 'VM Configuration'})
+
+                    
+
+
+                    await this.DropDown(uid,'startcommands',async () => {
+
+                        await this.DropDown(uid,`newcommand-vmconfig`,async () => {
+                            this.Buttons(uid,[{name :'One-line'},{name : 'Flow'}])
+                        },{up_buttontext : this.TextColor.pink('New'),
+                            down_buttontext : this.TextColor.pink('New'),
+                            up_emoji : '+',
+                            down_emoji : '-',horizontal :true
+                        })
+
+
+                    },{up_buttontext : 'Start Commands',down_buttontext : 'Start Commands'})
+
+
+
+                            
+                    await this.DropDown(uid,'vmfiles',async () => {
+                        this.File(uid,{startPath : '/home'})
+                    },{up_buttontext : 'Files',down_buttontext : 'Files'})
+
+
+                 
+                    let creation = {}
+                    this.Storages.Get(uid,'vmfields').forEach(e => {
+                        if(e.value){ creation[e.name] = e.value}
+                    })
+
                     this.Button(uid,' ')
-                    this.Button(uid,ColorText.brightYellow('Launch VM'))
+                    this.Button(uid,ColorText.lime('◈  Launch VM'),{props : {customlaunch : creation,page : ''}})
                     this.Button(uid,' ')
-                    this.Buttons(uid,[{name : '<- Return',props : {page : ''}},{name : 'Save'}])
+                    let lastbuttons = [{name : '<- Return',props : {page : ''}}]
+                    if(Object.keys(creation).length > 0){lastbuttons.push({name : 'Save'})}
+                    lastbuttons.push({name : 'Load'})
+                    
+                    
+                    this.Buttons(uid,lastbuttons)
                  })
 
                  await this.Page(uid,'config',async () => {
