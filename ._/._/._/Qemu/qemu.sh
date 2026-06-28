@@ -617,16 +617,46 @@ net_cmd() {
     fi
 }
 
-# --- Check if we have sufficient privileges ---
+# --- Detect if we are running inside WSL (Windows Subsystem for Linux) ---
+detect_wsl() {
+    # Check for Microsoft signature in kernel version
+    if grep -qi microsoft /proc/version 2>/dev/null; then
+        return 0
+    fi
+    
+    # Check for WSL signature in kernel version
+    if grep -qi wsl /proc/version 2>/dev/null; then
+        return 0
+    fi
+    
+    # Check for WSL environment variable
+    if [ -n "$WSL_DISTRO_NAME" ]; then
+        return 0
+    fi
+    
+    # Check for WSL-specific filesystem entries
+    if [ -d "/mnt/wsl" ] 2>/dev/null; then
+        return 0
+    fi
+    
+    return 1
+}
+
+# --- Check if we have sufficient privileges for network operations ---
 check_net_privileges() {
+    # Check if we are root
     if [ "$(id -u)" = "0" ]; then
         return 0
     fi
     
+    # Check if sudo is available
     if command -v sudo >/dev/null 2>&1; then
+        # Check if sudo works without password
         if sudo -n true 2>/dev/null; then
             return 0
         fi
+        
+        # Prompt user for sudo password if needed
         echo "[NET] Bridge setup requires root privileges (sudo may ask for password)"
         if sudo true 2>/dev/null; then
             return 0
@@ -637,38 +667,51 @@ check_net_privileges() {
     return 1
 }
 
-# --- Check TUN/TAP availability ---
+# --- Check TUN/TAP availability with aggressive fallback ---
 check_tun_available() {
+    # Check if TUN device already exists
     if [ -c /dev/net/tun ]; then
         return 0
     fi
     
+    # Try to load the TUN kernel module
     net_cmd modprobe tun 2>/dev/null && sleep 0.5
     
+    # Check again after loading module
     if [ -c /dev/net/tun ]; then
         return 0
     fi
     
+    # Check if TUN module is loaded but device node is missing
     if [ -f /proc/modules ] && grep -q "^tun" /proc/modules 2>/dev/null; then
-        return 0
+        # Module is loaded but device node missing - try to create it
+        if [ ! -c /dev/net/tun ]; then
+            net_cmd mkdir -p /dev/net 2>/dev/null
+            net_cmd mknod /dev/net/tun c 10 200 2>/dev/null
+            if [ -c /dev/net/tun ]; then
+                echo "[NET] Created TUN device node manually"
+                return 0
+            fi
+        fi
+    fi
+    
+    # Try to verify if TUN is supported by the kernel
+    if [ -f /proc/misc ] && grep -q "tun" /proc/misc 2>/dev/null; then
+        # TUN is supported, try to create device node
+        net_cmd mkdir -p /dev/net 2>/dev/null
+        net_cmd mknod /dev/net/tun c 10 200 2>/dev/null
+        if [ -c /dev/net/tun ]; then
+            echo "[NET] Created TUN device node from proc/misc detection"
+            return 0
+        fi
     fi
     
     return 1
 }
 
-# --- Check available bridge method ---
+# --- Check available bridge method with fallback chain ---
 detect_bridge_method() {
-    # Method 1: brctl (bridge-utils) - MOST RELIABLE on older systems
-    if command -v brctl >/dev/null 2>&1; then
-        local test_bridge="qemutest_$$"
-        if net_cmd brctl addbr "$test_bridge" 2>/dev/null; then
-            net_cmd brctl delbr "$test_bridge" 2>/dev/null
-            echo "brctl"
-            return 0
-        fi
-    fi
-    
-    # Method 2: Modern ip command with bridge support
+    # Method 1: Modern ip command with bridge support
     if command -v ip >/dev/null 2>&1; then
         local test_bridge="qemutest_$$"
         if net_cmd ip link add name "$test_bridge" type bridge 2>/dev/null; then
@@ -678,8 +721,19 @@ detect_bridge_method() {
         fi
     fi
     
-    # Method 3: Just TAP interface
+    # Method 2: brctl (bridge-utils) - RELIABLE on older systems
+    if command -v brctl >/dev/null 2>&1; then
+        local test_bridge="qemutest_$$"
+        if net_cmd brctl addbr "$test_bridge" 2>/dev/null; then
+            net_cmd brctl delbr "$test_bridge" 2>/dev/null
+            echo "brctl"
+            return 0
+        fi
+    fi
+    
+    # Method 3: Just TAP interface without bridge
     if check_tun_available; then
+        # Try tunctl first
         if command -v tunctl >/dev/null 2>&1; then
             local test_tap="qemutest_$$"
             if net_cmd tunctl -t "$test_tap" 2>/dev/null; then
@@ -687,10 +741,23 @@ detect_bridge_method() {
                 echo "tap-only"
                 return 0
             fi
-        elif command -v ip >/dev/null 2>&1; then
+        fi
+        
+        # Try ip tuntap as fallback
+        if command -v ip >/dev/null 2>&1; then
             local test_tap="qemutest_$$"
             if net_cmd ip tuntap add dev "$test_tap" mode tap 2>/dev/null; then
                 net_cmd ip tuntap del dev "$test_tap" mode tap 2>/dev/null
+                echo "tap-only"
+                return 0
+            fi
+        fi
+        
+        # Try openvpn as last resort
+        if command -v openvpn >/dev/null 2>&1; then
+            local test_tap="qemutest_$$"
+            if net_cmd openvpn --mktun --dev "$test_tap" 2>/dev/null; then
+                net_cmd openvpn --rmtun --dev "$test_tap" 2>/dev/null
                 echo "tap-only"
                 return 0
             fi
@@ -705,6 +772,7 @@ detect_bridge_method() {
 create_tap_interface() {
     local tap_name="$1"
     
+    # Try tunctl first
     if command -v tunctl >/dev/null 2>&1; then
         if net_cmd tunctl -t "$tap_name" 2>/dev/null; then
             net_cmd ip link set "$tap_name" up 2>/dev/null
@@ -712,6 +780,7 @@ create_tap_interface() {
         fi
     fi
     
+    # Try ip tuntap
     if command -v ip >/dev/null 2>&1; then
         if net_cmd ip tuntap add dev "$tap_name" mode tap 2>/dev/null; then
             net_cmd ip link set "$tap_name" up 2>/dev/null
@@ -719,9 +788,12 @@ create_tap_interface() {
         fi
     fi
     
-    if command -v openvpn >/dev/null 2>&1 && net_cmd openvpn --mktun --dev "$tap_name" 2>/dev/null; then
-        net_cmd ip link set "$tap_name" up 2>/dev/null
-        return 0
+    # Try openvpn as last resort
+    if command -v openvpn >/dev/null 2>&1; then
+        if net_cmd openvpn --mktun --dev "$tap_name" 2>/dev/null; then
+            net_cmd ip link set "$tap_name" up 2>/dev/null
+            return 0
+        fi
     fi
     
     return 1
@@ -948,17 +1020,28 @@ detect_nested_environment() {
 }
 
 
-# --- Main bridge setup orchestration ---
+# --- Main bridge setup orchestration with WSL detection and multiple fallbacks ---
 setup_bridge_network() {
     echo "[NET] Attempting to set up bridge networking..."
     
+    # Check for WSL environment first - bridge networking is not supported in WSL
+    if detect_wsl; then
+        echo "[NET] WSL (Windows Subsystem for Linux) detected"
+        echo "[NET] Bridge networking is not supported in WSL"
+        echo "[NET] Will use port forwarding instead (works everywhere)"
+        return 1
+    fi
+    
+    # Check for sufficient privileges
     if ! check_net_privileges; then
         echo "[NET] Will use port forwarding instead"
         return 1
     fi
     
+    # Check for TUN/TAP support
     if ! check_tun_available; then
-        echo "[NET] TUN/TAP not available, will use port forwarding"
+        echo "[NET] TUN/TAP is not available on this system"
+        echo "[NET] Will use port forwarding instead"
         return 1
     fi
     
@@ -975,47 +1058,89 @@ setup_bridge_network() {
         echo "[NET] Using nested subnet: ${BRIDGE_SUBNET}"
     fi
     
-    bridge_method=$(detect_bridge_method)
+    # Detect available bridge creation method
+    local bridge_method=$(detect_bridge_method)
     if [ "$bridge_method" = "none" ]; then
-        echo "[NET] No bridge utilities found, will use port forwarding"
+        echo "[NET] No bridge utilities found on this system"
+        echo "[NET] Will use port forwarding instead"
         return 1
     fi
     
     echo "[NET] Using bridge method: ${bridge_method}"
     
+    # Attempt bridge setup with fallback chain
+    local setup_success="false"
+    
     case "$bridge_method" in
         ip-bridge)
-            setup_bridge_ip || return 1
+            echo "[NET] Attempting bridge setup with ip command..."
+            if setup_bridge_ip; then
+                setup_success="true"
+            else
+                echo "[NET] ip-bridge method failed"
+                # Try brctl as fallback
+                if command -v brctl >/dev/null 2>&1; then
+                    echo "[NET] Attempting fallback to brctl method..."
+                    if setup_bridge_brctl; then
+                        bridge_method="brctl"
+                        setup_success="true"
+                    fi
+                fi
+            fi
             ;;
         brctl)
-            setup_bridge_brctl || return 1
+            echo "[NET] Attempting bridge setup with brctl command..."
+            if setup_bridge_brctl; then
+                setup_success="true"
+            else
+                echo "[NET] brctl method failed"
+                # Try ip-bridge as fallback
+                if command -v ip >/dev/null 2>&1; then
+                    echo "[NET] Attempting fallback to ip-bridge method..."
+                    if setup_bridge_ip; then
+                        bridge_method="ip-bridge"
+                        setup_success="true"
+                    fi
+                fi
+            fi
             ;;
         tap-only)
-            echo "[NET] Using TAP-only mode"
+            echo "[NET] Using TAP-only mode (no bridge)"
             if ! create_tap_interface "${TAP_PREFIX}0"; then
                 echo "[NET] Failed to create TAP interface"
                 return 1
             fi
+            # Use TAP interface directly as bridge
             BRIDGE_NAME="${TAP_PREFIX}0"
             net_cmd ip addr add "${BRIDGE_IP}/24" dev "$BRIDGE_NAME" 2>/dev/null
             net_cmd ip link set "$BRIDGE_NAME" up 2>/dev/null
+            setup_success="true"
             ;;
     esac
     
-    if ! ip link show "$BRIDGE_NAME" >/dev/null 2>&1; then
-        echo "[NET] Bridge interface not found after setup"
+    # If all methods failed, return failure
+    if [ "$setup_success" = "false" ]; then
+        echo "[NET] All bridge setup methods failed"
+        echo "[NET] Will use port forwarding instead"
         return 1
     fi
     
-    # In nested mode, add a route to reach parent's network through the correct interface
+    # Verify that the bridge interface exists
+    if ! ip link show "$BRIDGE_NAME" >/dev/null 2>&1; then
+        echo "[NET] Bridge interface not found after setup"
+        echo "[NET] Will use port forwarding instead"
+        return 1
+    fi
+    
+    # In nested mode, add route to parent network
     if [ "$IS_NESTED" = "true" ]; then
-        # Find the interface that has the parent's subnet
         local parent_iface=$(ip route show 2>/dev/null | grep "via ${NESTED_BRIDGE_IP%%1}1" | awk '{print $3}' | head -1 || ip route show default 2>/dev/null | awk '{print $5}')
         if [ -n "$parent_iface" ]; then
             echo "[NET] Setting up NAT for nested subnet via ${parent_iface}"
         fi
     fi
     
+    # Setup NAT for internet access
     setup_nat
     
     echo "[NET] Bridge network ready: ${BRIDGE_NAME} (${BRIDGE_IP}/24)"
