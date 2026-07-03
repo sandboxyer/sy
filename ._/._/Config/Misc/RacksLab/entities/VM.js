@@ -7,7 +7,7 @@ class VM {
         Model: SyDB.Model('VMConfig', {
             name:          { type: 'string', required: true, indexed: true },
             os:            { type: 'string', default: 'alpine' },
-            diskSize:      { type: 'string', default: '10G' },
+            size:         { type: 'string', default: '10G' },
             memory:        { type: 'number' },
             cpu:           { type: 'number', default: 1 },
             port:          { type: 'number' },
@@ -105,10 +105,10 @@ class VM {
                     description: 'Operating system'
                 },
                 {
-                    name: 'diskSize',
+                    name: 'size',
                     type: 'string',
                     default: '10G',
-                    possibleValues: ['5G', '10G', '20G', '40G', '80G'],
+                    possibleValues: ['5G', '10G', '20G', '30G' ,'40G', '80G'],
                     description: 'Virtual disk size (e.g. 10G, 20G)'
                 },
                 {
