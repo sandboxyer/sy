@@ -85,8 +85,8 @@ class RacksLab extends SyAPP.Func(){
                            
                            await this.DropDown(uid,`commands-${host.host}`,async () => {
                                this.Buttons(uid,[{name :'One-line'},{name : 'Flow'}])
-                           },{up_buttontext : this.TextColor.pink('Run Commands'),
-                               down_buttontext : this.TextColor.pink('Run Commands'),
+                           },{up_buttontext : this.TextColor.pink('Run'),
+                               down_buttontext : this.TextColor.pink('Run'),
                                up_emoji : '+',
                                down_emoji : '-',horizontal :true
                            })
@@ -97,6 +97,7 @@ class RacksLab extends SyAPP.Func(){
                                    this.Button(uid,`${ColorText.green(`    ⚡ Send Now (${getTotalSize(this.FileManager.GetSelected(uid,host.host))})`)} `,{props : {sendfiles : host.host}}) 
                                 }
                                 this.File(uid,{name : host.host,startPath : '/home'})
+                                this.Button(uid,' ')
                            },{up_buttontext : this.TextColor.pink('Send Files'),
                                down_buttontext : this.TextColor.pink('Send Files'),
                                up_emoji : '+',
@@ -136,6 +137,7 @@ class RacksLab extends SyAPP.Func(){
                     })
 
                     if(props.valuechange){
+                        this.DropDownManager.Close(uid,props.valuechange.key)
                         let actual = this.Storages.Get(uid,'vmfields')
                         actual[actual.findIndex(e => e.name == props.valuechange.key)].value = props.valuechange.value
                         this.Storages.Set(uid,'vmfields',actual)
