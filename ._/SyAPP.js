@@ -4185,6 +4185,360 @@ class SyAPP_Func {
 
     // --------------------------- Page Methods ---------------------------
 
+    // Add this after the DropDown method in the SyAPP_Func class
+
+/**
+ * Dropdown manager methods for managing dropdown states
+ * @namespace
+ */
+this.DropDownManager = {
+  /**
+   * Open a specific dropdown
+   * @param {string} id - User/build ID
+   * @param {string} dropdownName - Name of the dropdown (without 'dropdown-' prefix)
+   * @returns {boolean} Whether the operation succeeded
+   */
+  Open: (id, dropdownName) => {
+    if (!this.Builds.has(id)) {
+      if (this.Log) console.log(`DropDownManager.Open() Error - userBuild not found | BuildID: ${id}`);
+      return false;
+    }
+    
+    const storageKey = `dropdown-${dropdownName}`;
+    let state = this.Storages.Get(id, storageKey);
+    
+    if (!state) {
+      this.Storages.Set(id, storageKey, { dropped: false });
+      state = { dropped: false };
+      if (this.Log) console.log(`DropDownManager.Open() - Dropdown '${dropdownName}' not initialized, creating state | BuildID: ${id}`);
+    }
+    
+    if (!state.dropped) {
+      state.dropped = true;
+      this.Storages.Set(id, storageKey, state);
+      return true;
+    }
+    
+    return false; // Already open
+  },
+
+  /**
+   * Close a specific dropdown
+   * @param {string} id - User/build ID
+   * @param {string} dropdownName - Name of the dropdown (without 'dropdown-' prefix)
+   * @returns {boolean} Whether the operation succeeded
+   */
+  Close: (id, dropdownName) => {
+    if (!this.Builds.has(id)) {
+      if (this.Log) console.log(`DropDownManager.Close() Error - userBuild not found | BuildID: ${id}`);
+      return false;
+    }
+    
+    const storageKey = `dropdown-${dropdownName}`;
+    const state = this.Storages.Get(id, storageKey);
+    
+    if (!state) {
+      if (this.Log) console.log(`DropDownManager.Close() - Dropdown '${dropdownName}' not found | BuildID: ${id}`);
+      return false;
+    }
+    
+    if (state.dropped) {
+      state.dropped = false;
+      this.Storages.Set(id, storageKey, state);
+      return true;
+    }
+    
+    return false; // Already closed
+  },
+
+  /**
+   * Toggle a specific dropdown
+   * @param {string} id - User/build ID
+   * @param {string} dropdownName - Name of the dropdown (without 'dropdown-' prefix)
+   * @returns {boolean} New state (true = open, false = closed)
+   */
+  Toggle: (id, dropdownName) => {
+    if (!this.Builds.has(id)) {
+      if (this.Log) console.log(`DropDownManager.Toggle() Error - userBuild not found | BuildID: ${id}`);
+      return false;
+    }
+    
+    const storageKey = `dropdown-${dropdownName}`;
+    let state = this.Storages.Get(id, storageKey);
+    
+    if (!state) {
+      state = { dropped: false };
+      this.Storages.Set(id, storageKey, state);
+    }
+    
+    state.dropped = !state.dropped;
+    this.Storages.Set(id, storageKey, state);
+    
+    return state.dropped;
+  },
+
+  /**
+   * Check if a specific dropdown is open
+   * @param {string} id - User/build ID
+   * @param {string} dropdownName - Name of the dropdown (without 'dropdown-' prefix)
+   * @returns {boolean} Whether the dropdown is open
+   */
+  IsOpen: (id, dropdownName) => {
+    const storageKey = `dropdown-${dropdownName}`;
+    const state = this.Storages.Get(id, storageKey);
+    return state ? state.dropped : false;
+  },
+
+  /**
+   * Close all dropdowns for a user/build
+   * @param {string} id - User/build ID
+   * @returns {number} Number of dropdowns closed
+   */
+  CloseAll: (id) => {
+    let closedCount = 0;
+    
+    // Get all storage keys for this user
+    const allData = this.Storages.GetAll(id);
+    if (!allData) return 0;
+    
+    for (const key of Object.keys(allData)) {
+      if (key.startsWith('dropdown-')) {
+        const state = allData[key];
+        if (state && state.dropped) {
+          state.dropped = false;
+          this.Storages.Set(id, key, state);
+          closedCount++;
+        }
+      }
+    }
+    
+    return closedCount;
+  },
+
+  /**
+   * Get the state of all dropdowns for a user/build
+   * @param {string} id - User/build ID
+   * @returns {Object} Object with dropdown names as keys (without 'dropdown-' prefix) and their states
+   */
+  GetStates: (id) => {
+    const states = {};
+    const allData = this.Storages.GetAll(id);
+    
+    if (!allData) return states;
+    
+    for (const key of Object.keys(allData)) {
+      if (key.startsWith('dropdown-')) {
+        const dropdownName = key.replace('dropdown-', '');
+        states[dropdownName] = {
+          open: allData[key].dropped || false,
+          exists: true
+        };
+      }
+    }
+    
+    return states;
+  },
+
+  /**
+   * Get list of all dropdown names for a user/build (without 'dropdown-' prefix)
+   * @param {string} id - User/build ID
+   * @returns {Array<string>} Array of dropdown names
+   */
+  List: (id) => {
+    const dropdowns = [];
+    const allData = this.Storages.GetAll(id);
+    
+    if (!allData) return dropdowns;
+    
+    for (const key of Object.keys(allData)) {
+      if (key.startsWith('dropdown-')) {
+        dropdowns.push(key.replace('dropdown-', ''));
+      }
+    }
+    
+    return dropdowns;
+  },
+
+  /**
+   * Get count of open dropdowns for a user/build
+   * @param {string} id - User/build ID
+   * @returns {number} Number of open dropdowns
+   */
+  CountOpen: (id) => {
+    let openCount = 0;
+    const allData = this.Storages.GetAll(id);
+    
+    if (!allData) return 0;
+    
+    for (const key of Object.keys(allData)) {
+      if (key.startsWith('dropdown-') && allData[key].dropped) {
+        openCount++;
+      }
+    }
+    
+    return openCount;
+  },
+
+  /**
+   * Get total count of dropdowns for a user/build
+   * @param {string} id - User/build ID
+   * @returns {number} Total number of dropdowns
+   */
+  Count: (id) => {
+    let count = 0;
+    const allData = this.Storages.GetAll(id);
+    
+    if (!allData) return 0;
+    
+    for (const key of Object.keys(allData)) {
+      if (key.startsWith('dropdown-')) {
+        count++;
+      }
+    }
+    
+    return count;
+  },
+
+  /**
+   * Delete/reset a specific dropdown state
+   * @param {string} id - User/build ID
+   * @param {string} dropdownName - Name of the dropdown (without 'dropdown-' prefix)
+   * @returns {boolean} Whether the dropdown was deleted
+   */
+  Reset: (id, dropdownName) => {
+    const storageKey = `dropdown-${dropdownName}`;
+    return this.Storages.Delete(id, storageKey);
+  },
+
+  /**
+   * Delete all dropdown states for a user/build
+   * @param {string} id - User/build ID
+   * @returns {number} Number of dropdowns deleted
+   */
+  ResetAll: (id) => {
+    let deletedCount = 0;
+    const allData = this.Storages.GetAll(id);
+    
+    if (!allData) return 0;
+    
+    for (const key of Object.keys(allData)) {
+      if (key.startsWith('dropdown-')) {
+        this.Storages.Delete(id, key);
+        deletedCount++;
+      }
+    }
+    
+    return deletedCount;
+  },
+
+  /**
+   * Get detailed information about all dropdowns for a user/build
+   * @param {string} id - User/build ID
+   * @returns {Object} Detailed dropdown information
+   */
+  GetInfo: (id) => {
+    const info = {
+      total: 0,
+      open: 0,
+      closed: 0,
+      dropdowns: {}
+    };
+    
+    const allData = this.Storages.GetAll(id);
+    
+    if (!allData) return info;
+    
+    for (const key of Object.keys(allData)) {
+      if (key.startsWith('dropdown-')) {
+        const dropdownName = key.replace('dropdown-', '');
+        const state = allData[key];
+        const isOpen = state.dropped || false;
+        
+        info.total++;
+        if (isOpen) info.open++;
+        else info.closed++;
+        
+        info.dropdowns[dropdownName] = {
+          open: isOpen,
+          storageKey: key,
+          dropped: state.dropped
+        };
+      }
+    }
+    
+    return info;
+  },
+
+  /**
+   * Close all dropdowns except specified ones
+   * @param {string} id - User/build ID
+   * @param {Array<string>} keepOpen - Array of dropdown names to keep open (without 'dropdown-' prefix)
+   * @returns {number} Number of dropdowns closed
+   */
+  CloseAllExcept: (id, keepOpen = []) => {
+    let closedCount = 0;
+    const allData = this.Storages.GetAll(id);
+    
+    if (!allData) return 0;
+    
+    for (const key of Object.keys(allData)) {
+      if (key.startsWith('dropdown-')) {
+        const dropdownName = key.replace('dropdown-', '');
+        if (!keepOpen.includes(dropdownName)) {
+          const state = allData[key];
+          if (state && state.dropped) {
+            state.dropped = false;
+            this.Storages.Set(id, key, state);
+            closedCount++;
+          }
+        }
+      }
+    }
+    
+    return closedCount;
+  },
+
+  /**
+   * Check if a dropdown exists
+   * @param {string} id - User/build ID
+   * @param {string} dropdownName - Name of the dropdown (without 'dropdown-' prefix)
+   * @returns {boolean} Whether the dropdown exists
+   */
+  Exists: (id, dropdownName) => {
+    const storageKey = `dropdown-${dropdownName}`;
+    return this.Storages.Has(id, storageKey);
+  },
+
+  /**
+   * Set multiple dropdowns to the same state at once
+   * @param {string} id - User/build ID
+   * @param {Array<string>} dropdownNames - Array of dropdown names (without 'dropdown-' prefix)
+   * @param {boolean} open - Whether to open (true) or close (false) the dropdowns
+   * @returns {number} Number of dropdowns changed
+   */
+  SetMany: (id, dropdownNames = [], open = false) => {
+    let changedCount = 0;
+    
+    for (const dropdownName of dropdownNames) {
+      const storageKey = `dropdown-${dropdownName}`;
+      let state = this.Storages.Get(id, storageKey);
+      
+      if (!state) {
+        state = { dropped: false };
+        this.Storages.Set(id, storageKey, state);
+      }
+      
+      if (state.dropped !== open) {
+        state.dropped = open;
+        this.Storages.Set(id, storageKey, state);
+        changedCount++;
+      }
+    }
+    
+    return changedCount;
+  }
+};
+
     /**
      * Define a page in the UI.
      * Page‑enter hooks are executed only when the page actually changes, and

@@ -85,8 +85,8 @@ class RacksLab extends SyAPP.Func(){
                            
                            await this.DropDown(uid,`commands-${host.host}`,async () => {
                                this.Buttons(uid,[{name :'One-line'},{name : 'Flow'}])
-                           },{up_buttontext : this.TextColor.pink('Run Commands'),
-                               down_buttontext : this.TextColor.pink('Run Commands'),
+                           },{up_buttontext : this.TextColor.pink('Run'),
+                               down_buttontext : this.TextColor.pink('Run'),
                                up_emoji : '+',
                                down_emoji : '-',horizontal :true
                            })
@@ -97,6 +97,7 @@ class RacksLab extends SyAPP.Func(){
                                    this.Button(uid,`${ColorText.green(`    ⚡ Send Now (${getTotalSize(this.FileManager.GetSelected(uid,host.host))})`)} `,{props : {sendfiles : host.host}}) 
                                 }
                                 this.File(uid,{name : host.host,startPath : '/home'})
+                                this.Button(uid,' ')
                            },{up_buttontext : this.TextColor.pink('Send Files'),
                                down_buttontext : this.TextColor.pink('Send Files'),
                                up_emoji : '+',
@@ -136,6 +137,7 @@ class RacksLab extends SyAPP.Func(){
                     })
 
                     if(props.valuechange){
+                        this.DropDownManager.Close(uid,props.valuechange.key)
                         let actual = this.Storages.Get(uid,'vmfields')
                         actual[actual.findIndex(e => e.name == props.valuechange.key)].value = props.valuechange.value
                         this.Storages.Set(uid,'vmfields',actual)
@@ -182,7 +184,7 @@ class RacksLab extends SyAPP.Func(){
                     await this.DropDown(uid,'startcommands',async () => {
 
                         await this.DropDown(uid,`newcommand-vmconfig`,async () => {
-                            this.Buttons(uid,[{name :'One-line'},{name : 'Flow'}])
+                            this.Buttons(uid,[{name :'One-line'},{name : 'Flow'},{name : 'Load'}])
                         },{up_buttontext : this.TextColor.pink('New'),
                             down_buttontext : this.TextColor.pink('New'),
                             up_emoji : '+',
@@ -206,12 +208,15 @@ class RacksLab extends SyAPP.Func(){
                         if(e.value){ creation[e.name] = e.value}
                     })
 
+                    let launchbuttons = [{name : ColorText.lime('◈  Launch VM'),props : {customlaunch : creation,page : ''}}]
+                    launchbuttons.push({name : 'Save'})
+                    launchbuttons.push({name : 'Load'})
                     this.Button(uid,' ')
-                    this.Button(uid,ColorText.lime('◈  Launch VM'),{props : {customlaunch : creation,page : ''}})
+                    this.Buttons(uid,launchbuttons)
                     this.Button(uid,' ')
                     let lastbuttons = [{name : '<- Return',props : {page : ''}}]
-                    if(Object.keys(creation).length > 0){lastbuttons.push({name : 'Save'})}
-                    lastbuttons.push({name : 'Load'})
+                 
+                    
                     
                     
                     this.Buttons(uid,lastbuttons)
