@@ -207,6 +207,7 @@ BUILD_VERSION=""                    # NEW: specific version or "latest"
 BUILD_SAVE_NAME=""                  # NEW: saved configuration to load
 BUILD_DIR="$REPO_DIR/build"
 BUILD_SAVE_FILE="$REPO_DIR/buildsaves.cfg"   # NEW: persistent build configurations
+BUILD_INFO_FILE=false           # Changed from implicit true to false
 
 # NEW: List for files/directories manually included from actual filesystem (gitignored files)
 BUILD_INCLUDE_LIST="/tmp/build_include_$$.txt"
@@ -1976,7 +1977,9 @@ do_build() {
                 echo "  Included from filesystem: $(wc -l < "$ACTUAL_INCLUDE_LIST" 2>/dev/null || echo 0) files"
             fi
             echo ""
-            cat > "${tar_file}.info" <<EOF
+           # Only create info file if explicitly requested
+if [ "$BUILD_INFO_FILE" = true ]; then
+    cat > "${tar_file}.info" <<EOF
 Build Name: $build_name
 Build Date: $(date)
 Source Commit: $(git rev-parse "$BUILD_COMMIT" 2>/dev/null)
@@ -1984,6 +1987,7 @@ Commit Message: $BUILD_COMMIT_MSG
 Files: $file_count
 Filesystem Inclusions: $(wc -l < "$ACTUAL_INCLUDE_LIST" 2>/dev/null || echo 0)
 EOF
+fi
         else
             echo "Error: Failed to create tar.gz archive"; cd "$REPO_DIR"; rm -rf "$temp_build"; exit 1
         fi
@@ -2000,7 +2004,9 @@ EOF
                 echo "  Included from filesystem: $(wc -l < "$ACTUAL_INCLUDE_LIST" 2>/dev/null || echo 0) files"
             fi
             echo ""
-            cat > "$build_path/BUILD_INFO.txt" <<EOF
+            # Only create info file if explicitly requested
+if [ "$BUILD_INFO_FILE" = true ]; then
+    cat > "$build_path/BUILD_INFO.txt" <<EOF
 Build Name: $build_name
 Build Date: $(date)
 Source Commit: $(git rev-parse "$BUILD_COMMIT" 2>/dev/null)
@@ -2008,6 +2014,7 @@ Commit Message: $BUILD_COMMIT_MSG
 Files: $file_count
 Filesystem Inclusions: $(wc -l < "$ACTUAL_INCLUDE_LIST" 2>/dev/null || echo 0)
 EOF
+fi
         else
             echo "Error: Failed to create build directory"; rm -rf "$temp_build"; exit 1
         fi
