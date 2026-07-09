@@ -208,6 +208,7 @@ BUILD_SAVE_NAME=""                  # NEW: saved configuration to load
 BUILD_DIR="$REPO_DIR/build"
 BUILD_SAVE_FILE="$REPO_DIR/buildsaves.cfg"   # NEW: persistent build configurations
 BUILD_INFO_FILE=false           # Changed from implicit true to false
+FORCE_UPDATE=false              # NEW: skip interactive menu and force update
 
 # NEW: List for files/directories manually included from actual filesystem (gitignored files)
 BUILD_INCLUDE_LIST="/tmp/build_include_$$.txt"
@@ -2043,6 +2044,7 @@ show_help() {
     echo "  --no-preserve    Don't preserve files during update"
     echo "  --node           Auto-install Node.js if missing (requires internet)"
     echo "  --nodejs         Same as --node"
+    echo "  --update         Force update without interactive menu"
     echo "  --build          Create a build from the last commit"
     echo "  --tar            Create a tar.gz archive (use with --build)"
     echo "  --config         Interactive file exclusion (use with --build)"
@@ -3531,6 +3533,51 @@ execute_post_install_scripts() {
 # END OF POST-INSTALL SCRIPTS EXECUTION
 # =============================================================================
 
+# =============================================================================
+# UPDATE INSTALLATION FUNCTION
+# =============================================================================
+# Handles the update process: backs up existing installation, removes old links,
+# copies new files, preserves whitelisted files, creates new links, and runs
+# post-install scripts.
+# =============================================================================
+
+perform_update() {
+    log_message "Performing update of existing installation..."
+    
+    # Always remove old pkg-cli.js during update to ensure fresh creation
+    if [ -f "$INSTALL_DIR/pkg-cli.js" ]; then
+        rm -f "$INSTALL_DIR/pkg-cli.js"
+    fi
+    
+    # Backup existing installation
+    mv -f "$INSTALL_DIR" "$BACKUP_DIR"
+    
+    # Remove old command links
+    remove_links
+    
+    # Proceed with normal installation steps
+    install_debs
+    mkdir -p "$INSTALL_DIR"
+    copy_files "$MAIN_SOURCE_DIR" "$INSTALL_DIR"
+    preserve_files_from_backup
+    
+    # Extract archives if configured
+    [ -n "$PM2_TAR_GZ" ] && extract_archive "$PM2_TAR_GZ" "$PM2_EXTRACT_DIR"
+    
+    create_command_links "$INSTALL_DIR"
+    
+    # Execute post-installation scripts after all main installation steps are complete
+    execute_post_install_scripts "$INSTALL_DIR"
+    
+    cleanup
+    
+    log_message "$PROJECT_NAME update completed!"
+}
+
+# =============================================================================
+# END OF UPDATE INSTALLATION FUNCTION
+# =============================================================================
+
 cleanup() {
     sudo dpkg --configure -a > /dev/null 2>&1 || true
 }
@@ -3558,6 +3605,7 @@ for arg in "$@"; do
         --local-dir) LOCAL_DIR_MODE=true ;;
         --no-preserve) PRESERVE_DATA=false ;;
         --node|--nodejs) INSTALL_NODE=true ;;
+        --update) FORCE_UPDATE=true ;;
         --build) BUILD_MODE=true ;;
         --tar) BUILD_TAR=true ;;
         --config) BUILD_CONFIG=true ;;
@@ -3566,7 +3614,7 @@ for arg in "$@"; do
     esac
     # Handle --build with optional save name
     # This catches: ./install.sh --build mysave  OR  ./install.sh --build --tar mysave
-    if [ "$prev_arg" = "--build" ] && [ "$arg" != "--build" ] && [ "$arg" != "--tar" ] && [ "$arg" != "--config" ] && [ "$arg" != "--message" ] && [ "$arg" != "--version" ] && [ "$arg" != "-log" ] && [ "$arg" != "--skip-debs" ] && [ "$arg" != "--local-dir" ] && [ "$arg" != "--no-preserve" ] && [ "$arg" != "--node" ] && [ "$arg" != "--nodejs" ] && [ "$arg" != "-h" ] && [ "$arg" != "--help" ]; then
+    if [ "$prev_arg" = "--build" ] && [ "$arg" != "--build" ] && [ "$arg" != "--tar" ] && [ "$arg" != "--config" ] && [ "$arg" != "--message" ] && [ "$arg" != "--version" ] && [ "$arg" != "-log" ] && [ "$arg" != "--skip-debs" ] && [ "$arg" != "--local-dir" ] && [ "$arg" != "--no-preserve" ] && [ "$arg" != "--node" ] && [ "$arg" != "--nodejs" ] && [ "$arg" != "--update" ] && [ "$arg" != "-h" ] && [ "$arg" != "--help" ]; then
         BUILD_SAVE_NAME="$arg"
     fi
     # Handle --version with specific version number
@@ -3615,27 +3663,113 @@ log_message "Starting $PROJECT_NAME installation..."
 # Check and install Node.js if --node or --nodejs flag was provided
 ensure_nodejs
 
+# =========================================================================
+# HANDLE EXISTING INSTALLATION
+# =========================================================================
+# If --update flag is set, force update without interactive menu.
+# Otherwise, show the interactive menu (1=Update, 2=Remove, 3=Exit).
+# =========================================================================
+
 if [ -d "$INSTALL_DIR" ]; then
     log_message "Existing installation found."
-    printf "Choose: 1=Update, 2=Remove, 3=Exit\n"
-    printf "Enter choice: "
-    read choice
-    case "$choice" in
-        1) 
-            # Always remove old pkg-cli.js during update to ensure fresh creation
-            if [ -f "$INSTALL_DIR/pkg-cli.js" ]; then
-                rm -f "$INSTALL_DIR/pkg-cli.js"
-            fi
-            mv -f "$INSTALL_DIR" "$BACKUP_DIR"
-            remove_links 
-            ;;
-        2) remove_links; rm -rf "$INSTALL_DIR"; exit 0 ;;
-        3) exit 0 ;;
-        *) exit 1 ;;
-    esac
+    
+    if [ "$FORCE_UPDATE" = true ]; then
+        # Force update mode - skip interactive menu
+        log_message "--update flag detected, forcing update without interactive menu..."
+        perform_update
+        # Display final summary and exit
+        printf "\n"
+        echo "Available commands:"
+        for cmd in $NODE_ENTRY_POINTS_CMD; do
+            echo "  $cmd"
+        done
+        if [ -n "$SHELL_SCRIPTS_CMD" ]; then
+            for cmd in $SHELL_SCRIPTS_CMD; do
+                echo "  $cmd"
+            done
+        fi
+        echo "  wsave"
+        echo "  git-config"
+        printf "\n"
+        echo "Working directory configuration:"
+        for cmd in $NODE_ENTRY_POINTS_CMD; do
+            working_dir=$(get_command_working_dir "$cmd")
+            echo "  $cmd: $working_dir"
+        done
+        if [ -n "$SHELL_SCRIPTS_CMD" ]; then
+            for cmd in $SHELL_SCRIPTS_CMD; do
+                working_dir=$(get_command_working_dir "$cmd")
+                echo "  $cmd: $working_dir (bash→ash fallback)"
+            done
+        fi
+        echo "  git-config: global"
+        printf "\n"
+        echo "pkg command features:"
+        echo "  pkg start                    - Create/ensure package.json has version 0.0.1 and type:module"
+        echo "  pkg run <script> [args...]   - Run any script from package.json with arguments"
+        echo "  pkg version <type|ver>       - Update version and create git commit"
+        printf "\n"
+        echo "pack command features:"
+        echo "  pack [path1] [path2] ...     - Compare directories and show differences"
+        echo "  Examples:"
+        echo "    pack path/to/project              - Compare single directory with itself"
+        echo "    pack path/to/one path/to/two      - Compare two directories"
+        echo "    pack path/one path/two path/three - Compare multiple directories"
+        printf "\n"
+        echo "Other commands:"
+        echo "  wsave                        - Surgically fix VSCode save permissions silently"
+        echo "  git-config                    - Complete Git setup (finds and runs Git.js --setup)"
+        printf "\n"
+        echo "pkg version supports:"
+        echo "  • patch    - Bump patch version (1.2.3 → 1.2.4)"
+        echo "  • minor    - Bump minor version (1.2.3 → 1.3.0)"
+        echo "  • major    - Bump major version (1.2.3 → 2.0.0)"
+        echo "  • X.Y.Z    - Set specific version"
+        echo "  • X.Y.Z-prerelease - Set version with prerelease tag"
+        printf "\n"
+        echo "Examples:"
+        echo "  pkg start                     # Creates/ensures package.json has version 0.0.1 and type:module"
+        echo "  pkg run test                  # Runs 'test' script from package.json"
+        echo "  pkg run build                 # Runs 'build' script from package.json"
+        echo "  pkg run dev --port 3000       # Runs 'dev' script with --port argument"
+        echo "  pkg version patch             # Bumps patch version and commits"
+        echo "  pack ./project1 ./project2    # Compares two directories"
+        echo "  pack ./src ./dist             # Compares source and distribution directories"
+        echo "  git-config                     # Complete Git setup (Git.js --setup)"
+        printf "\n"
+        echo "Note: pkg works from any directory. 'pkg start' ensures package.json has version 0.0.1 and type:module"
+        echo "Note: pack works from any directory and supports multiple paths as arguments"
+        echo "Note: git-config finds Git.js anywhere in the installation tree"
+        if [ -n "$SHELL_SCRIPTS_CMD" ]; then
+            printf "\n"
+            echo "Shell script commands use automatic bash→ash fallback for maximum compatibility"
+            echo "Each .sh script is wrapped to detect and use the best available shell interpreter"
+        fi
+        printf "\n"
+        if [ "$LOCAL_DIR_MODE" = true ]; then
+            echo "Commands run from current directory"
+        else
+            echo "Installation directory: $INSTALL_DIR"
+            echo "Node.js processes start in configured working directories (see above)"
+        fi
+        exit 0
+    else
+        # Interactive mode - show menu
+        printf "Choose: 1=Update, 2=Remove, 3=Exit\n"
+        printf "Enter choice: "
+        read choice
+        case "$choice" in
+            1)
+                perform_update
+                ;;
+            2) remove_links; rm -rf "$INSTALL_DIR"; exit 0 ;;
+            3) exit 0 ;;
+            *) exit 1 ;;
+        esac
+    fi
 fi
 
-# Main installation steps
+# Main installation steps (fresh install)
 install_debs
 mkdir -p "$INSTALL_DIR"
 copy_files "$MAIN_SOURCE_DIR" "$INSTALL_DIR"
