@@ -5568,284 +5568,278 @@ this.DropDownManager = {
 
     // --------------------------- Pagination Methods ---------------------------
 
-    /**
- * Pagination utilities
- * @namespace
- */
-this.Pagination = {
-  /**
-   * Create paginated buttons
-   * @param {string} id - User/build ID
-   * @param {string} name - Pagination name
-   * @param {Array} data - Data to paginate
-   * @param {Object} config - Pagination config
-   * @param {number} [config.actual_page=1] - Current page
-   * @param {number} [config.items_per_page=5] - Items per page
-   * @param {Object} [config.button] - Button configuration
-   * @param {Array} [config.button.text] - Button text configuration
-   * @param {Object} [config.button.path] - Button path configuration
-   * @param {Array} [config.button.props] - Button props configuration
-   * @param {boolean} [config.template_config=true] - Use template config
-   * @returns {{actual_page: number, total_pages: number}} Pagination info
-   */
-  Button: (id, name = '', data = [], config = {
-    actual_page: 1,
-    items_per_page: 5,
-    button: {
-      text: [{ type: 'text', value: 'text1' }, { type: 'key', value: 'ID' }],
-      path: { type: 'text', value: 'path1' },
-      props: [{ props_key: 'id', type: 'text', value: 'ID' }]
-    },
-    template_config: true
-  }) => {
-    // Handle empty data case
-    if (!data || !data.length) {
-      if (this.Log) {
-        console.log(`This.Pagination.Button() Error - Empty Data Array | BuildID: ${id}`);
-      }
-      
-      // Clean up storage for this pagination
-      if (this.Storages.Has(id, name)) {
-        this.Storages.Delete(id, name);
-      }
-      
-      return {
-        actual_page: 0,
-        total_pages: 0
-      };
-    }
-
-    // Calculate pagination based on CURRENT data
-    const itemsPerPage = config.items_per_page || 5;
-    const paginatedData = BuildPagination(data, itemsPerPage);
-    const totalPages = paginatedData.length;
-
-    // Get or initialize storage
-    let storage = this.Storages.Get(id, name);
+    this.Pagination = {
+      Button: async (id, name = '', data = [], config = {}) => {
+        // Default config – no sweeping template_config, mode chosen by presence of renderItem/button
+        const finalConfig = {
+          actual_page: 1,
+          items_per_page: 5,
+          button: {
+            text: [{ type: 'text', value: 'text1' }, { type: 'key', value: 'ID' }],
+            path: { type: 'text', value: 'path1' },
+            props: [{ props_key: 'id', type: 'text', value: 'ID' }]
+          },
+          renderItem: null,
+          ...config
+        };
     
-    if (!storage) {
-      // First time initialization
-      storage = {
-        actual_page: config.actual_page || 1,
-        total_pages: totalPages
-      };
-    } else {
-      // Update total pages to match current data
-      storage.total_pages = totalPages;
-      
-      // Clamp current page to valid range
-      if (storage.actual_page > totalPages) {
-        storage.actual_page = totalPages;
-      }
-      if (storage.actual_page < 1 && totalPages > 0) {
-        storage.actual_page = 1;
-      }
-    }
-
-    // Handle navigation button clicks
-    const currentProps = this.Builds.get(id).Session.ActualProps;
-
-    if (currentProps.pagination_next === name) {
-      if (storage.actual_page < totalPages) {
-        storage.actual_page++;
-      }
-      delete this.Builds.get(id).Session.ActualProps.pagination_next;
-    }
-
-    if (currentProps.pagination_prev === name) {
-      if (storage.actual_page > 1) {
-        storage.actual_page--;
-      }
-      delete this.Builds.get(id).Session.ActualProps.pagination_prev;
-    }
-
-    // Ensure page is still valid after navigation
-    storage.actual_page = Math.max(1, Math.min(storage.actual_page, totalPages));
+        // Handle empty data
+        if (!data || !data.length) {
+          if (this.Storages.Has(id, name)) {
+            this.Storages.Delete(id, name);
+          }
+          return { actual_page: 0, total_pages: 0, items_on_page: 0, total_items: 0 };
+        }
     
-    // Save updated storage
-    this.Storages.Set(id, name, storage);
-
-    // Display page counter
-    this.Text(id, `Page ${storage.actual_page} of ${totalPages}`);
-
-    // Get items for current page
-    const currentPageIndex = storage.actual_page - 1;
-    const currentPageItems = paginatedData[currentPageIndex]?.list || [];
-
-    // Render buttons for current page items
-    if (config.button && !config.template_config) {
-      // Custom button template
-      currentPageItems.forEach(item => {
-        let buttonText = '';
-        let buttonPath = this.Name;
-        let buttonProps = {};
-
-        // Build button text from template
-        if (config.button.text) {
-          config.button.text.forEach(textConfig => {
-            switch (textConfig.type) {
-              case 'text':
-                buttonText += textConfig.value;
-                break;
-              case 'key':
-                if (typeof item === 'object' && item[textConfig.value] !== undefined) {
-                  buttonText += item[textConfig.value];
-                }
-                break;
-            }
-          });
-        }
-
-        // Build button path from template
-        if (config.button.path) {
-          switch (config.button.path.type) {
-            case 'text':
-              buttonPath = config.button.path.value;
-              break;
-            case 'key':
-              if (typeof item === 'object' && item[config.button.path.value] !== undefined) {
-                buttonPath = item[config.button.path.value];
-              }
-              break;
-          }
-        }
-
-        // Build button props from template
-        if (config.button.props) {
-          config.button.props.forEach(propConfig => {
-            switch (propConfig.type) {
-              case 'text':
-                buttonProps[propConfig.props_key] = propConfig.value;
-                break;
-              case 'key':
-                if (typeof item === 'object' && item[propConfig.value] !== undefined) {
-                  buttonProps[propConfig.props_key] = item[propConfig.value];
-                }
-                break;
-            }
-          });
-        }
-
-        // Create the button
-        this.Button(id, {
-          name: buttonText || JSON.stringify(item),
-          path: buttonPath,
-          props: buttonProps
-        });
-      });
-    } else {
-      // Default button template (auto-detect properties)
-      currentPageItems.forEach(item => {
-        let buttonName;
-        let buttonProps = {};
-
-        if (typeof item === 'object' && item !== null) {
-          // Use first property as button name
-          const keys = Object.keys(item);
-          if (keys.length > 0) {
-            const firstKey = keys[0];
-            buttonName = `${firstKey}: ${item[firstKey]}`;
-          } else {
-            buttonName = JSON.stringify(item);
-          }
-          
-          // Pass all item properties as button props
-          buttonProps = { ...item };
+        // Pagination calculation
+        const itemsPerPage = finalConfig.items_per_page || 5;
+        const paginatedData = BuildPagination(data, itemsPerPage);
+        const totalPages = paginatedData.length;
+    
+        let storage = this.Storages.Get(id, name);
+        if (!storage) {
+          storage = { actual_page: finalConfig.actual_page || 1, total_pages: totalPages };
         } else {
-          // Primitive value
-          buttonName = String(item);
-          buttonProps = { value: item };
+          storage.total_pages = totalPages;
+          if (storage.actual_page > totalPages) storage.actual_page = totalPages;
+          if (storage.actual_page < 1) storage.actual_page = 1;
         }
-
-        this.Button(id, {
-          name: buttonName,
-          path: this.Name,
-          props: buttonProps
+    
+        // Navigation (next/prev props)
+        const currentProps = this.Builds.get(id).Session.ActualProps;
+    
+        if (currentProps[`pagination_next_${name}`]) {
+          if (storage.actual_page < totalPages) storage.actual_page++;
+          delete currentProps[`pagination_next_${name}`];
+        }
+    
+        if (currentProps[`pagination_prev_${name}`]) {
+          if (storage.actual_page > 1) storage.actual_page--;
+          delete currentProps[`pagination_prev_${name}`];
+        }
+    
+        storage.actual_page = Math.max(1, Math.min(storage.actual_page, totalPages));
+        this.Storages.Set(id, name, storage);
+    
+        const currentPageItems = paginatedData[storage.actual_page - 1]?.list || [];
+        const startIndex = (storage.actual_page - 1) * itemsPerPage;
+    
+        // ============================================================
+        // PRE-PROCESS: Force close all dropdowns except the clicked one
+        // ============================================================
+        if (finalConfig.renderItem && typeof finalConfig.renderItem === 'function') {
+          const paginationDropdownPrefix = `dropdown-pagination-${name}-`;
+          const allStorageKeys = Object.keys(this.Storages.GetAll(id) || {});
+          const paginationDropdownKeys = allStorageKeys.filter(key => 
+            key.startsWith(paginationDropdownPrefix)
+          );
+    
+          let clickedDropdownKey = null;
+          for (const key of Object.keys(currentProps)) {
+            if (key.startsWith('droprun') && currentProps[key]) {
+              clickedDropdownKey = currentProps[key];
+              break;
+            }
+          }
+    
+          if (clickedDropdownKey) {
+            paginationDropdownKeys.forEach(dropdownKey => {
+              if (dropdownKey !== clickedDropdownKey) {
+                const dropdownState = this.Storages.Get(id, dropdownKey);
+                if (dropdownState && dropdownState.dropped) {
+                  dropdownState.dropped = false;
+                  this.Storages.Set(id, dropdownKey, dropdownState);
+                }
+              }
+            });
+          }
+        }
+    
+        // ============================================================
+        // RENDERING: choose mode based on config
+        // ============================================================
+        if (finalConfig.renderItem && typeof finalConfig.renderItem === 'function') {
+          // ----- MODULAR (DROPDOWN) MODE -----
+          this.Button(id, { name: '─'.repeat(40) }); // separator
+    
+          for (let i = 0; i < currentPageItems.length; i++) {
+            const item = currentPageItems[i];
+            const globalIndex = startIndex + i;
+    
+            const itemData = {
+              item: item,
+              index: i,
+              globalIndex: globalIndex,
+              pageIndex: storage.actual_page,
+              isFirst: i === 0,
+              isLast: i === currentPageItems.length - 1,
+              get: (key) => (typeof item === 'object' && item !== null) ? item[key] : undefined,
+              has: (key) => (typeof item === 'object' && item !== null) ? key in item : false,
+              keys: (typeof item === 'object' && item !== null) ? Object.keys(item) : [],
+              values: (typeof item === 'object' && item !== null) ? Object.values(item) : [],
+              isObject: typeof item === 'object' && item !== null,
+              isArray: Array.isArray(item),
+              isString: typeof item === 'string',
+              isNumber: typeof item === 'number',
+              toString: () => typeof item === 'object' && item !== null ? JSON.stringify(item) : String(item),
+              pagination: {
+                name: name,
+                actualPage: storage.actual_page,
+                totalPages: totalPages,
+                itemsPerPage: itemsPerPage,
+                totalItems: data.length,
+                startIndex: startIndex,
+                endIndex: Math.min(storage.actual_page * itemsPerPage, data.length),
+                hasNext: storage.actual_page < totalPages,
+                hasPrev: storage.actual_page > 1,
+                isFirstPage: storage.actual_page === 1,
+                isLastPage: storage.actual_page === totalPages
+              }
+            };
+    
+            try {
+              const result = finalConfig.renderItem(itemData);
+              if (result instanceof Promise) await result;
+            } catch (error) {
+              console.error(`Pagination renderItem error:`, error);
+              this.Button(id, {
+                name: `Error rendering item ${globalIndex + 1}`,
+                path: this.Name,
+                props: { error: error.message }
+              });
+            }
+    
+            if (i < currentPageItems.length - 1) {
+              this.Button(id, { name: '─'.repeat(40) });
+            }
+          }
+    
+          this.Button(id, { name: '─'.repeat(40) }); // footer separator
+        } 
+        else if (finalConfig.button) {
+          // ----- LEGACY TEMPLATE MODE -----
+          currentPageItems.forEach(item => {
+            let buttonText = '';
+            let buttonPath = this.Name;
+            let buttonProps = {};
+    
+            if (finalConfig.button.text) {
+              finalConfig.button.text.forEach(t => {
+                if (t.type === 'text') buttonText += t.value;
+                else if (t.type === 'key' && typeof item === 'object') buttonText += item[t.value] || '';
+              });
+            }
+    
+            if (finalConfig.button.path) {
+              if (finalConfig.button.path.type === 'text') buttonPath = finalConfig.button.path.value;
+              else if (finalConfig.button.path.type === 'key' && typeof item === 'object') buttonPath = item[finalConfig.button.path.value] || this.Name;
+            }
+    
+            if (finalConfig.button.props) {
+              finalConfig.button.props.forEach(p => {
+                if (p.type === 'text') buttonProps[p.props_key] = p.value;
+                else if (p.type === 'key' && typeof item === 'object') buttonProps[p.props_key] = item[p.value];
+              });
+            }
+    
+            this.Button(id, {
+              name: buttonText || JSON.stringify(item),
+              path: buttonPath,
+              props: buttonProps
+            });
+          });
+        } 
+        else {
+          // ----- DEFAULT AUTO-DETECT MODE -----
+          currentPageItems.forEach(item => {
+            let buttonName, buttonProps = {};
+    
+            if (typeof item === 'object' && item !== null) {
+              const keys = Object.keys(item);
+              buttonName = keys.length > 0 ? `${keys[0]}: ${item[keys[0]]}` : JSON.stringify(item);
+              buttonProps = { ...item };
+            } else {
+              buttonName = String(item);
+              buttonProps = { value: item };
+            }
+    
+            this.Button(id, {
+              name: buttonName,
+              path: this.Name,
+              props: buttonProps
+            });
+          });
+        }
+    
+        // ============================================================
+        // NAVIGATION CONTROLS (same for all modes)
+        // ============================================================
+        this.Button(id, { name: ' ' });
+        this.Text(id, `Page ${storage.actual_page} of ${totalPages}  •  ${data.length} items`);
+    
+        const navButtons = [];
+    
+        if (storage.actual_page > 1) {
+          navButtons.push({
+            name: '◀  Prev',
+            props: { [`pagination_prev_${name}`]: true }
+          });
+        }
+    
+        navButtons.push({
+          name: `${storage.actual_page} / ${totalPages}`,
+          props: {}
         });
-      });
-    }
-
-    // Add spacer
-    this.Button(id, { name: ' ' });
-
-    // Navigation buttons
-    if (storage.actual_page > 1) {
-      this.SideButton(id, {
-        name: '<- Prev',
-        props: { pagination_prev: name }
-      });
-    }
-
-    if (storage.actual_page < totalPages) {
-      this.SideButton(id, {
-        name: 'Next ->',
-        props: { pagination_next: name }
-      });
-    }
-
-    // Return current pagination state
-    return {
-      actual_page: storage.actual_page,
-      total_pages: totalPages
-    };
-  },
-
-  /**
-   * Reset pagination state for a specific pagination
-   * @param {string} id - User/build ID
-   * @param {string} name - Pagination name
-   * @returns {boolean} Whether reset was successful
-   */
-  Reset: (id, name) => {
-    if (this.Storages.Has(id, name)) {
-      this.Storages.Delete(id, name);
-      return true;
-    }
-    return false;
-  },
-
-  /**
-   * Get current pagination state without rendering
-   * @param {string} id - User/build ID
-   * @param {string} name - Pagination name
-   * @returns {{actual_page: number, total_pages: number}} Pagination state
-   */
-  GetState: (id, name) => {
-    const storage = this.Storages.Get(id, name);
-    if (!storage) {
-      return {
-        actual_page: 1,
-        total_pages: 0
-      };
-    }
-    return {
-      actual_page: storage.actual_page,
-      total_pages: storage.total_pages
-    };
-  },
-
-  /**
-   * Force set current page for a pagination
-   * @param {string} id - User/build ID
-   * @param {string} name - Pagination name
-   * @param {number} page - Page number to set (1-based)
-   * @returns {boolean} Whether set was successful
-   */
-  SetPage: (id, name, page) => {
-    const storage = this.Storages.Get(id, name);
-    if (!storage) {
-      return false;
-    }
     
-    if (page < 1 || page > storage.total_pages) {
-      return false;
-    }
+        if (storage.actual_page < totalPages) {
+          navButtons.push({
+            name: 'Next  ▶',
+            props: { [`pagination_next_${name}`]: true }
+          });
+        }
     
-    storage.actual_page = page;
-    this.Storages.Set(id, name, storage);
-    return true;
-  }
-};
+        if (navButtons.length > 0) {
+          this.Buttons(id, navButtons);
+        }
+    
+        return {
+          actual_page: storage.actual_page,
+          total_pages: totalPages,
+          items_on_page: currentPageItems.length,
+          total_items: data.length,
+          start_index: startIndex,
+          end_index: Math.min(storage.actual_page * itemsPerPage, data.length)
+        };
+      },
+    
+      // Rest of Pagination object (Reset, GetState, SetPage) unchanged
+      Reset: (id, name) => {
+        if (this.Storages.Has(id, name)) {
+          this.Storages.Delete(id, name);
+          return true;
+        }
+        return false;
+      },
+    
+      GetState: (id, name) => {
+        const storage = this.Storages.Get(id, name);
+        return storage ? {
+          actual_page: storage.actual_page,
+          total_pages: storage.total_pages
+        } : {
+          actual_page: 1,
+          total_pages: 0
+        };
+      },
+    
+      SetPage: (id, name, page) => {
+        const storage = this.Storages.Get(id, name);
+        if (!storage || page < 1 || page > storage.total_pages) return false;
+        storage.actual_page = page;
+        this.Storages.Set(id, name, storage);
+        return true;
+      }
+    };
 
     // --------------------------- DropDown Method ---------------------------
 
