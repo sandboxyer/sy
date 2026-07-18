@@ -5569,186 +5569,283 @@ this.DropDownManager = {
     // --------------------------- Pagination Methods ---------------------------
 
     /**
-     * Pagination utilities
-     * @namespace
-     */
-    this.Pagination = {
-      /**
-       * Create paginated buttons
-       * @param {string} id - User/build ID
-       * @param {string} name - Pagination name
-       * @param {Array} data - Data to paginate
-       * @param {Object} config - Pagination config
-       * @param {number} [config.actual_page=1] - Current page
-       * @param {number} [config.items_per_page=5] - Items per page
-       * @param {Object} [config.button] - Button configuration
-       * @param {Array} [config.button.text] - Button text configuration
-       * @param {Object} [config.button.path] - Button path configuration
-       * @param {Array} [config.button.props] - Button props configuration
-       * @param {boolean} [config.template_config=true] - Use template config
-       * @returns {{actual_page: number, total_pages: number}} Pagination info
-       */
-      Button: (id, name = '', data = [], config = {
-        actual_page: 1,
-        items_per_page: 5,
-        button: {
-          text: [{ type: 'text', value: 'text1' }, { type: 'key', value: 'ID' }],
-          path: { type: 'text', value: 'path1' },
-          props: [{ props_key: 'id', type: 'text', value: 'ID' }]
-        },
-        template_config: true
-      }) => {
-        if (data.length) {
-          let obj_return = {
-            actual_page: config.actual_page || 1,
-            total_pages: undefined
-          }
+ * Pagination utilities
+ * @namespace
+ */
+this.Pagination = {
+  /**
+   * Create paginated buttons
+   * @param {string} id - User/build ID
+   * @param {string} name - Pagination name
+   * @param {Array} data - Data to paginate
+   * @param {Object} config - Pagination config
+   * @param {number} [config.actual_page=1] - Current page
+   * @param {number} [config.items_per_page=5] - Items per page
+   * @param {Object} [config.button] - Button configuration
+   * @param {Array} [config.button.text] - Button text configuration
+   * @param {Object} [config.button.path] - Button path configuration
+   * @param {Array} [config.button.props] - Button props configuration
+   * @param {boolean} [config.template_config=true] - Use template config
+   * @returns {{actual_page: number, total_pages: number}} Pagination info
+   */
+  Button: (id, name = '', data = [], config = {
+    actual_page: 1,
+    items_per_page: 5,
+    button: {
+      text: [{ type: 'text', value: 'text1' }, { type: 'key', value: 'ID' }],
+      path: { type: 'text', value: 'path1' },
+      props: [{ props_key: 'id', type: 'text', value: 'ID' }]
+    },
+    template_config: true
+  }) => {
+    // Handle empty data case
+    if (!data || !data.length) {
+      if (this.Log) {
+        console.log(`This.Pagination.Button() Error - Empty Data Array | BuildID: ${id}`);
+      }
+      
+      // Clean up storage for this pagination
+      if (this.Storages.Has(id, name)) {
+        this.Storages.Delete(id, name);
+      }
+      
+      return {
+        actual_page: 0,
+        total_pages: 0
+      };
+    }
 
-          let paginated_data = BuildPagination(data, config.items_per_page || 5)
+    // Calculate pagination based on CURRENT data
+    const itemsPerPage = config.items_per_page || 5;
+    const paginatedData = BuildPagination(data, itemsPerPage);
+    const totalPages = paginatedData.length;
 
-          if (!this.Storages.Has(id, name)) {
-            this.Storages.Set(id, name, {
-              actual_page: config.actual_page || 1,
-              total_pages: paginated_data.length
-            })
-          }
-
-          let storaged = this.Storages.Get(id, name)
-          let actual_page = storaged.actual_page
-
-          const currentProps = this.Builds.get(id).Session.ActualProps
-
-          if (currentProps.pagination_next === name) {
-            if (actual_page < storaged.total_pages) {
-              actual_page++
-            }
-            delete this.Builds.get(id).Session.ActualProps.pagination_next
-          }
-
-          if (currentProps.pagination_prev === name) {
-            if (actual_page > 1) {
-              actual_page--
-            }
-            delete this.Builds.get(id).Session.ActualProps.pagination_prev
-          }
-
-          storaged.actual_page = actual_page
-          this.Storages.Set(id, name, storaged)
-
-          this.Text(id, `Page ${actual_page} of ${storaged.total_pages}`)
-
-          const currentPageItems = paginated_data[actual_page - 1]?.list || []
-
-          if (config.button && !config.template_config) {
-            currentPageItems.forEach(item => {
-              let buttonText = ''
-              let buttonPath = this.Name
-              let buttonProps = {}
-
-              if (config.button.text) {
-                config.button.text.forEach(textConfig => {
-                  switch (textConfig.type) {
-                    case 'text':
-                      buttonText += textConfig.value
-                      break
-                    case 'key':
-                      if (typeof item === 'object' && item[textConfig.value]) {
-                        buttonText += item[textConfig.value]
-                      }
-                      break
-                  }
-                })
-              }
-
-              if (config.button.path) {
-                switch (config.button.path.type) {
-                  case 'text':
-                    buttonPath = config.button.path.value
-                    break
-                  case 'key':
-                    if (typeof item === 'object' && item[config.button.path.value]) {
-                      buttonPath = item[config.button.path.value]
-                    }
-                    break
-                }
-              }
-
-              if (config.button.props) {
-                config.button.props.forEach(propConfig => {
-                  switch (propConfig.type) {
-                    case 'text':
-                      buttonProps[propConfig.props_key] = propConfig.value
-                      break
-                    case 'key':
-                      if (typeof item === 'object' && item[propConfig.value]) {
-                        buttonProps[propConfig.props_key] = item[propConfig.value]
-                      }
-                      break
-                  }
-                })
-              }
-
-              this.Button(id, {
-                name: buttonText || JSON.stringify(item),
-                path: buttonPath,
-                props: buttonProps
-              })
-            })
-          } else {
-            currentPageItems.forEach(item => {
-              let buttonName
-              let buttonProps = {}
-
-              if (typeof item === 'object') {
-                const firstKey = Object.keys(item)[0]
-                buttonName = `${firstKey}: ${item[firstKey]}`
-
-                buttonProps = { ...item }
-              } else {
-                buttonName = item.toString()
-                buttonProps = { value: item }
-              }
-
-              this.Button(id, {
-                name: buttonName,
-                path: this.Name,
-                props: buttonProps
-              })
-            })
-          }
-
-          this.Button(id, { name: ' ' })
-
-          if (actual_page > 1) {
-            this.SideButton(id, {
-              name: '<- Prev',
-              props: { pagination_prev: name }
-            })
-          }
-
-          if (actual_page < storaged.total_pages) {
-            this.SideButton(id, {
-              name: 'Next ->',
-              props: { pagination_next: name }
-            })
-          }
-
-          return {
-            actual_page: actual_page,
-            total_pages: storaged.total_pages
-          }
-
-        } else {
-          if (this.Log) {
-            console.log(`This.Pagination.Button() Error - Empty Data Array | BuildID: ${id}`)
-          }
-          return {
-            actual_page: 0,
-            total_pages: 0
-          }
-        }
+    // Get or initialize storage
+    let storage = this.Storages.Get(id, name);
+    
+    if (!storage) {
+      // First time initialization
+      storage = {
+        actual_page: config.actual_page || 1,
+        total_pages: totalPages
+      };
+    } else {
+      // Update total pages to match current data
+      storage.total_pages = totalPages;
+      
+      // Clamp current page to valid range
+      if (storage.actual_page > totalPages) {
+        storage.actual_page = totalPages;
+      }
+      if (storage.actual_page < 1 && totalPages > 0) {
+        storage.actual_page = 1;
       }
     }
+
+    // Handle navigation button clicks
+    const currentProps = this.Builds.get(id).Session.ActualProps;
+
+    if (currentProps.pagination_next === name) {
+      if (storage.actual_page < totalPages) {
+        storage.actual_page++;
+      }
+      delete this.Builds.get(id).Session.ActualProps.pagination_next;
+    }
+
+    if (currentProps.pagination_prev === name) {
+      if (storage.actual_page > 1) {
+        storage.actual_page--;
+      }
+      delete this.Builds.get(id).Session.ActualProps.pagination_prev;
+    }
+
+    // Ensure page is still valid after navigation
+    storage.actual_page = Math.max(1, Math.min(storage.actual_page, totalPages));
+    
+    // Save updated storage
+    this.Storages.Set(id, name, storage);
+
+    // Display page counter
+    this.Text(id, `Page ${storage.actual_page} of ${totalPages}`);
+
+    // Get items for current page
+    const currentPageIndex = storage.actual_page - 1;
+    const currentPageItems = paginatedData[currentPageIndex]?.list || [];
+
+    // Render buttons for current page items
+    if (config.button && !config.template_config) {
+      // Custom button template
+      currentPageItems.forEach(item => {
+        let buttonText = '';
+        let buttonPath = this.Name;
+        let buttonProps = {};
+
+        // Build button text from template
+        if (config.button.text) {
+          config.button.text.forEach(textConfig => {
+            switch (textConfig.type) {
+              case 'text':
+                buttonText += textConfig.value;
+                break;
+              case 'key':
+                if (typeof item === 'object' && item[textConfig.value] !== undefined) {
+                  buttonText += item[textConfig.value];
+                }
+                break;
+            }
+          });
+        }
+
+        // Build button path from template
+        if (config.button.path) {
+          switch (config.button.path.type) {
+            case 'text':
+              buttonPath = config.button.path.value;
+              break;
+            case 'key':
+              if (typeof item === 'object' && item[config.button.path.value] !== undefined) {
+                buttonPath = item[config.button.path.value];
+              }
+              break;
+          }
+        }
+
+        // Build button props from template
+        if (config.button.props) {
+          config.button.props.forEach(propConfig => {
+            switch (propConfig.type) {
+              case 'text':
+                buttonProps[propConfig.props_key] = propConfig.value;
+                break;
+              case 'key':
+                if (typeof item === 'object' && item[propConfig.value] !== undefined) {
+                  buttonProps[propConfig.props_key] = item[propConfig.value];
+                }
+                break;
+            }
+          });
+        }
+
+        // Create the button
+        this.Button(id, {
+          name: buttonText || JSON.stringify(item),
+          path: buttonPath,
+          props: buttonProps
+        });
+      });
+    } else {
+      // Default button template (auto-detect properties)
+      currentPageItems.forEach(item => {
+        let buttonName;
+        let buttonProps = {};
+
+        if (typeof item === 'object' && item !== null) {
+          // Use first property as button name
+          const keys = Object.keys(item);
+          if (keys.length > 0) {
+            const firstKey = keys[0];
+            buttonName = `${firstKey}: ${item[firstKey]}`;
+          } else {
+            buttonName = JSON.stringify(item);
+          }
+          
+          // Pass all item properties as button props
+          buttonProps = { ...item };
+        } else {
+          // Primitive value
+          buttonName = String(item);
+          buttonProps = { value: item };
+        }
+
+        this.Button(id, {
+          name: buttonName,
+          path: this.Name,
+          props: buttonProps
+        });
+      });
+    }
+
+    // Add spacer
+    this.Button(id, { name: ' ' });
+
+    // Navigation buttons
+    if (storage.actual_page > 1) {
+      this.SideButton(id, {
+        name: '<- Prev',
+        props: { pagination_prev: name }
+      });
+    }
+
+    if (storage.actual_page < totalPages) {
+      this.SideButton(id, {
+        name: 'Next ->',
+        props: { pagination_next: name }
+      });
+    }
+
+    // Return current pagination state
+    return {
+      actual_page: storage.actual_page,
+      total_pages: totalPages
+    };
+  },
+
+  /**
+   * Reset pagination state for a specific pagination
+   * @param {string} id - User/build ID
+   * @param {string} name - Pagination name
+   * @returns {boolean} Whether reset was successful
+   */
+  Reset: (id, name) => {
+    if (this.Storages.Has(id, name)) {
+      this.Storages.Delete(id, name);
+      return true;
+    }
+    return false;
+  },
+
+  /**
+   * Get current pagination state without rendering
+   * @param {string} id - User/build ID
+   * @param {string} name - Pagination name
+   * @returns {{actual_page: number, total_pages: number}} Pagination state
+   */
+  GetState: (id, name) => {
+    const storage = this.Storages.Get(id, name);
+    if (!storage) {
+      return {
+        actual_page: 1,
+        total_pages: 0
+      };
+    }
+    return {
+      actual_page: storage.actual_page,
+      total_pages: storage.total_pages
+    };
+  },
+
+  /**
+   * Force set current page for a pagination
+   * @param {string} id - User/build ID
+   * @param {string} name - Pagination name
+   * @param {number} page - Page number to set (1-based)
+   * @returns {boolean} Whether set was successful
+   */
+  SetPage: (id, name, page) => {
+    const storage = this.Storages.Get(id, name);
+    if (!storage) {
+      return false;
+    }
+    
+    if (page < 1 || page > storage.total_pages) {
+      return false;
+    }
+    
+    storage.actual_page = page;
+    this.Storages.Set(id, name, storage);
+    return true;
+  }
+};
 
     // --------------------------- DropDown Method ---------------------------
 

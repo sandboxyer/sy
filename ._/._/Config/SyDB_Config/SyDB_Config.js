@@ -122,13 +122,47 @@ class SyDB_Config extends SyAPP.Func() {
                       
                     }
 
-                    this.Text(uid,`${view.db} | ${view.collection}`)
-
                     let result = await SyDB.listInstances(view.db,view.collection)
 
-                    result.instances.forEach(e => {
-                        this.Button(uid,formatObjectKeys(e),{props : {deleteinstance : e._id}})
-                    })
+
+                  
+
+            
+                    this.Text(uid,`${view.db} | ${view.collection} | ${this.TextColor.orange(result.instances.length)}`)
+                    this.Button(uid,{name : ' '})
+
+                    let buttontext = []
+
+                    if(result.instances.length){
+
+                        Object.keys(result.instances[0]).forEach(e => {
+                            buttontext.push({type : 'text',value : `${this.TextColor.yellow(e)} : `})
+                            buttontext.push({type : 'key',value : e})
+                            buttontext.push({type : 'text',value : ` | `})
+                        })
+                        this.Pagination.Button(uid,'collection',result.instances,
+                            {
+                                button : {
+                                    text: buttontext,
+                                    props : [{ props_key: 'deleteinstance', type: 'key', value: '_id' }]
+                                }
+    
+                            }
+                        )
+                        this.Button(uid,{name : ' '})
+                        this.Button(uid,'+ New')
+                        this.Button(uid,{name : ' '})
+                        this.Button(uid,{name : ' '})
+                    } else {
+
+                        this.Button(uid,'+ New')
+                        this.Button(uid,{name : ' '})
+                        this.Button(uid,{name : ' '})
+                    }
+
+                    
+                 
+
 
                     this.Button(uid,{name : ' '})
                     this.Button(uid,{name : '← Return',props : {page : ''}})
