@@ -667,22 +667,23 @@ class FastHTTP extends SyAPP.Func() {
                         let components = await Component.Model.find()
 
                         components = components.filter(e => !e.GroupID)
-    
-                        for (const [index, component] of components.entries()) {
-                            if(component.Type == 'route'){
-                                await this.DropDown(uid,component._id,async () => {
+
+                        await this.Pagination.Button(uid,'components',components,{
+                            renderItem : async (item) => {
+                            if(item.get('Type') == 'route'){
+                                await this.DropDown(uid,item.get('_id'),async () => {
                                     this.Buttons(uid,[
-                                        {name : 'Run',props : {runroute : component._id}},
-                                        {name : 'Edit',props : {editroute : component._id}},
-                                        {name : 'Remove',props : {removeroute : component._id}}
+                                        {name : 'Run',props : {runroute : item.get('_id')}},
+                                        {name : 'Edit',props : {editroute : item.get('_id')}},
+                                        {name : 'Remove',props : {removeroute : item.get('_id')}}
                                     ])
-                                },{up_buttontext : `${component.Name} ${this.TextColor.white('|')} ${HTTPClient.colorHttpMethod(component.Method)} | ${this.TextColor.cyan(component.Url)}`,down_buttontext : `${component.Name} ${this.TextColor.white('|')} ${HTTPClient.colorHttpMethod(component.Method)} | ${this.TextColor.cyan(component.Url)}`})
+                                },{up_buttontext : `${item.get('Name')} ${this.TextColor.white('|')} ${HTTPClient.colorHttpMethod(item.get('Method'))} | ${this.TextColor.cyan(item.get('Url'))}`,down_buttontext : `${item.get('Name')} ${this.TextColor.white('|')} ${HTTPClient.colorHttpMethod(item.get('Method'))} | ${this.TextColor.cyan(item.get('Url'))}`})
                              
                             } else {
                                 let all = await Component.Model.find()
                                 let childs = []
-                                all.forEach(e => {if(e.GroupID == component._id){childs.push(e)}})
-                                await this.DropDown(uid,component._id,async () => {
+                                all.forEach(e => {if(e.GroupID == item.get('_id')){childs.push(e)}})
+                                await this.DropDown(uid,item.get('_id'),async () => {
                                     for (const [index, child] of childs.entries()) {
                                         await this.DropDown(uid,child._id,async () => {
                                             this.Buttons(uid,[
@@ -695,14 +696,18 @@ class FastHTTP extends SyAPP.Func() {
                                     }
                                     
                                     this.Buttons(uid,[
-                                        {name : this.TextColor.rgb('  + New',0,255,0),props : {newroutechild : component._id}},
-                                        {name : 'Rename group',props : {renamegroup : component._id}},
-                                        {name : 'Delete group',props : {deletegroup : component._id}}
+                                        {name : this.TextColor.rgb('  + New',0,255,0),props : {newroutechild : item.get('_id')}},
+                                        {name : 'Rename group',props : {renamegroup : item.get('_id')}},
+                                        {name : 'Delete group',props : {deletegroup : item.get('_id')}}
                                     ])
-                                },{up_buttontext : `${component.Name} (${childs.length})`,down_buttontext : `${component.Name} (${childs.length})`})
+                                },{up_buttontext : `${item.get('Name')} (${childs.length})`,down_buttontext : `${item.get('Name')} (${childs.length})`})
                             }
-                            }
-    
+                        },
+                        custom : {
+                            showPageInfo: false
+                        }
+                    })
+
                        this.Button(uid,' ')
                        await this.DropDown(uid,'mainlayernew',async () => {
                         this.Buttons(uid,[

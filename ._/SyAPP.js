@@ -5570,7 +5570,31 @@ this.DropDownManager = {
 
     this.Pagination = {
       Button: async (id, name = '', data = [], config = {}) => {
-        // Default config – no sweeping template_config, mode chosen by presence of renderItem/button
+        // Base default config
+        const defaultCustom = {
+          showSeparators: false,
+          showPageInfo: true,
+          showNavigation: true,
+          showBlankSpace: true,
+          separatorTop: '─'.repeat(40),
+          separatorBetween: '─'.repeat(40),
+          separatorBottom: '─'.repeat(40),
+          prevButtonText: '◀  Prev',
+          nextButtonText: 'Next  ▶',
+          pageIndicatorText: null,
+          pageInfoText: null,
+          pageInfoStyle: 'text',
+          renderPageInfo: null,
+          renderNavigation: null,
+          renderSeparator: null,
+          renderBlankSpace: null,
+          topSpacing: 0,
+          bottomSpacing: 0,
+        };
+    
+        // Safely merge custom config
+        const custom = config.custom ? { ...defaultCustom, ...config.custom } : defaultCustom;
+    
         const finalConfig = {
           actual_page: 1,
           items_per_page: 5,
@@ -5580,7 +5604,8 @@ this.DropDownManager = {
             props: [{ props_key: 'id', type: 'text', value: 'ID' }]
           },
           renderItem: null,
-          ...config
+          ...config,
+          custom: custom // Replace with merged custom
         };
     
         // Handle empty data
@@ -5606,7 +5631,7 @@ this.DropDownManager = {
         }
     
         // Navigation (next/prev props)
-        const currentProps = this.Builds.get(id).Session.ActualProps;
+        const currentProps = this.Builds.get(id).Session.ActualProps || {};
     
         if (currentProps[`pagination_next_${name}`]) {
           if (storage.actual_page < totalPages) storage.actual_page++;
@@ -5624,9 +5649,25 @@ this.DropDownManager = {
         const currentPageItems = paginatedData[storage.actual_page - 1]?.list || [];
         const startIndex = (storage.actual_page - 1) * itemsPerPage;
     
-        // ============================================================
-        // PRE-PROCESS: Force close all dropdowns except the clicked one
-        // ============================================================
+        // Pagination data object for custom renderers
+        const paginationData = {
+          name: name,
+          actualPage: storage.actual_page,
+          totalPages: totalPages,
+          itemsPerPage: itemsPerPage,
+          totalItems: data.length,
+          startIndex: startIndex,
+          endIndex: Math.min(storage.actual_page * itemsPerPage, data.length),
+          hasNext: storage.actual_page < totalPages,
+          hasPrev: storage.actual_page > 1,
+          isFirstPage: storage.actual_page === 1,
+          isLastPage: storage.actual_page === totalPages,
+          currentPageItems: currentPageItems,
+          allData: data,
+          storage: storage
+        };
+    
+        // Pre-process dropdown handling (only if renderItem exists)
         if (finalConfig.renderItem && typeof finalConfig.renderItem === 'function') {
           const paginationDropdownPrefix = `dropdown-pagination-${name}-`;
           const allStorageKeys = Object.keys(this.Storages.GetAll(id) || {});
@@ -5655,13 +5696,43 @@ this.DropDownManager = {
           }
         }
     
+        // Helper function to safely execute custom renderers
+        const safeRender = (renderer, ...args) => {
+          if (typeof renderer === 'function') {
+            try {
+              renderer(...args);
+              return true;
+            } catch (error) {
+              console.error(`Pagination custom renderer error:`, error);
+              return false;
+            }
+          }
+          return false;
+        };
+    
         // ============================================================
-        // RENDERING: choose mode based on config
+        // TOP SPACING
+        // ============================================================
+        if (custom.topSpacing > 0) {
+          for (let i = 0; i < custom.topSpacing; i++) {
+            this.Button(id, { name: ' ' });
+          }
+        }
+    
+        // ============================================================
+        // TOP SEPARATOR
+        // ============================================================
+        if (custom.showSeparators && currentPageItems.length > 0) {
+          if (!safeRender(custom.renderSeparator, 'top', paginationData)) {
+            this.Button(id, { name: custom.separatorTop });
+          }
+        }
+    
+        // ============================================================
+        // RENDER ITEMS
         // ============================================================
         if (finalConfig.renderItem && typeof finalConfig.renderItem === 'function') {
-          // ----- MODULAR (DROPDOWN) MODE -----
-          this.Button(id, { name: '─'.repeat(40) }); // separator
-    
+          // Modular renderItem mode
           for (let i = 0; i < currentPageItems.length; i++) {
             const item = currentPageItems[i];
             const globalIndex = startIndex + i;
@@ -5682,19 +5753,7 @@ this.DropDownManager = {
               isString: typeof item === 'string',
               isNumber: typeof item === 'number',
               toString: () => typeof item === 'object' && item !== null ? JSON.stringify(item) : String(item),
-              pagination: {
-                name: name,
-                actualPage: storage.actual_page,
-                totalPages: totalPages,
-                itemsPerPage: itemsPerPage,
-                totalItems: data.length,
-                startIndex: startIndex,
-                endIndex: Math.min(storage.actual_page * itemsPerPage, data.length),
-                hasNext: storage.actual_page < totalPages,
-                hasPrev: storage.actual_page > 1,
-                isFirstPage: storage.actual_page === 1,
-                isLastPage: storage.actual_page === totalPages
-              }
+              pagination: paginationData
             };
     
             try {
@@ -5709,16 +5768,16 @@ this.DropDownManager = {
               });
             }
     
-            if (i < currentPageItems.length - 1) {
-              this.Button(id, { name: '─'.repeat(40) });
+            // Between items separator
+            if (custom.showSeparators && i < currentPageItems.length - 1) {
+              if (!safeRender(custom.renderSeparator, 'between', paginationData, i)) {
+                this.Button(id, { name: custom.separatorBetween });
+              }
             }
           }
-    
-          this.Button(id, { name: '─'.repeat(40) }); // footer separator
-        } 
-        else if (finalConfig.button) {
-          // ----- LEGACY TEMPLATE MODE -----
-          currentPageItems.forEach(item => {
+        } else if (finalConfig.button) {
+          // Template mode
+          currentPageItems.forEach((item, i) => {
             let buttonText = '';
             let buttonPath = this.Name;
             let buttonProps = {};
@@ -5747,11 +5806,17 @@ this.DropDownManager = {
               path: buttonPath,
               props: buttonProps
             });
+    
+            // Between items separator
+            if (custom.showSeparators && i < currentPageItems.length - 1) {
+              if (!safeRender(custom.renderSeparator, 'between', paginationData, i)) {
+                this.Button(id, { name: custom.separatorBetween });
+              }
+            }
           });
-        } 
-        else {
-          // ----- DEFAULT AUTO-DETECT MODE -----
-          currentPageItems.forEach(item => {
+        } else {
+          // Default auto-detect mode
+          currentPageItems.forEach((item, i) => {
             let buttonName, buttonProps = {};
     
             if (typeof item === 'object' && item !== null) {
@@ -5768,38 +5833,93 @@ this.DropDownManager = {
               path: this.Name,
               props: buttonProps
             });
+    
+            // Between items separator
+            if (custom.showSeparators && i < currentPageItems.length - 1) {
+              if (!safeRender(custom.renderSeparator, 'between', paginationData, i)) {
+                this.Button(id, { name: custom.separatorBetween });
+              }
+            }
           });
         }
     
         // ============================================================
-        // NAVIGATION CONTROLS (same for all modes)
+        // BOTTOM SEPARATOR
         // ============================================================
-        this.Button(id, { name: ' ' });
-        this.Text(id, `Page ${storage.actual_page} of ${totalPages}  •  ${data.length} items`);
-    
-        const navButtons = [];
-    
-        if (storage.actual_page > 1) {
-          navButtons.push({
-            name: '◀  Prev',
-            props: { [`pagination_prev_${name}`]: true }
-          });
+        if (custom.showSeparators && currentPageItems.length > 0) {
+          if (!safeRender(custom.renderSeparator, 'bottom', paginationData)) {
+            this.Button(id, { name: custom.separatorBottom });
+          }
         }
     
-        navButtons.push({
-          name: `${storage.actual_page} / ${totalPages}`,
-          props: {}
-        });
-    
-        if (storage.actual_page < totalPages) {
-          navButtons.push({
-            name: 'Next  ▶',
-            props: { [`pagination_next_${name}`]: true }
-          });
+        // ============================================================
+        // BLANK SPACE
+        // ============================================================
+        if (custom.showBlankSpace && currentPageItems.length > 0) {
+          if (!safeRender(custom.renderBlankSpace, paginationData)) {
+            this.Button(id, { name: ' ' });
+          }
         }
     
-        if (navButtons.length > 0) {
-          this.Buttons(id, navButtons);
+        // ============================================================
+        // PAGE INFO
+        // ============================================================
+        if (custom.showPageInfo) {
+          if (!safeRender(custom.renderPageInfo, paginationData)) {
+            const infoText = custom.pageInfoText || 
+                            `Page ${storage.actual_page} of ${totalPages}  •  ${data.length} items`;
+            
+            if (custom.pageInfoStyle === 'button') {
+              this.Button(id, { name: infoText });
+            } else if (custom.pageInfoStyle === 'text') {
+              this.Text(id, infoText);
+            }
+            // 'none' style doesn't render anything
+          }
+        }
+    
+        // ============================================================
+        // NAVIGATION CONTROLS
+        // ============================================================
+        if (custom.showNavigation) {
+          if (!safeRender(custom.renderNavigation, paginationData)) {
+            const navButtons = [];
+    
+            if (storage.actual_page > 1) {
+              navButtons.push({
+                name: custom.prevButtonText,
+                props: { [`pagination_prev_${name}`]: true }
+              });
+            }
+    
+            // Page indicator
+            const indicatorText = custom.pageIndicatorText || 
+                                 `${storage.actual_page} / ${totalPages}`;
+            navButtons.push({
+              name: indicatorText,
+              props: {}
+            });
+    
+            if (storage.actual_page < totalPages) {
+              navButtons.push({
+                name: custom.nextButtonText,
+                props: { [`pagination_next_${name}`]: true }
+              });
+            }
+    
+            if (navButtons.length > 0) {
+              this.Buttons(id, navButtons);
+            }
+          }
+        }
+    
+        // ============================================================
+        // BOTTOM SPACING
+        // ============================================================
+        if (custom.bottomSpacing > 0) {
+          for (let i = 0; i < custom.bottomSpacing; i++) {
+            this.Button(id, { name: ' ' });
+          }
         }
     
         return {
@@ -5808,11 +5928,11 @@ this.DropDownManager = {
           items_on_page: currentPageItems.length,
           total_items: data.length,
           start_index: startIndex,
-          end_index: Math.min(storage.actual_page * itemsPerPage, data.length)
+          end_index: Math.min(storage.actual_page * itemsPerPage, data.length),
+          paginationData: paginationData
         };
       },
     
-      // Rest of Pagination object (Reset, GetState, SetPage) unchanged
       Reset: (id, name) => {
         if (this.Storages.Has(id, name)) {
           this.Storages.Delete(id, name);
