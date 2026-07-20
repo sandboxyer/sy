@@ -329,6 +329,12 @@ class CodeParser {
             const anchorBefore = beforeLines[beforeLines.length - 1]?.trim() || '';
             const anchorAfter = afterLines[0]?.trim() || '';
             
+            const whitespaceBefore = code.substring(Math.max(0, part.start - 10), part.start);
+            const whitespaceAfter = code.substring(part.end, Math.min(code.length, part.end + 10));
+            
+            const newlinesBefore = (whitespaceBefore.match(/\n/g) || []).length;
+            const newlinesAfter = (whitespaceAfter.match(/\n/g) || []).length;
+            
             anchors.push({
                 part: part,
                 index: index,
@@ -336,11 +342,72 @@ class CodeParser {
                 anchorAfter: anchorAfter,
                 originalStart: part.start,
                 originalEnd: part.end,
-                content: part.content
+                content: part.content,
+                newlinesBefore: newlinesBefore,
+                newlinesAfter: newlinesAfter
             });
         });
         
         return anchors;
+    }
+
+    static #configFilePath = '';
+    
+    static getConfigFilePath() {
+        if (!this.#configFilePath) {
+            this.#configFilePath = path.join(path.dirname(this.#filePath), '.code-parser-configs.json');
+        }
+        return this.#configFilePath;
+    }
+    
+    static loadConfigurations() {
+        const configFile = this.getConfigFilePath();
+        if (fs.existsSync(configFile)) {
+            try {
+                const data = fs.readFileSync(configFile, 'utf-8');
+                return JSON.parse(data);
+            } catch (error) {
+                console.error('⚠️  Error reading configuration file:', error.message);
+                return { configs: {} };
+            }
+        }
+        return { configs: {} };
+    }
+    
+    static saveConfigurations(configs) {
+        const configFile = this.getConfigFilePath();
+        try {
+            fs.writeFileSync(configFile, JSON.stringify(configs, null, 2));
+            return true;
+        } catch (error) {
+            console.error('⚠️  Error saving configuration file:', error.message);
+            return false;
+        }
+    }
+    
+    static saveCurrentConfig(configName, options, analysis) {
+        const configs = this.loadConfigurations();
+        
+        const config = {
+            name: configName,
+            file: path.basename(this.#filePath),
+            created: new Date().toISOString(),
+            options: options,
+            summary: {
+                mode: options.mode,
+                excludeClasses: options.excludeClasses || [],
+                excludeFunctions: options.excludeFunctions || [],
+                excludeVariables: options.excludeVariables || [],
+                includeClasses: options.includeClasses || [],
+                includeFunctions: options.includeFunctions || [],
+                includeVariables: options.includeVariables || [],
+                generateMergeScript: options.generateMergeScript || false
+            }
+        };
+        
+        configs.configs[configName] = config;
+        
+        return this.saveConfigurations(configs);
     }
 
     static createMergeScript(removedParts, originalCode, filteredOptions) {
@@ -352,7 +419,9 @@ class CodeParser {
             anchorBefore: a.anchorBefore,
             anchorAfter: a.anchorAfter,
             originalStart: a.originalStart,
-            originalEnd: a.originalEnd
+            originalEnd: a.originalEnd,
+            newlinesBefore: a.newlinesBefore,
+            newlinesAfter: a.newlinesAfter
         }));
         
         const mergeScript = `#!/usr/bin/env node
@@ -413,18 +482,20 @@ function calculateSimilarity(str1, str2) {
 }
 
 /**
- * Determine the appropriate separator between code sections
+ * Get proper spacing to insert before the content
  */
-function determineSeparator(before, after, part) {
-    const beforeEndsWithNewline = before.endsWith('\\n') || before.endsWith('\\n\\n');
-    const afterStartsWithNewline = after.startsWith('\\n');
+function getInsertPrefix(before, part) {
+    if (before.length === 0) return { prefix: '', needsNewlineAfter: false };
     
-    if (!beforeEndsWithNewline && !afterStartsWithNewline) {
-        return '\\n\\n';
-    } else if (!beforeEndsWithNewline) {
-        return '\\n';
+    const trimmedBefore = before.trimEnd();
+    const trailingNewlines = before.length - trimmedBefore.length;
+    
+    if (trailingNewlines >= 2) {
+        return { prefix: '\\n', needsNewlineAfter: true };
+    } else if (trailingNewlines === 1) {
+        return { prefix: '\\n\\n', needsNewlineAfter: true };
     } else {
-        return '';
+        return { prefix: '\\n\\n', needsNewlineAfter: true };
     }
 }
 
@@ -433,7 +504,6 @@ function determineSeparator(before, after, part) {
  */
 function findInsertionPoint(code, part) {
     const strategies = [
-        // Strategy 1: Exact anchor match (HIGH confidence)
         () => {
             const beforeIndex = code.indexOf(part.anchorBefore);
             const afterIndex = code.indexOf(part.anchorAfter);
@@ -451,7 +521,6 @@ function findInsertionPoint(code, part) {
             return null;
         },
         
-        // Strategy 2: Partial anchor match - before only (MEDIUM confidence)
         () => {
             const beforeIndex = code.indexOf(part.anchorBefore);
             if (beforeIndex !== -1) {
@@ -464,7 +533,6 @@ function findInsertionPoint(code, part) {
             return null;
         },
         
-        // Strategy 3: Partial anchor match - after only (MEDIUM confidence)
         () => {
             const afterIndex = code.indexOf(part.anchorAfter);
             if (afterIndex !== -1) {
@@ -477,7 +545,6 @@ function findInsertionPoint(code, part) {
             return null;
         },
         
-        // Strategy 4: Fuzzy matching (LOW confidence)
         () => {
             const lines = code.split('\\n');
             const anchorLines = part.anchorBefore.split('\\n');
@@ -500,7 +567,6 @@ function findInsertionPoint(code, part) {
             return null;
         },
         
-        // Strategy 5: Type-based insertion (LOW confidence)
         () => {
             const typePatterns = {
                 'class': /class\\s+\\w+/g,
@@ -532,7 +598,6 @@ function findInsertionPoint(code, part) {
             return null;
         },
         
-        // Strategy 6: Append to end (FALLBACK confidence)
         () => {
             return {
                 found: true,
@@ -550,9 +615,6 @@ function findInsertionPoint(code, part) {
     return { found: false };
 }
 
-/**
- * Merge removed parts back into the filtered code
- */
 function merge(filteredCode) {
     console.log('🔄 Starting merge process...');
     console.log(\`📊 Removed parts to reinsert: \${removedPartsData.length}\`);
@@ -561,7 +623,6 @@ function merge(filteredCode) {
     let reinsertedCount = 0;
     const warnings = [];
     
-    // Sort parts by original position (reverse order to maintain positions)
     const sortedParts = [...removedPartsData].sort((a, b) => b.originalStart - a.originalStart);
     
     for (const part of sortedParts) {
@@ -570,9 +631,12 @@ function merge(filteredCode) {
         if (insertionPoint.found) {
             const before = mergedCode.substring(0, insertionPoint.position);
             const after = mergedCode.substring(insertionPoint.position);
-            const separator = determineSeparator(before, after, part);
             
-            mergedCode = before + separator + part.content + '\\n' + after;
+            const { prefix, needsNewlineAfter } = getInsertPrefix(before, part);
+            
+            let cleanAfter = after.replace(/^\\n+/, '');
+            
+            mergedCode = before + prefix + part.content + (needsNewlineAfter ? '\\n' : '') + cleanAfter;
             reinsertedCount++;
             
             console.log(\`✅ Reinserted: \${part.type} "\${part.name}" at position \${insertionPoint.position}\`);
@@ -594,7 +658,6 @@ function merge(filteredCode) {
     };
 }
 
-// Main execution
 async function main() {
     const args = process.argv.slice(2);
     
@@ -691,7 +754,7 @@ main().catch(console.error);
             generateMergeScript = false,
             mergeScriptPath = null
         } = options;
-
+    
         const originalCode = this.#sourceCode;
         let partsToRemove = [];
         
@@ -702,7 +765,7 @@ main().catch(console.error);
         if (!includeExports) {
             partsToRemove.push(...analysis.exports);
         }
-
+    
         if (mode === 'include') {
             if (includeClasses.length > 0) {
                 partsToRemove.push(...analysis.classes.filter(c => !includeClasses.includes(c.name)));
@@ -710,7 +773,7 @@ main().catch(console.error);
         } else {
             partsToRemove.push(...analysis.classes.filter(c => excludeClasses.includes(c.name)));
         }
-
+    
         if (mode === 'include') {
             if (includeFunctions.length > 0) {
                 partsToRemove.push(...analysis.functions.filter(f => !includeFunctions.includes(f.name)));
@@ -718,7 +781,7 @@ main().catch(console.error);
         } else {
             partsToRemove.push(...analysis.functions.filter(f => excludeFunctions.includes(f.name)));
         }
-
+    
         if (mode === 'include') {
             if (includeVariables.length > 0) {
                 partsToRemove.push(...analysis.variables.filter(v => !includeVariables.includes(v.name)));
@@ -726,37 +789,25 @@ main().catch(console.error);
         } else {
             partsToRemove.push(...analysis.variables.filter(v => excludeVariables.includes(v.name)));
         }
-
+    
+        // Sort by position descending to remove from end to start (prevents position shifts)
         partsToRemove.sort((a, b) => b.start - a.start);
         
-        let filteredCode = originalCode;
+        // Build filtered code by keeping only the parts we want
+        let filteredCode = '';
+        let lastEnd = 0;
         
-        for (const part of partsToRemove) {
-            const before = filteredCode.substring(0, part.start);
-            const after = filteredCode.substring(part.end);
-            
-            let cleanedBefore = before;
-            let cleanedAfter = after;
-            
-            cleanedBefore = cleanedBefore.replace(/\s+$/, '');
-            cleanedAfter = cleanedAfter.replace(/^\s+/, '');
-            
-            if (cleanedBefore.length > 0 && cleanedAfter.length > 0) {
-                const beforeLastChar = cleanedBefore[cleanedBefore.length - 1];
-                const afterFirstChar = cleanedAfter[0];
-                
-                if ((beforeLastChar === '}' || beforeLastChar === ';') && 
-                    (afterFirstChar.match(/[a-zA-Z]/) || afterFirstChar === 'e' || afterFirstChar === 'i' || afterFirstChar === 'c')) {
-                    filteredCode = cleanedBefore + '\n\n' + cleanedAfter;
-                } else if (beforeLastChar === '\n') {
-                    filteredCode = cleanedBefore + cleanedAfter;
-                } else {
-                    filteredCode = cleanedBefore + '\n' + cleanedAfter;
-                }
-            } else {
-                filteredCode = cleanedBefore + cleanedAfter;
-            }
+        // Sort by position ascending for building
+        const sortedParts = [...partsToRemove].sort((a, b) => a.start - b.start);
+        
+        for (const part of sortedParts) {
+            // Keep everything from lastEnd to part.start exactly as-is
+            filteredCode += originalCode.substring(lastEnd, part.start);
+            lastEnd = part.end;
         }
+        
+        // Add remaining code after last removed part
+        filteredCode += originalCode.substring(lastEnd);
         
         let mergeScriptGenerated = false;
         let actualMergeScriptPath = null;
@@ -779,8 +830,9 @@ main().catch(console.error);
     static async runInteractive() {
         const args = process.argv.slice(2);
         if (args.length === 0) {
-            console.log('Usage: node code-parser-interface.js <filename.js>');
-            console.log('Example: node code-parser-interface.js sample-test.js');
+            console.log('Usage: node code-parser-interface.js <filename.js> [config-name]');
+            console.log('       node code-parser-interface.js <filename.js>                 - Interactive mode');
+            console.log('       node code-parser-interface.js <filename.js> <config-name>  - Apply saved config directly');
             process.exit(1);
         }
 
@@ -793,6 +845,68 @@ main().catch(console.error);
 
         const code = fs.readFileSync(this.#filePath, 'utf-8');
         const analysis = this.analyzeCode(code);
+        
+        if (args.length >= 2) {
+            const configName = args[1];
+            const configs = this.loadConfigurations();
+            
+            if (configs.configs[configName]) {
+                console.log('🔧 JavaScript Code Parser - Applying Configuration');
+                console.log('═'.repeat(50));
+                console.log(`📄 File: ${path.basename(this.#filePath)}`);
+                console.log(`⚙️  Config: ${configName}\n`);
+                
+                const selectedConfig = configs.configs[configName];
+                const options = selectedConfig.options;
+                
+                console.log(`Mode: ${options.mode}`);
+                if (options.mode === 'exclude') {
+                    if (options.excludeClasses?.length) console.log(`Excluding classes: ${options.excludeClasses.join(', ')}`);
+                    if (options.excludeFunctions?.length) console.log(`Excluding functions: ${options.excludeFunctions.join(', ')}`);
+                    if (options.excludeVariables?.length) console.log(`Excluding variables: ${options.excludeVariables.join(', ')}`);
+                } else {
+                    if (options.includeClasses?.length) console.log(`Including classes: ${options.includeClasses.join(', ')}`);
+                    if (options.includeFunctions?.length) console.log(`Including functions: ${options.includeFunctions.join(', ')}`);
+                    if (options.includeVariables?.length) console.log(`Including variables: ${options.includeVariables.join(', ')}`);
+                }
+                console.log(`Generate merge script: ${options.generateMergeScript ? 'Yes' : 'No'}`);
+                
+                const result = this.createFilteredCode(analysis, options);
+                
+                let outputFile;
+                if (options.mode === 'exclude') {
+                    outputFile = this.#filePath.replace('.js', '_filtered.js');
+                } else {
+                    outputFile = this.#filePath.replace('.js', '_included.js');
+                }
+                
+                fs.writeFileSync(outputFile, result.code);
+                
+                console.log('\n' + '═'.repeat(50));
+                console.log(`✅ Filtered code saved to: ${outputFile}`);
+                console.log(`📊 Original: ${this.#sourceCode.length} chars, ${this.#sourceCode.split('\n').length} lines`);
+                console.log(`📊 Filtered: ${result.code.length} chars, ${result.code.split('\n').length} lines`);
+                console.log(`📊 Removed parts: ${result.removedParts.length}`);
+                
+                if (result.mergeScriptGenerated) {
+                    console.log(`\n🔧 Merge script generated: ${result.mergeScriptPath}`);
+                    console.log('   Run it later with: node ' + path.basename(result.mergeScriptPath) + ' <updated-filtered-file.js>');
+                }
+                
+                console.log('\n✅ Process completed successfully!');
+                process.exit(0);
+            } else {
+                console.error(`❌ Configuration "${configName}" not found.`);
+                console.log('\nAvailable configurations:');
+                const configNames = Object.keys(configs.configs);
+                if (configNames.length === 0) {
+                    console.log('   No configurations saved yet.');
+                } else {
+                    configNames.forEach(name => console.log(`   • ${name}`));
+                }
+                process.exit(1);
+            }
+        }
         
         const rl = readline.createInterface({
             input: process.stdin,
@@ -815,6 +929,7 @@ main().catch(console.error);
             '6': { text: '✅ Create filtered version (include only) with merge script', action: () => this.filterMenuInclude(analysis, rl) },
             '7': { text: '💾 Export specific parts', action: () => this.exportMenu(analysis, rl) },
             '8': { text: '📊 Show statistics', action: () => this.displayStats(analysis) },
+            '9': { text: '⚙️  Configuration management', action: () => this.configMenu(analysis, rl) },
             '0': { text: '🚪 Exit', action: () => { 
                 console.log('\n👋 Goodbye!');
                 rl.close(); 
@@ -834,9 +949,11 @@ main().catch(console.error);
             if (menuOptions[choice]) {
                 console.clear();
                 await menuOptions[choice].action();
-                await this.question(rl, '\nPress Enter to continue...');
-                console.clear();
-                showMenu();
+                if (choice !== '0') {
+                    await this.question(rl, '\nPress Enter to continue...');
+                    console.clear();
+                    showMenu();
+                }
             } else {
                 console.log('❌ Invalid option. Please try again.');
                 await this.question(rl, '\nPress Enter to continue...');
@@ -980,6 +1097,23 @@ main().catch(console.error);
             console.log('   Run it later with: node ' + path.basename(result.mergeScriptPath) + ' <updated-filtered-file.js>');
             console.log('   This will reinsert the removed parts into the updated file.');
         }
+        
+        const saveConfig = await this.question(rl, '\n💾 Save this configuration for future use? (y/n, default: y): ');
+        if (saveConfig.toLowerCase() !== 'n') {
+            const configName = await this.question(rl, '📝 Configuration name: ');
+            if (configName.trim()) {
+                const saved = this.saveCurrentConfig(configName.trim(), options, analysis);
+                if (saved) {
+                    console.log(`✅ Configuration "${configName.trim()}" saved successfully!`);
+                    console.log(`   Config file: ${this.getConfigFilePath()}`);
+                    console.log(`\n   Usage: node ${path.basename(process.argv[1])} ${path.basename(this.#filePath)} "${configName.trim()}"`);
+                } else {
+                    console.log('❌ Failed to save configuration.');
+                }
+            } else {
+                console.log('❌ Configuration name cannot be empty. Skipping save.');
+            }
+        }
     }
 
     static async filterMenuInclude(analysis, rl) {
@@ -1040,6 +1174,23 @@ main().catch(console.error);
             console.log('   Run it later with: node ' + path.basename(result.mergeScriptPath) + ' <updated-included-file.js>');
             console.log('   This will reinsert the removed parts back into the updated file.');
         }
+        
+        const saveConfig = await this.question(rl, '\n💾 Save this configuration for future use? (y/n, default: y): ');
+        if (saveConfig.toLowerCase() !== 'n') {
+            const configName = await this.question(rl, '📝 Configuration name: ');
+            if (configName.trim()) {
+                const saved = this.saveCurrentConfig(configName.trim(), options, analysis);
+                if (saved) {
+                    console.log(`✅ Configuration "${configName.trim()}" saved successfully!`);
+                    console.log(`   Config file: ${this.getConfigFilePath()}`);
+                    console.log(`\n   Usage: node ${path.basename(process.argv[1])} ${path.basename(this.#filePath)} "${configName.trim()}"`);
+                } else {
+                    console.log('❌ Failed to save configuration.');
+                }
+            } else {
+                console.log('❌ Configuration name cannot be empty. Skipping save.');
+            }
+        }
     }
 
     static async exportMenu(analysis, rl) {
@@ -1098,6 +1249,186 @@ main().catch(console.error);
                 const typeStr = types.length > 0 ? ` (${types.join(', ')})` : '';
                 console.log(`  • ${func.name}${typeStr}`);
             });
+        }
+    }
+
+    static async configMenu(analysis, rl) {
+        const configs = this.loadConfigurations();
+        const configNames = Object.keys(configs.configs);
+        
+        const showConfigSubMenu = () => {
+            console.log('⚙️  Configuration Management');
+            console.log('═'.repeat(50));
+            console.log('\n⚙️  Configuration Options:');
+            console.log('─'.repeat(50));
+            console.log('  1. 📋 List saved configurations');
+            console.log('  2. 📂 Load and apply configuration');
+            console.log('  3. 🗑️  Delete configuration');
+            console.log('  4. 📁 Show config file location');
+            console.log('  0. 🔙 Back to main menu');
+        };
+        
+        const handleConfigChoice = async (choice) => {
+            switch (choice) {
+                case '1':
+                    console.log('\n📋 Saved Configurations:');
+                    console.log('─'.repeat(50));
+                    
+                    if (configNames.length === 0) {
+                        console.log('   No configurations saved yet.');
+                    } else {
+                        configNames.forEach((name, index) => {
+                            const config = configs.configs[name];
+                            console.log(`\n${index + 1}. ${name}`);
+                            console.log(`   File: ${config.file}`);
+                            console.log(`   Mode: ${config.summary.mode}`);
+                            console.log(`   Created: ${config.created}`);
+                            if (config.summary.mode === 'exclude') {
+                                if (config.summary.excludeClasses.length > 0) 
+                                    console.log(`   Excluded classes: ${config.summary.excludeClasses.join(', ')}`);
+                                if (config.summary.excludeFunctions.length > 0) 
+                                    console.log(`   Excluded functions: ${config.summary.excludeFunctions.join(', ')}`);
+                                if (config.summary.excludeVariables.length > 0) 
+                                    console.log(`   Excluded variables: ${config.summary.excludeVariables.join(', ')}`);
+                            } else {
+                                if (config.summary.includeClasses.length > 0) 
+                                    console.log(`   Included classes: ${config.summary.includeClasses.join(', ')}`);
+                                if (config.summary.includeFunctions.length > 0) 
+                                    console.log(`   Included functions: ${config.summary.includeFunctions.join(', ')}`);
+                                if (config.summary.includeVariables.length > 0) 
+                                    console.log(`   Included variables: ${config.summary.includeVariables.join(', ')}`);
+                            }
+                            console.log(`   Generate merge: ${config.summary.generateMergeScript ? 'Yes' : 'No'}`);
+                            console.log(`   Usage: node ${path.basename(process.argv[1])} ${path.basename(this.#filePath)} "${name}"`);
+                        });
+                    }
+                    return true;
+                    
+                case '2':
+                    if (configNames.length === 0) {
+                        console.log('\n❌ No configurations saved. Create one first by running a filter operation.');
+                        return true;
+                    }
+                    
+                    console.log('\n📂 Available Configurations:');
+                    configNames.forEach((name, index) => {
+                        console.log(`  ${index + 1}. ${name}`);
+                    });
+                    
+                    const loadChoice = await this.question(rl, '\nSelect configuration number (or 0 to cancel): ');
+                    const configIndex = parseInt(loadChoice) - 1;
+                    
+                    if (loadChoice === '0') {
+                        console.log('❌ Loading cancelled.');
+                        return true;
+                    }
+                    
+                    if (isNaN(configIndex) || configIndex < 0 || configIndex >= configNames.length) {
+                        console.log('❌ Invalid selection.');
+                        return true;
+                    }
+                    
+                    const selectedConfig = configs.configs[configNames[configIndex]];
+                    const loadOptions = selectedConfig.options;
+                    
+                    console.log(`\n✅ Loaded configuration: ${configNames[configIndex]}`);
+                    console.log(`   Mode: ${loadOptions.mode}`);
+                    
+                    const loadResult = this.createFilteredCode(analysis, loadOptions);
+                    
+                    let outputFile;
+                    if (loadOptions.mode === 'exclude') {
+                        outputFile = this.#filePath.replace('.js', '_filtered.js');
+                    } else {
+                        outputFile = this.#filePath.replace('.js', '_included.js');
+                    }
+                    
+                    fs.writeFileSync(outputFile, loadResult.code);
+                    
+                    console.log(`\n✅ Filtered code saved to: ${outputFile}`);
+                    console.log(`📊 Original: ${this.#sourceCode.length} chars`);
+                    console.log(`📊 Filtered: ${loadResult.code.length} chars`);
+                    console.log(`📊 Removed parts: ${loadResult.removedParts.length}`);
+                    
+                    if (loadResult.mergeScriptGenerated) {
+                        console.log(`\n🔧 Merge script generated: ${loadResult.mergeScriptPath}`);
+                    }
+                    return true;
+                    
+                case '3':
+                    if (configNames.length === 0) {
+                        console.log('\n❌ No configurations saved.');
+                        return true;
+                    }
+                    
+                    console.log('\n🗑️  Delete Configuration:');
+                    configNames.forEach((name, index) => {
+                        console.log(`  ${index + 1}. ${name}`);
+                    });
+                    
+                    const deleteChoice = await this.question(rl, '\nSelect configuration to delete (or 0 to cancel): ');
+                    const deleteIndex = parseInt(deleteChoice) - 1;
+                    
+                    if (deleteChoice === '0') {
+                        console.log('❌ Deletion cancelled.');
+                        return true;
+                    }
+                    
+                    if (isNaN(deleteIndex) || deleteIndex < 0 || deleteIndex >= configNames.length) {
+                        console.log('❌ Invalid selection.');
+                        return true;
+                    }
+                    
+                    const nameToDelete = configNames[deleteIndex];
+                    const confirm = await this.question(rl, `\n⚠️  Confirm delete "${nameToDelete}"? (y/n): `);
+                    
+                    if (confirm.toLowerCase() === 'y') {
+                        delete configs.configs[nameToDelete];
+                        const saved = this.saveConfigurations(configs);
+                        if (saved) {
+                            console.log(`✅ Configuration "${nameToDelete}" deleted successfully.`);
+                        } else {
+                            console.log('❌ Failed to delete configuration.');
+                        }
+                    } else {
+                        console.log('❌ Deletion cancelled.');
+                    }
+                    return true;
+                    
+                case '4':
+                    const configFile = this.getConfigFilePath();
+                    console.log(`\n📁 Configuration file: ${configFile}`);
+                    if (fs.existsSync(configFile)) {
+                        const stats = fs.statSync(configFile);
+                        console.log(`   Size: ${stats.size} bytes`);
+                        console.log(`   Last modified: ${stats.mtime.toISOString()}`);
+                        console.log(`   Configurations: ${configNames.length}`);
+                    } else {
+                        console.log('   File does not exist yet. Create configurations by saving them after filter operations.');
+                    }
+                    return true;
+                    
+                case '0':
+                    return false;
+                    
+                default:
+                    console.log('❌ Invalid option. Please try again.');
+                    return true;
+            }
+        };
+        
+        let running = true;
+        while (running) {
+            console.clear();
+            showConfigSubMenu();
+            const choice = await this.question(rl, '\n👉 Select option: ');
+            console.clear();
+            console.log('⚙️  Configuration Management');
+            console.log('═'.repeat(50));
+            running = await handleConfigChoice(choice);
+            if (running) {
+                await this.question(rl, '\nPress Enter to continue...');
+            }
         }
     }
 }
