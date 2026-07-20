@@ -1247,9 +1247,18 @@ class TerminalHUD extends EventEmitter {
     this.DOUBLE_CLICK_DELAY = 300;
     this.doubleClickTimeout = null;
     this.isClickInProgress = false;
+    this.mouseClickBlinkLock = false;
+
+    // Active field editing state
+    this.activeField = null;          // { value, originalValue, line, column, onChange }
+    this.isEditing = false;
+    this.inputBuffer = '';
+    this.fieldMaxWidth = 20;          // default maximum visible characters
     
     // Mouse wheel state
     this.wheelAccumulator = 0;
+    this.activeField = null;
+    this.isEditing = false;
     this.WHEEL_THRESHOLD = 1; // Number of wheel events needed to trigger navigation
 
     // Track if we're currently in a menu
@@ -1411,6 +1420,8 @@ class TerminalHUD extends EventEmitter {
     
     // Reset wheel accumulator
     this.wheelAccumulator = 0;
+    this.activeField = null;
+    this.isEditing = false;
   }
 
   /**
@@ -1844,7 +1855,23 @@ if (configuration.remember) {
         if (question) console.log(`${question}\n`);
         normalizedOptions.forEach((lineOptions, lineIndex) => {
           let lineString = lineOptions.map((option, columnIndex) => {
-            const text = typeof option === 'string' ? option : option.name || JSON.stringify(option);
+            let text;
+            if (option.type === 'field') {
+                const maxLen = this.fieldMaxWidth || 20;
+                let val = '';
+                if (this.isEditing && lineIndex === line && columnIndex === column && this.activeField) {
+                    val = this.activeField.value;
+                    const blink = (Math.floor(Date.now() / 500) % 2 === 0) ? '█' : ' ';
+                    const truncated = val.length > maxLen ? val.slice(-maxLen) : val;  // show last maxLen chars
+                    text = `${option.label || 'Field'}: ░${truncated}${blink}░`;
+                } else {
+                    val = option.value || '';
+                    const truncated = val.length > maxLen ? val.slice(-maxLen) : val;
+                    text = `${option.label || 'Field'}: ░${truncated}░`;
+                }
+            } else {
+                text = typeof option === 'string' ? option : option.name || JSON.stringify(option);
+            }
             if (lineIndex === line && columnIndex === column) {
               return this.highlightColor
                 ? `${this.highlightColor}${text}${this.resetColor()}`
@@ -1881,7 +1908,26 @@ if (configuration.remember) {
         this.isClickInProgress = true;
         
         // Get selected item before cleanup
-        this.lastSelectedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, line, column);
+        // Check if the selected option is a field
+        const selectedOption = normalizedOptions[line] && normalizedOptions[line][column];
+        if (selectedOption && selectedOption.type === 'field') {
+            // Enter editing mode
+            this.activeField = {
+                value: selectedOption.value || '',
+                originalValue: selectedOption.value || '',
+                line, column,
+                onChange: selectedOption.onChange || null
+            };
+            this.isEditing = true;
+            this.inputBuffer = '';
+            this.disableMouseTracking();       // stop mouse interference
+            this.isClickInProgress = false;    // unlock click processing
+            setFocus(line, column);            // keep highlight on the field
+            renderMenu();
+            return;
+        }
+
+this.lastSelectedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, line, column);
         const selected = normalizedOptions[line][column];
         
         // Emit menu selection event with data
@@ -1941,6 +1987,40 @@ if (configuration.remember) {
           inMenu: true
         });
         
+        // --- FIELD EDITING MODE ---
+        if (this.isEditing && this.activeField) {
+            if (key.name === 'backspace') {
+                if (this.activeField.value.length > 0) {
+                    this.activeField.value = this.activeField.value.slice(0, -1);
+                }
+            } else if (key.name === 'return') {
+                // Confirm edit and save value
+                if (this.activeField.onChange) {
+                    this.activeField.onChange(this.activeField.value);
+                }
+                this.isEditing = false;
+                this.activeField = null;
+                this.isClickInProgress = false;   // ensure clicks are allowed again
+                this.enableMouseTracking();       // restore mouse
+            } else if (key.name === 'escape') {
+                // Cancel edit, revert to original value
+                if (this.activeField.originalValue !== undefined) {
+                    this.activeField.value = this.activeField.originalValue;
+                }
+                this.isEditing = false;
+                this.activeField = null;
+                this.isClickInProgress = false;
+                this.enableMouseTracking();
+            } else if (key.sequence && key.sequence.length === 1 && key.sequence >= ' ') {
+                // Printable character
+                this.activeField.value += key.sequence;
+            }
+            // Always re-render to show changes
+            renderMenu();
+            return;
+        }
+        
+        // --- NORMAL MENU NAVIGATION ---
         switch (key.name) {
           case 'up':
             if (line > 0) line--;
@@ -2429,6 +2509,28 @@ getOptionDataForEvent(option) {
     } catch (error) {
       this.isMouseEnabled = false;
     }
+  }
+
+  /**
+   * Disables mouse tracking temporarily (for field editing)
+   * @private
+   */
+  disableMouseTracking() {
+      if (this.isMouseEnabled) {
+          this.resetTerminalModes();
+          stdin.removeListener('data', this.handleMouseData);
+          this.isMouseEnabled = false;
+      }
+  }
+
+  /**
+   * Re-enables mouse tracking if the menu is still open
+   * @private
+   */
+  enableMouseTracking() {
+      if (!this.isMouseEnabled && this.isInMenu) {
+          this.safeEnableMouseTracking();
+      }
   }
 
   /**
@@ -6282,6 +6384,49 @@ this.DropDownManager = {
       this.Builds.get(id).InputQuestion = config.question || ''
       this.Builds.get(id).InputPassword = config.password || false
     }
+
+    // --------------------------- Field Method ---------------------------
+
+    /**
+     * Create a text field in the current build
+     * @param {string} id - User/build ID
+     * @param {string} name - Unique name for this field (used as storage key)
+     * @param {Object} config - Field configuration
+     * @param {string} [config.label] - Label displayed next to the field
+     * @param {string} [config.initialValue] - Starting value (will be overwritten if stored)
+     * @param {Function} [config.onChange] - Callback when value changes (receives new value)
+     * @param {number} [config.maxWidth] - Maximum visible characters (default 20)
+     */
+    this.Field = (id, name, config = {}) => {
+        if (!this.Builds.has(id)) return;
+
+        const storageKey = `field_${name}`;
+        let value = this.Storages.Get(id, storageKey);
+        if (value === undefined) {
+            value = config.initialValue || '';
+            this.Storages.Set(id, storageKey, value);
+        }
+
+        // Set max display width if provided
+        if (config.maxWidth) {
+            this._syappInstance.HUD.fieldMaxWidth = config.maxWidth;
+        }
+
+        const fieldObj = {
+            type: 'field',
+            label: config.label || 'Value',
+            value: value,
+            onChange: (newValue) => {
+                this.Storages.Set(id, storageKey, newValue);
+                if (typeof config.onChange === 'function') {
+                    config.onChange(newValue);
+                }
+            }
+        };
+
+        // Add it as an item in the current build, similar to a button but with type 'field'
+        this.Builds.get(id).Buttons.push(fieldObj);
+    };
 
     // --------------------------- Build Method ---------------------------
 
