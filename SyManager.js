@@ -8,14 +8,17 @@ class SyManager {
 static DB = SyDB
 static PM = SyPM
 static APP =  SyAPP
-static DefaultFunc = Sy
+
+static async Start(name){
+  let app = new SyAPP(Sy,{mainFuncName : name})
+  await SyDB.Connect(app.MainFunc.Name)
+}
 
 }
 
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-   let app = new SyAPP(SyManager.DefaultFunc)
-    await SyDB.Connect(app.MainFunc.Name)
+    SyManager.Start(process.argv[2])
   }
   
   
