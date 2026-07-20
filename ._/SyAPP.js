@@ -2713,7 +2713,8 @@ setFocus(newLine, newColumn);
         let currentColumn = 0;
         for (let column = 0; column < normalizedOptions[row].length; column++) {
           const option = normalizedOptions[row][column];
-          const text = typeof option === 'string' ? option : option.name || JSON.stringify(option);
+          const rawText = typeof option === 'string' ? option : option.name || JSON.stringify(option);
+          const text = rawText.replace(/\x1b\[[0-9;]*m/g, '');   // strip escape sequences
           const textWidth = text.length;
 
           const optionStart = currentColumn;
