@@ -1229,6 +1229,7 @@ class TerminalHUD extends EventEmitter {
     this.isLoading = false;
     this.numberedMenus = configuration.numberedMenus || false;
     this.highlightColor = this.getAnsiBackgroundColor(configuration.highlightColor || 'blue');
+    this.clickMode = configuration.clickMode || 'single';   // 'single' or 'double'
     this.lastMenuGenerator = null;
     this.lastSelectedIndex = 0;
     this.lastFocusedIndex = 0; 
@@ -1278,6 +1279,7 @@ class TerminalHUD extends EventEmitter {
       
       // Mouse events
       MOUSE_CLICK: 'mouse:click',
+      MOUSE_RIGHT_CLICK: 'mouse:rightclick',
       MOUSE_DOUBLE_CLICK: 'mouse:doubleclick',
       MOUSE_WHEEL: 'mouse:wheel',
       
@@ -2535,7 +2537,12 @@ getOptionDataForEvent(option) {
       });
       
       this.processMouseClick(x, y);
-    }
+    } else if (eventType === 'M' && button === 2) {
+      this.emitEvent('mouse:rightclick', { x, y, button: 'right', buttonCode: button });
+      // If you want right‑click to also select (like left), uncomment:
+      // this.processMouseClick(x, y);
+      // Instead we'll let SyAPP handle the navigation
+  }
   }
 
   /**
@@ -2574,7 +2581,10 @@ getOptionDataForEvent(option) {
       });
       
       this.processMouseClick(x, y);
-    }
+    } else if (button === 2) {
+      this.emitEvent('mouse:rightclick', { x, y, button: 'right', buttonCode: button });
+      // this.processMouseClick(x, y);   // if you want identical left/right behaviour
+  }
   }
 
   /**
@@ -2583,53 +2593,56 @@ getOptionDataForEvent(option) {
    * @param {number} x - X coordinate of click
    * @param {number} y - Y coordinate of click
    */
-  processMouseClick(x, y) {
+  processMouseClick(x, y) {  
     if (this.isClickInProgress) return;
 
     const { normalizedOptions, question, setFocus, selectOption } = this.currentMenuState;
     const clickedIndex = this.findOptionIndexAtCoordinates(y, x, normalizedOptions, question);
-
     if (clickedIndex === -1) return;
 
-    const { line: targetLine, column: targetColumn } = this.getCoordinatesFromLinearIndex(normalizedOptions, clickedIndex);
+    const { line: targetLine, column: targetColumn } = 
+        this.getCoordinatesFromLinearIndex(normalizedOptions, clickedIndex);
 
+    // Always focus the option (visual feedback)
     setFocus(targetLine, targetColumn);
 
+    // Single‑click mode – select immediately
+    if (this.clickMode === 'single') {
+        // Emit mouse click event
+        this.emitEvent(this.eventTypes.MOUSE_CLICK, {
+            x, y, button: 'left'
+        });
+        selectOption('mouse').catch(error => {
+            console.error('Error in menu selection:', error);
+        });
+        return;
+    }
+
+    // Double‑click mode (original logic)
     const currentTime = Date.now();
     const isDoubleClick = (currentTime - this.lastMouseClick.time < this.DOUBLE_CLICK_DELAY &&
-                          this.lastMouseClick.x === x && 
-                          this.lastMouseClick.y === y);
+                           this.lastMouseClick.x === x && 
+                           this.lastMouseClick.y === y);
 
     if (isDoubleClick) {
-      // Emit mouse double click event
-      this.emitEvent(this.eventTypes.MOUSE_DOUBLE_CLICK, {
-        x,
-        y,
-        button: 'left'
-      });
-      
-      this.lastMouseClick = { time: 0, x: -1, y: -1 };
-      if (this.doubleClickTimeout) {
-        clearTimeout(this.doubleClickTimeout);
-        this.doubleClickTimeout = null;
-      }
-      
-      selectOption('mouse').catch(error => {
-        console.error('Error in menu selection:', error);
-      });
-    } else {
-      this.lastMouseClick = { time: currentTime, x, y };
-      
-      if (this.doubleClickTimeout) {
-        clearTimeout(this.doubleClickTimeout);
-      }
-      
-      this.doubleClickTimeout = setTimeout(() => {
+        this.emitEvent(this.eventTypes.MOUSE_DOUBLE_CLICK, { x, y, button: 'left' });
         this.lastMouseClick = { time: 0, x: -1, y: -1 };
-        this.doubleClickTimeout = null;
-      }, this.DOUBLE_CLICK_DELAY);
+        if (this.doubleClickTimeout) {
+            clearTimeout(this.doubleClickTimeout);
+            this.doubleClickTimeout = null;
+        }
+        selectOption('mouse').catch(error => {
+            console.error('Error in menu selection:', error);
+        });
+    } else {
+        this.lastMouseClick = { time: currentTime, x, y };
+        if (this.doubleClickTimeout) clearTimeout(this.doubleClickTimeout);
+        this.doubleClickTimeout = setTimeout(() => {
+            this.lastMouseClick = { time: 0, x: -1, y: -1 };
+            this.doubleClickTimeout = null;
+        }, this.DOUBLE_CLICK_DELAY);
     }
-  }
+}
 
   /**
    * Processes mouse wheel events for navigation
@@ -7066,8 +7079,7 @@ class SyAPP {
    * @param {number} [config.maxFuncHistorySize=20] - Maximum size of function history array per session
    */
   constructor(mainFuncOrConfig, config = {}) {
-    /** @type {TerminalHUD} */
-    this.HUD = new TerminalHUD();
+    
     /** @type {http.Server|null} */
     this.httpServer = null;
     /** @type {HTTPRoutesStorage} */
@@ -7084,6 +7096,11 @@ class SyAPP {
       mainFunc = mainFuncOrConfig?.mainfunc || TemplateFunc;
       userConfig = mainFuncOrConfig || {};
     }
+
+/** @type {TerminalHUD} */
+this.HUD = new TerminalHUD({
+  clickMode: userConfig.mouseClickMode || 'single'   // default to single click
+});
 
     /** @type {{Func: Function, Name: string, OriginalName: string}} */
     this.MainFunc = { Func: mainFunc, Name: undefined, OriginalName: undefined };
@@ -7561,6 +7578,25 @@ class SyAPP {
         });
       });
     });
+
+    this.HUD.on('mouse:rightclick', () => {
+      const currentSession = this.Sessions.get(this.MainSessionID);
+      // Navigate back to the previous function (and its props)
+      if (currentSession && currentSession.PreviousPath) {
+          this.LoadScreen(currentSession.PreviousPath, {
+              props: currentSession.PreviousProps || {},
+              resetSelection: true
+          }).catch(er => {
+              this.LoadScreen('error', {
+                  props: {
+                      error_message: er,
+                      error_func: currentSession.PreviousPath,
+                      mainfunc: this.MainFunc.Name
+                  }
+              });
+          });
+      }
+  });
 
     if (!this.serverConfig.enableHTTP) {
       this.LoadScreen();
