@@ -91,6 +91,70 @@ class BraceMatcher {
         }
         return sourceCode.length - 1;
     }
+    
+    // New helper method to track template string context
+    static isInsideTemplateString(sourceCode, position) {
+        let insideTemplate = false;
+        let insideString = false;
+        let stringDelimiter = '';
+        let insideSingleLineComment = false;
+        let insideMultiLineComment = false;
+        
+        for (let i = 0; i < position; i++) {
+            const char = sourceCode[i];
+            const prevChar = i > 0 ? sourceCode[i - 1] : '';
+            const nextChar = i < sourceCode.length - 1 ? sourceCode[i + 1] : '';
+            
+            // Handle comments outside of strings/templates
+            if (!insideString && !insideTemplate && !insideMultiLineComment) {
+                if (char === '/' && nextChar === '/') {
+                    insideSingleLineComment = true;
+                    i++;
+                    continue;
+                }
+                if (char === '/' && nextChar === '*') {
+                    insideMultiLineComment = true;
+                    i++;
+                    continue;
+                }
+            }
+            
+            if (insideSingleLineComment) {
+                if (char === '\n') {
+                    insideSingleLineComment = false;
+                }
+                continue;
+            }
+            
+            if (insideMultiLineComment) {
+                if (char === '*' && nextChar === '/') {
+                    insideMultiLineComment = false;
+                    i++;
+                    continue;
+                }
+                continue;
+            }
+            
+            // Track template strings
+            if (char === '`' && prevChar !== '\\' && !insideString) {
+                insideTemplate = !insideTemplate;
+                continue;
+            }
+            
+            // Track regular strings (only when not in template)
+            if (!insideTemplate && (char === '"' || char === "'") && prevChar !== '\\') {
+                if (!insideString) {
+                    insideString = true;
+                    stringDelimiter = char;
+                } else if (char === stringDelimiter) {
+                    insideString = false;
+                }
+                continue;
+            }
+        }
+        
+        return insideTemplate;
+    }
 }
 
 // ============================================================================
@@ -103,6 +167,10 @@ class CodeAnalyzer {
         const regularExpression = /import\s+(?:(?:\{[^}]*\}|\*\s+as\s+\w+|\w+)\s*,?\s*)*\s*from\s+['"][^'"]+['"]\s*;?/g;
         let match;
         while ((match = regularExpression.exec(sourceCode)) !== null) {
+            // Skip if inside template string
+            if (BraceMatcher.isInsideTemplateString(sourceCode, match.index)) {
+                continue;
+            }
             imports.push({
                 type: 'import',
                 name: match[0].trim(),
@@ -126,6 +194,10 @@ class CodeAnalyzer {
         for (const regularExpression of patterns) {
             let match;
             while ((match = regularExpression.exec(sourceCode)) !== null) {
+                // Skip if inside template string
+                if (BraceMatcher.isInsideTemplateString(sourceCode, match.index)) {
+                    continue;
+                }
                 exports.push({
                     type: 'export',
                     name: match[1] || match[0].trim(),
@@ -143,6 +215,10 @@ class CodeAnalyzer {
         const regularExpression = /class\s+(\w+)(?:\s+extends\s+(\w+))?\s*\{/g;
         let match;
         while ((match = regularExpression.exec(sourceCode)) !== null) {
+            // Skip if inside template string
+            if (BraceMatcher.isInsideTemplateString(sourceCode, match.index)) {
+                continue;
+            }
             const className = match[1];
             const extendsClass = match[2] || null;
             const start = match.index;
@@ -176,35 +252,39 @@ class CodeAnalyzer {
         const functionDeclarationRegex = /(?:async\s+)?function\s+(\w+)\s*\([^)]*\)\s*\{/g;
         let match;
         while ((match = functionDeclarationRegex.exec(sourceCode)) !== null) {
-            if (!isInsideAnyClass(match.index)) {
-                const start = match.index;
-                const end = BraceMatcher.findMatchingBrace(sourceCode, match.index + match[0].length - 1) + 1;
-                functions.push({
-                    type: 'function',
-                    name: match[1],
-                    start: start,
-                    end: end,
-                    content: sourceCode.substring(start, end),
-                    isAsync: match[0].includes('async')
-                });
+            // Skip if inside template string or class
+            if (BraceMatcher.isInsideTemplateString(sourceCode, match.index) || isInsideAnyClass(match.index)) {
+                continue;
             }
+            const start = match.index;
+            const end = BraceMatcher.findMatchingBrace(sourceCode, match.index + match[0].length - 1) + 1;
+            functions.push({
+                type: 'function',
+                name: match[1],
+                start: start,
+                end: end,
+                content: sourceCode.substring(start, end),
+                isAsync: match[0].includes('async')
+            });
         }
         
         const arrowFunctionRegex = /(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>\s*\{/g;
         while ((match = arrowFunctionRegex.exec(sourceCode)) !== null) {
-            if (!isInsideAnyClass(match.index)) {
-                const start = match.index;
-                const end = BraceMatcher.findMatchingBrace(sourceCode, match.index + match[0].length - 1) + 1;
-                functions.push({
-                    type: 'function',
-                    name: match[1],
-                    start: start,
-                    end: end,
-                    content: sourceCode.substring(start, end),
-                    isAsync: match[0].includes('async'),
-                    isArrow: true
-                });
+            // Skip if inside template string or class
+            if (BraceMatcher.isInsideTemplateString(sourceCode, match.index) || isInsideAnyClass(match.index)) {
+                continue;
             }
+            const start = match.index;
+            const end = BraceMatcher.findMatchingBrace(sourceCode, match.index + match[0].length - 1) + 1;
+            functions.push({
+                type: 'function',
+                name: match[1],
+                start: start,
+                end: end,
+                content: sourceCode.substring(start, end),
+                isAsync: match[0].includes('async'),
+                isArrow: true
+            });
         }
         return functions;
     }
@@ -228,15 +308,20 @@ class CodeAnalyzer {
         const regularExpression = /(?:const|let|var)\s+(\w+)\s*=\s*[^;]+;?/g;
         let match;
         while ((match = regularExpression.exec(sourceCode)) !== null) {
-            if (!isInsideStructure(match.index) && !match[0].includes('=>') && !match[0].includes('function')) {
-                variables.push({
-                    type: 'variable',
-                    name: match[1],
-                    start: match.index,
-                    end: match.index + match[0].length,
-                    content: match[0].trim()
-                });
+            // Skip if inside template string, class, function, or is arrow/function declaration
+            if (BraceMatcher.isInsideTemplateString(sourceCode, match.index) || 
+                isInsideStructure(match.index) || 
+                match[0].includes('=>') || 
+                match[0].includes('function')) {
+                continue;
             }
+            variables.push({
+                type: 'variable',
+                name: match[1],
+                start: match.index,
+                end: match.index + match[0].length,
+                content: match[0].trim()
+            });
         }
         return variables;
     }
@@ -251,6 +336,11 @@ class CodeAnalyzer {
         for (const { regularExpression, type } of patterns) {
             let match;
             while ((match = regularExpression.exec(sourceCode)) !== null) {
+                // Skip if inside template string
+                if (BraceMatcher.isInsideTemplateString(sourceCode, match.index)) {
+                    continue;
+                }
+                
                 const isJSDoc = match[0].includes('/**') || 
                                (type === 'multi-line' && match[0].trimStart().startsWith('/**'));
                 
