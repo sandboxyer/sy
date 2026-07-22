@@ -832,6 +832,7 @@ build_config_interface() {
     
     COMMIT_CACHE="/tmp/build_commits_cache_$$.txt"
     MONTH_CACHE="/tmp/build_months_cache_$$.txt"
+    VERSION_METRICS_FILE="/tmp/build_version_metrics_$$.txt"   # NEW: store version metric info
     
     echo "Loading files..."
     
@@ -985,6 +986,252 @@ build_config_interface() {
             done
             rm -f "/tmp/build_months_raw_$$.txt"
         fi
+    }
+    
+    # =========================================================================
+    # SMART VERSION METRICS: Determines what to count based on version level
+    # =========================================================================
+    # Version level detection:
+    #   - 3-part version (x.y.z) with z > 0 or 0 → PATCH level → count "micro-patches"
+    #   - 2-part version (x.y) or 3-part with z=0 → MINOR level → count "patches"
+    #   - 1-part version or 2-part with y=0 → MAJOR level → count "minors"
+    # =========================================================================
+    
+    # Helper: determine the "level" of a version string
+    # Returns: patch, minor, or major
+    get_version_level() {
+        version_str="$1"
+        # Count dots
+        dot_count=$(echo "$version_str" | tr -cd '.' | wc -c)
+        
+        if [ "$dot_count" -ge 2 ]; then
+            # Three-part version: x.y.z
+            major=$(echo "$version_str" | cut -d. -f1)
+            minor=$(echo "$version_str" | cut -d. -f2)
+            patch=$(echo "$version_str" | cut -d. -f3 | sed 's/-.*//')
+            # If patch is 0, treat as minor level (x.y.0 means it's a minor release)
+            if [ "$patch" = "0" ] || [ -z "$patch" ]; then
+                echo "minor"
+            else
+                echo "patch"
+            fi
+        elif [ "$dot_count" -ge 1 ]; then
+            # Two-part version: x.y
+            minor_part=$(echo "$version_str" | cut -d. -f2 | sed 's/-.*//')
+            if [ "$minor_part" = "0" ] || [ -z "$minor_part" ]; then
+                echo "major"
+            else
+                echo "minor"
+            fi
+        else
+            echo "major"
+        fi
+    }
+    
+    # Helper: get parent version prefix for counting sub-versions
+    # For patch "1.2.3" → parent prefix "1.2." (count patches: 1.2.0, 1.2.1, etc.)
+    # For minor "1.2.0" or "1.2" → parent prefix "1." (count minors: 1.0, 1.1, etc.)
+    # For major "1.0.0" or "1.0" or "1" → no prefix (count all majors)
+    get_parent_prefix() {
+        version_str="$1"
+        level="$2"
+        case "$level" in
+            "patch")
+                # Strip patch part, keep "major.minor."
+                echo "$version_str" | sed 's/\.[0-9]*$//'
+                ;;
+            "minor")
+                # Strip minor and patch, keep "major."
+                echo "$version_str" | cut -d. -f1
+                ;;
+            "major")
+                echo ""
+                ;;
+        esac
+    }
+    
+    # Count sub-versions (patches for minors, minors for majors, micro-patches for patches)
+    # between two version tags within the same parent scope
+    count_sub_versions_between() {
+        from_tag="$1"
+        to_tag="$2"
+        level="$3"
+        
+        case "$level" in
+            "patch")
+                # Count commits between patches (micro-patches)
+                git rev-list --count "${from_tag}..${to_tag}" 2>/dev/null || echo "0"
+                ;;
+            "minor")
+                # Count patch-level version tags between two minors
+                parent_prefix=$(get_parent_prefix "$from_tag" "minor")
+                # Count version tags that start with parent_prefix and are between from_tag and to_tag
+                count=0
+                all_version_tags=$(git tag --sort=creatordate 2>/dev/null | grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?$')
+                started=false
+                for tag in $all_version_tags; do
+                    if [ "$tag" = "$from_tag" ]; then
+                        started=true
+                        continue
+                    fi
+                    if [ "$tag" = "$to_tag" ]; then
+                        break
+                    fi
+                    if [ "$started" = true ]; then
+                        # Only count if it's a patch within the same minor family
+                        tag_prefix=$(echo "$tag" | sed 's/\.[0-9]*$//')
+                        if [ "$tag_prefix" = "$parent_prefix" ]; then
+                            count=$((count + 1))
+                        fi
+                    fi
+                done
+                echo "$count"
+                ;;
+            "major")
+                # Count minor-level version tags between two majors
+                from_major=$(echo "$from_tag" | cut -d. -f1)
+                to_major=$(echo "$to_tag" | cut -d. -f1)
+                count=0
+                all_version_tags=$(git tag --sort=creatordate 2>/dev/null | grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?$')
+                started=false
+                for tag in $all_version_tags; do
+                    if [ "$tag" = "$from_tag" ]; then
+                        started=true
+                        continue
+                    fi
+                    if [ "$tag" = "$to_tag" ]; then
+                        break
+                    fi
+                    if [ "$started" = true ]; then
+                        tag_major=$(echo "$tag" | cut -d. -f1)
+                        tag_level=$(get_version_level "$tag")
+                        # Only count if it's a minor release (not patch) within the same major family
+                        if [ "$tag_major" = "$from_major" ] && [ "$tag_level" = "minor" ]; then
+                            count=$((count + 1))
+                        fi
+                    fi
+                done
+                echo "$count"
+                ;;
+            *)
+                echo "0"
+                ;;
+        esac
+    }
+    
+    build_version_metrics() {
+        > "$VERSION_METRICS_FILE"
+        # Extract version tags (lines ending with "|V") and sort by date ascending
+        grep '|V$' "$COMMIT_CACHE" | sort -t'|' -k3 > "/tmp/build_version_tags_$$.txt"
+        
+        prev_hash=""
+        prev_date=""
+        prev_version=""
+        while IFS='|' read -r csize hash date msg is_version; do
+            if [ -n "$prev_hash" ]; then
+                # compute days between prev_date and current date
+                prev_epoch=$(date -d "$prev_date" +%s 2>/dev/null || echo 0)
+                curr_epoch=$(date -d "$date" +%s 2>/dev/null || echo 0)
+                if [ "$prev_epoch" -gt 0 ] && [ "$curr_epoch" -gt 0 ]; then
+                    days=$(( (curr_epoch - prev_epoch) / 86400 ))
+                    [ "$days" -lt 0 ] && days=0
+                else
+                    days="?"
+                fi
+                
+                # Determine the level of the current version
+                level=$(get_version_level "$prev_version")
+                
+                # Count sub-versions based on level
+                case "$level" in
+                    "patch")
+                        # Count commits (micro-patches) between patches
+                        sub_count=$(git rev-list --count "${prev_hash}..${hash}" 2>/dev/null || echo "0")
+                        label="micro-patches"
+                        ;;
+                    "minor")
+                        # Count patch versions between minors
+                        sub_count=$(count_sub_versions_between "$prev_version" "$msg" "minor")
+                        label="patches"
+                        ;;
+                    "major")
+                        # Count minor versions between majors
+                        sub_count=$(count_sub_versions_between "$prev_version" "$msg" "major")
+                        label="minors"
+                        ;;
+                esac
+                
+                echo "${prev_hash}|${days}|${sub_count}|${label}" >> "$VERSION_METRICS_FILE"
+            fi
+            prev_hash="$hash"
+            prev_date="$date"
+            prev_version="$msg"
+        done < "/tmp/build_version_tags_$$.txt"
+        
+        # handle the last (most recent) version tag
+        if [ -n "$prev_hash" ]; then
+            prev_epoch=$(date -d "$prev_date" +%s 2>/dev/null || echo 0)
+            now_epoch=$(date +%s)
+            if [ "$prev_epoch" -gt 0 ]; then
+                days=$(( (now_epoch - prev_epoch) / 86400 ))
+                [ "$days" -lt 0 ] && days=0
+            else
+                days="?"
+            fi
+            
+            level=$(get_version_level "$prev_version")
+            
+            case "$level" in
+                "patch")
+                    sub_count=$(git rev-list --count "${prev_hash}..HEAD" 2>/dev/null || echo "0")
+                    label="micro-patches"
+                    ;;
+                "minor")
+                    # Count patches from the last minor to HEAD
+                    parent_prefix=$(get_parent_prefix "$prev_version" "minor")
+                    sub_count=0
+                    all_version_tags=$(git tag --sort=creatordate 2>/dev/null | grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?$')
+                    started=false
+                    for tag in $all_version_tags; do
+                        if [ "$tag" = "$prev_version" ]; then
+                            started=true
+                            continue
+                        fi
+                        if [ "$started" = true ]; then
+                            tag_prefix=$(echo "$tag" | sed 's/\.[0-9]*$//')
+                            if [ "$tag_prefix" = "$parent_prefix" ]; then
+                                sub_count=$((sub_count + 1))
+                            fi
+                        fi
+                    done
+                    label="patches"
+                    ;;
+                "major")
+                    from_major=$(echo "$prev_version" | cut -d. -f1)
+                    sub_count=0
+                    all_version_tags=$(git tag --sort=creatordate 2>/dev/null | grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?$')
+                    started=false
+                    for tag in $all_version_tags; do
+                        if [ "$tag" = "$prev_version" ]; then
+                            started=true
+                            continue
+                        fi
+                        if [ "$started" = true ]; then
+                            tag_major=$(echo "$tag" | cut -d. -f1)
+                            tag_level=$(get_version_level "$tag")
+                            if [ "$tag_major" = "$from_major" ] && [ "$tag_level" = "minor" ]; then
+                                sub_count=$((sub_count + 1))
+                            fi
+                        fi
+                    done
+                    label="minors"
+                    ;;
+            esac
+            
+            echo "${prev_hash}|${days}|${sub_count}|${label}" >> "$VERSION_METRICS_FILE"
+        fi
+        
+        rm -f "/tmp/build_version_tags_$$.txt"
     }
     
     # Main loop
@@ -1441,6 +1688,7 @@ build_config_interface() {
                         mv "${COMMIT_CACHE}.sorted" "$COMMIT_CACHE"
                     fi
                     build_month_cache
+                    build_version_metrics   # NEW: compute version metrics
                     echo ""; echo "  Cache built with $(wc -l < "$COMMIT_CACHE") commits"; sleep 1
                 fi
                 current_page=1; ITEMS_PER_PAGE=5; show_versions_only=false; date_filter=""
@@ -1479,7 +1727,18 @@ build_config_interface() {
                         short_hash=$(echo "$hash" | cut -c1-7)
                         shortened_msg=$(echo "$msg" | cut -c1-30)
                         marker=""; [ -n "$SELECTED_COMMIT" ] && [ "$hash" = "$SELECTED_COMMIT" ] && marker=" << SELECTED"
-                        printf "  %2s. %8s %s %s %s%s\n" "$counter" "$size_display" "$short_hash" "$date" "$shortened_msg" "$marker"
+                        # NEW: append version metrics if this commit is a version tag
+                        version_extra=""
+                        if [ "$is_version" = "V" ] && [ -f "$VERSION_METRICS_FILE" ]; then
+                            metrics=$(grep "^${hash}|" "$VERSION_METRICS_FILE" 2>/dev/null)
+                            if [ -n "$metrics" ]; then
+                                days=$(echo "$metrics" | cut -d'|' -f2)
+                                sub_count=$(echo "$metrics" | cut -d'|' -f3)
+                                label=$(echo "$metrics" | cut -d'|' -f4)
+                                version_extra=" (${days}d, ${sub_count} ${label})"
+                            fi
+                        fi
+                        printf "  %2s. %8s %s %s %s%s%s\n" "$counter" "$size_display" "$short_hash" "$date" "$shortened_msg" "$version_extra" "$marker"
                         echo "${counter}|${hash}|${msg}" >> "/tmp/build_commit_map_$$.txt"
                         counter=$((counter+1))
                     done < "$FILTERED_COMMITS"
@@ -1525,7 +1784,7 @@ build_config_interface() {
                                 esac
                             done
                             ;;
-                        r|R) rm -f "$COMMIT_CACHE" "$MONTH_CACHE"; echo ""; echo "  Cache cleared."; sleep 1; break ;;
+                        r|R) rm -f "$COMMIT_CACHE" "$MONTH_CACHE" "$VERSION_METRICS_FILE"; echo ""; echo "  Cache cleared."; sleep 1; break ;;
                         c|C) SELECTED_COMMIT=""; SELECTED_COMMIT_MSG=""; date_filter=""
                             > "$EXCLUDE_LIST"; > "$EXCLUDE_DIRS_LIST"; load_files_from_commit ""
                             echo ""; echo "  Switched to HEAD"; sleep 1; break ;;
@@ -1645,7 +1904,7 @@ build_config_interface() {
                 ;;
             0) break ;;
             q|Q)
-                rm -f "$EXCLUDE_LIST" "$EXCLUDE_DIRS_LIST" "$BUILD_INCLUDE_LIST" "$BUILD_FILES_LIST" "$BUILD_DIRS_LIST" "$COMMIT_CACHE" "$MONTH_CACHE"
+                rm -f "$EXCLUDE_LIST" "$EXCLUDE_DIRS_LIST" "$BUILD_INCLUDE_LIST" "$BUILD_FILES_LIST" "$BUILD_DIRS_LIST" "$COMMIT_CACHE" "$MONTH_CACHE" "$VERSION_METRICS_FILE"
                 echo ""; echo "  Build cancelled."; exit 0
                 ;;
             *) echo ""; echo "  Invalid choice. Press Enter..."; read dummy ;;
@@ -1685,7 +1944,7 @@ build_config_interface() {
         save_name=$(echo "$save_name" | sed 's/[^a-zA-Z0-9_-]/_/g')
         [ -n "$save_name" ] && save_build_configuration "$save_name"
     fi
-    rm -f "$BUILD_FILES_LIST" "$BUILD_DIRS_LIST" "$COMMIT_CACHE" "$MONTH_CACHE"
+    rm -f "$BUILD_FILES_LIST" "$BUILD_DIRS_LIST" "$COMMIT_CACHE" "$MONTH_CACHE" "$VERSION_METRICS_FILE"
     return 0
 }
 
