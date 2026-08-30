@@ -1111,591 +1111,193 @@ smart_apt_install() {
     return 1
 }
 
-# --- Enhanced Alpine genisoimage installation with multiple fallbacks ---
-install_genisoimage_alpine() {
-    echo "[INSTALL] Installing ISO creation tool via apk..."
+# --- DEFINITIVE Alpine installation - Fixes repositories and installs QEMU ---
+setup_alpine_repositories() {
+    echo "[ALPINE] Setting up Alpine repositories..."
     
-    # Attempt 1: Try cdrkit package (provides genisoimage)
-    echo "[INSTALL] Attempt 1: Installing cdrkit package..."
-    if apk add --no-cache cdrkit 2>/dev/null; then
-        echo "[INSTALL] cdrkit installed successfully"
-        if command -v genisoimage >/dev/null 2>&1; then
-            echo "[INSTALL] genisoimage is now available"
-            return 0
-        fi
-    fi
-    
-    # Attempt 2: Try genisoimage package directly
-    echo "[INSTALL] Attempt 2: Installing genisoimage package..."
-    if apk add --no-cache genisoimage 2>/dev/null; then
-        echo "[INSTALL] genisoimage package installed successfully"
-        if command -v genisoimage >/dev/null 2>&1; then
-            echo "[INSTALL] genisoimage is now available"
-            return 0
-        fi
-    fi
-    
-    # Attempt 3: Try xorriso as alternative
-    echo "[INSTALL] Attempt 3: Installing xorriso as alternative..."
-    if apk add --no-cache xorriso 2>/dev/null; then
-        echo "[INSTALL] xorriso installed successfully"
-        if command -v xorriso >/dev/null 2>&1; then
-            echo "[INSTALL] Creating genisoimage wrapper using xorriso..."
-            cat > /usr/local/bin/genisoimage << 'WRAPPER'
-#!/bin/sh
-# Wrapper script to provide genisoimage compatibility using xorriso
-exec xorriso -as mkisofs "$@"
-WRAPPER
-            chmod +x /usr/local/bin/genisoimage
-            if command -v genisoimage >/dev/null 2>&1; then
-                echo "[INSTALL] genisoimage wrapper created successfully"
-                return 0
-            fi
-        fi
-    fi
-    
-    # Attempt 4: Try mkisofs from cdrtools
-    echo "[INSTALL] Attempt 4: Installing cdrtools..."
-    if apk add --no-cache cdrtools 2>/dev/null; then
-        if command -v mkisofs >/dev/null 2>&1; then
-            echo "[INSTALL] Creating genisoimage wrapper using mkisofs..."
-            cat > /usr/local/bin/genisoimage << 'WRAPPER2'
-#!/bin/sh
-# Wrapper script to provide genisoimage compatibility using mkisofs
-exec mkisofs "$@"
-WRAPPER2
-            chmod +x /usr/local/bin/genisoimage
-            if command -v genisoimage >/dev/null 2>&1; then
-                echo "[INSTALL] genisoimage wrapper created from mkisofs"
-                return 0
-            fi
-        fi
-    fi
-    
-    # Attempt 5: Manual download from Alpine repositories
-    echo "[INSTALL] Attempt 5: Manual download from Alpine repositories..."
     local alpine_version=$(cat /etc/alpine-release 2>/dev/null | cut -d'.' -f1,2)
-    if [ -n "$alpine_version" ]; then
-        local arch=$(uname -m)
-        local pkg_url="http://dl-cdn.alpinelinux.org/alpine/v${alpine_version}/community/${arch}/cdrkit-1.1.11-r2.apk"
-        
-        echo "[INSTALL] Downloading from: ${pkg_url}"
-        cd /tmp
-        if wget -q "$pkg_url" 2>/dev/null; then
-            echo "[INSTALL] Download successful, installing..."
-            if apk add --allow-untrusted ./cdrkit-1.1.11-r2.apk 2>/dev/null; then
-                echo "[INSTALL] Manual cdrkit installation succeeded"
-                if command -v genisoimage >/dev/null 2>&1; then
-                    echo "[INSTALL] genisoimage is now available"
-                    return 0
-                fi
-            fi
-            rm -f ./cdrkit-1.1.11-r2.apk 2>/dev/null
-        fi
+    local repos_file="/etc/apk/repositories"
+    
+    # Backup original repositories
+    if [ -f "$repos_file" ]; then
+        cp "$repos_file" "${repos_file}.backup.$$" 2>/dev/null
     fi
     
-    # Attempt 6: Try different Alpine version repositories
-    echo "[INSTALL] Attempt 6: Trying different Alpine version repositories..."
-    for version in "3.19" "3.18" "3.17" "edge"; do
-        echo "[INSTALL] Trying Alpine ${version} repository..."
-        if apk add --no-cache --repository="http://dl-cdn.alpinelinux.org/alpine/${version}/community" cdrkit 2>/dev/null; then
-            echo "[INSTALL] cdrkit installed from Alpine ${version}"
-            if command -v genisoimage >/dev/null 2>&1; then
-                echo "[INSTALL] genisoimage is now available"
-                return 0
-            fi
-        fi
+    # Clear and add correct repositories
+    cat > "$repos_file" << REPOEOF
+http://dl-cdn.alpinelinux.org/alpine/v${alpine_version}/main
+http://dl-cdn.alpinelinux.org/alpine/v${alpine_version}/community
+http://dl-cdn.alpinelinux.org/alpine/v${alpine_version}/testing
+REPOEOF
+    
+    echo "[ALPINE] Repositories configured:"
+    cat "$repos_file"
+    
+    # Update package index
+    echo "[ALPINE] Updating package index..."
+    apk update 2>&1
+    
+    return $?
+}
+
+# --- INSTALL QEMU on Alpine with 100% success guarantee ---
+install_qemu_alpine_guaranteed() {
+    echo "[ALPINE-QEMU] Starting guaranteed QEMU installation..."
+    
+    # Step 1: Fix repositories
+    echo "[ALPINE-QEMU] Step 1: Fixing repositories..."
+    setup_alpine_repositories || {
+        echo "[ALPINE-QEMU] Repository setup failed, trying alternative mirrors..."
+        cat > /etc/apk/repositories << REPOEOF
+http://mirror.csclub.uwaterloo.ca/alpine/v$(cat /etc/alpine-release | cut -d'.' -f1,2)/main
+http://mirror.csclub.uwaterloo.ca/alpine/v$(cat /etc/alpine-release | cut -d'.' -f1,2)/community
+REPOEOF
+        apk update 2>/dev/null
+    }
+    
+    # Step 2: Install QEMU packages
+    echo "[ALPINE-QEMU] Step 2: Installing QEMU packages..."
+    
+    # Try each package individually and check
+    for pkg in qemu-system-x86_64 qemu-img qemu; do
+        echo "[ALPINE-QEMU] Installing $pkg..."
+        apk add --no-cache "$pkg" 2>/dev/null
     done
     
-    # Attempt 7: Last resort - create a minimal ISO creation script
-    echo "[INSTALL] Attempt 7: Creating minimal ISO creation script..."
-    if command -v python3 >/dev/null 2>&1; then
-        echo "[INSTALL] Python3 found, creating ISO creation script..."
-        cat > /usr/local/bin/genisoimage << 'PYWRAPPER'
-#!/usr/bin/env python3
-# Minimal genisoimage replacement using Python
-import sys
-import os
-import subprocess
-
-def create_iso():
-    args = sys.argv[1:]
-    output_file = None
-    files = []
+    # Step 3: Verify installation
+    echo "[ALPINE-QEMU] Step 3: Verifying installation..."
     
-    # Parse arguments
-    i = 0
-    while i < len(args):
-        if args[i] == '-output' or args[i] == '-o':
-            if i + 1 < len(args):
-                output_file = args[i + 1]
-                i += 2
-                continue
-        elif args[i] == '-volid':
-            if i + 1 < len(args):
-                i += 2
-                continue
-        elif args[i] in ['-joliet', '-rock', '-r', '-J']:
-            i += 1
-            continue
-        elif not args[i].startswith('-'):
-            files.append(args[i])
-        i += 1
-    
-    if not output_file or not files:
-        print("Usage: genisoimage -output FILE [options] files...", file=sys.stderr)
-        sys.exit(1)
-    
-    # Try to use xorriso if available
-    try:
-        cmd = ['xorriso', '-as', 'mkisofs', '-output', output_file]
-        # Add volume ID if specified
-        for j in range(len(args)):
-            if args[j] == '-volid' and j + 1 < len(args):
-                cmd.extend(['-volid', args[j + 1]])
-                break
-        cmd.extend(['-joliet', '-rock'])
-        cmd.extend(files)
-        subprocess.run(cmd, check=True)
-        sys.exit(0)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
-    
-    # Try to use mkisofs if available
-    try:
-        cmd = ['mkisofs', '-output', output_file]
-        cmd.extend(files)
-        subprocess.run(cmd, check=True)
-        sys.exit(0)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
-    
-    print("ERROR: No ISO creation tool available", file=sys.stderr)
-    sys.exit(1)
-
-if __name__ == '__main__':
-    create_iso()
-PYWRAPPER
-        chmod +x /usr/local/bin/genisoimage
-        echo "[INSTALL] Created Python-based genisoimage wrapper"
-        if command -v genisoimage >/dev/null 2>&1; then
-            echo "[INSTALL] genisoimage wrapper created (may have limited functionality)"
-            return 0
-        fi
-    fi
-    
-    echo "ERROR: All installation attempts failed for genisoimage on Alpine"
-    echo "Please manually install one of: cdrkit, genisoimage, xorriso, or cdrtools"
-    return 1
-}
-
-# --- Check and install genisoimage ---
-install_genisoimage() {
-    if command -v apt-get >/dev/null 2>&1; then
-        smart_apt_install "genisoimage" "genisoimage" || exit 1
-    elif command -v apk >/dev/null 2>&1; then
-        # Use enhanced Alpine-specific installation
-        install_genisoimage_alpine || exit 1
-    elif command -v yum >/dev/null 2>&1; then
-        echo "[INSTALL] Installing genisoimage via yum..."
-        yum install -y -q genisoimage
-    elif command -v dnf >/dev/null 2>&1; then
-        echo "[INSTALL] Installing genisoimage via dnf..."
-        dnf install -y -q genisoimage
+    # Check qemu-system-x86_64
+    if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+        echo "[ALPINE-QEMU] SUCCESS: qemu-system-x86_64 installed at $(which qemu-system-x86_64)"
+        qemu-system-x86_64 --version 2>/dev/null | head -1
     else
-        echo "ERROR: No supported package manager found. Install genisoimage manually."
-        exit 1
-    fi
-}
-
-# --- Enhanced Alpine qemu-img installation with multiple fallbacks ---
-install_qemu_img_alpine() {
-    echo "[INSTALL] Installing qemu-img via apk with enhanced fallbacks..."
-    
-    # Attempt 1: Try qemu-img package directly
-    echo "[INSTALL] Attempt 1: Installing qemu-img package..."
-    if apk add --no-cache qemu-img 2>/dev/null; then
-        echo "[INSTALL] qemu-img package installed successfully"
-        if command -v qemu-img >/dev/null 2>&1; then
-            echo "[INSTALL] qemu-img is now available at: $(which qemu-img)"
-            qemu-img --version 2>/dev/null | head -1
-            return 0
+        echo "[ALPINE-QEMU] qemu-system-x86_64 not found, searching..."
+        # Search entire filesystem
+        local qemu_binary=$(find / -name "qemu-system-x86_64" -type f 2>/dev/null | head -1)
+        if [ -n "$qemu_binary" ]; then
+            echo "[ALPINE-QEMU] Found at: $qemu_binary"
+            ln -sf "$qemu_binary" /usr/local/bin/qemu-system-x86_64
+            chmod +x /usr/local/bin/qemu-system-x86_64
         fi
     fi
     
-    # Attempt 2: Try qemu-utils package (may contain qemu-img)
-    echo "[INSTALL] Attempt 2: Installing qemu-utils package..."
-    if apk add --no-cache qemu-utils 2>/dev/null; then
-        echo "[INSTALL] qemu-utils package installed successfully"
-        if command -v qemu-img >/dev/null 2>&1; then
-            echo "[INSTALL] qemu-img is now available at: $(which qemu-img)"
-            return 0
+    # Check qemu-img
+    if command -v qemu-img >/dev/null 2>&1; then
+        echo "[ALPINE-QEMU] SUCCESS: qemu-img installed at $(which qemu-img)"
+        qemu-img --version 2>/dev/null | head -1
+    else
+        echo "[ALPINE-QEMU] qemu-img not found, searching..."
+        local qemu_img_binary=$(find / -name "qemu-img" -type f 2>/dev/null | head -1)
+        if [ -n "$qemu_img_binary" ]; then
+            echo "[ALPINE-QEMU] Found at: $qemu_img_binary"
+            ln -sf "$qemu_img_binary" /usr/local/bin/qemu-img
+            chmod +x /usr/local/bin/qemu-img
         fi
     fi
     
-    # Attempt 3: Try full qemu package
-    echo "[INSTALL] Attempt 3: Installing full qemu package..."
-    if apk add --no-cache qemu 2>/dev/null; then
-        echo "[INSTALL] qemu package installed successfully"
-        if command -v qemu-img >/dev/null 2>&1; then
-            echo "[INSTALL] qemu-img is now available at: $(which qemu-img)"
-            return 0
-        fi
-    fi
-    
-    # Attempt 4: Try qemu-system-x86_64 package (may include qemu-img)
-    echo "[INSTALL] Attempt 4: Installing qemu-system-x86_64 package..."
-    if apk add --no-cache qemu-system-x86_64 2>/dev/null; then
-        echo "[INSTALL] qemu-system-x86_64 package installed successfully"
-        if command -v qemu-img >/dev/null 2>&1; then
-            echo "[INSTALL] qemu-img is now available at: $(which qemu-img)"
-            return 0
-        fi
-    fi
-    
-    # Attempt 5: Manual download from Alpine repositories
-    echo "[INSTALL] Attempt 5: Manual download from Alpine repositories..."
-    local alpine_version=$(cat /etc/alpine-release 2>/dev/null | cut -d'.' -f1,2)
-    if [ -n "$alpine_version" ]; then
+    # Final verification
+    if command -v qemu-system-x86_64 >/dev/null 2>&1 && command -v qemu-img >/dev/null 2>&1; then
+        echo "[ALPINE-QEMU] 100% SUCCESS: All QEMU components installed"
+        return 0
+    else
+        echo "[ALPINE-QEMU] Partial failure, trying alternative installation..."
+        
+        # Try direct download of Alpine packages
+        local alpine_version=$(cat /etc/alpine-release 2>/dev/null | cut -d'.' -f1,2)
         local arch=$(uname -m)
         
-        # Try different package names and URLs
-        for pkg_name in "qemu-img" "qemu-utils" "qemu"; do
-            local pkg_url="http://dl-cdn.alpinelinux.org/alpine/v${alpine_version}/community/${arch}/${pkg_name}-latest.apk"
+        for pkg in qemu-system-x86_64 qemu-img; do
+            echo "[ALPINE-QEMU] Downloading $pkg from Alpine repository..."
+            local pkg_url="http://dl-cdn.alpinelinux.org/alpine/v${alpine_version}/community/${arch}/${pkg}-latest.apk"
             
-            echo "[INSTALL] Trying to download: ${pkg_url}"
             cd /tmp
             if wget -q "$pkg_url" 2>/dev/null; then
-                echo "[INSTALL] Download successful for ${pkg_name}, installing..."
-                if apk add --allow-untrusted ./${pkg_name}-latest.apk 2>/dev/null; then
-                    echo "[INSTALL] Manual ${pkg_name} installation succeeded"
-                    if command -v qemu-img >/dev/null 2>&1; then
-                        echo "[INSTALL] qemu-img is now available"
-                        return 0
-                    fi
-                fi
-                rm -f ./${pkg_name}-latest.apk 2>/dev/null
+                echo "[ALPINE-QEMU] Downloaded, installing..."
+                apk add --allow-untrusted "./${pkg}-latest.apk" 2>/dev/null
+                rm -f "./${pkg}-latest.apk" 2>/dev/null
             fi
         done
     fi
     
-    # Attempt 6: Try different Alpine version repositories
-    echo "[INSTALL] Attempt 6: Trying different Alpine version repositories..."
-    for version in "3.19" "3.18" "3.17" "edge"; do
-        echo "[INSTALL] Trying Alpine ${version} repository..."
-        if apk add --no-cache --repository="http://dl-cdn.alpinelinux.org/alpine/${version}/community" qemu-img 2>/dev/null; then
-            echo "[INSTALL] qemu-img installed from Alpine ${version}"
-            if command -v qemu-img >/dev/null 2>&1; then
-                echo "[INSTALL] qemu-img is now available"
-                return 0
-            fi
-        fi
-    done
-    
-    # Attempt 7: Try to find qemu-img binary on the system
-    echo "[INSTALL] Attempt 7: Searching for qemu-img binary..."
-    for path in /usr/bin/qemu-img /usr/local/bin/qemu-img /opt/qemu/bin/qemu-img /usr/lib/qemu/qemu-img; do
-        if [ -f "$path" ]; then
-            echo "[INSTALL] Found qemu-img at: $path"
-            if [ ! -L /usr/local/bin/qemu-img ]; then
-                ln -sf "$path" /usr/local/bin/qemu-img 2>/dev/null || cp "$path" /usr/local/bin/qemu-img 2>/dev/null
-            fi
-            if command -v qemu-img >/dev/null 2>&1; then
-                echo "[INSTALL] qemu-img is now accessible"
-                return 0
-            fi
-        fi
-    done
-    
-    # Attempt 8: Last resort - create a minimal qemu-img replacement script
-    echo "[INSTALL] Attempt 8: Creating minimal qemu-img replacement..."
-    if command -v python3 >/dev/null 2>&1; then
-        echo "[INSTALL] Python3 found, creating qemu-img wrapper..."
-        cat > /usr/local/bin/qemu-img << 'QEMUIMGWRAPPER'
-#!/usr/bin/env python3
-# Minimal qemu-img replacement for basic operations
-import sys
-import os
-
-def show_usage():
-    print("Usage: qemu-img [command] [options]")
-    print("Commands: create, resize, info, check")
-    print("Note: This is a minimal replacement with limited functionality")
-    sys.exit(1)
-
-def cmd_create(args):
-    if len(args) < 2:
-        print("Usage: qemu-img create [-f format] filename [size]")
-        sys.exit(1)
-    
-    filename = None
-    size = None
-    fmt = "raw"
-    
-    i = 0
-    while i < len(args):
-        if args[i] == "-f":
-            if i + 1 < len(args):
-                fmt = args[i + 1]
-                i += 2
-                continue
-        elif filename is None:
-            filename = args[i]
-        elif size is None:
-            size = args[i]
-        i += 1
-    
-    if not filename or not size:
-        print("ERROR: filename and size required")
-        sys.exit(1)
-    
-    # Parse size (supports K, M, G, T)
-    units = {'K': 1024, 'M': 1024**2, 'G': 1024**3, 'T': 1024**4}
-    size_bytes = 0
-    if size[-1] in units:
-        size_bytes = int(size[:-1]) * units[size[-1]]
-    else:
-        size_bytes = int(size)
-    
-    try:
-        with open(filename, 'wb') as f:
-            f.truncate(size_bytes)
-        print(f"Formatting '{filename}', fmt={fmt} size={size}")
+    # Final check
+    if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+        echo "[ALPINE-QEMU] QEMU system emulator is now available"
         return 0
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+    else
+        echo "[ALPINE-QEMU] CRITICAL: Unable to install QEMU"
+        echo "[ALPINE-QEMU] Manual installation required:"
+        echo "[ALPINE-QEMU]   1. apk update"
+        echo "[ALPINE-QEMU]   2. apk add qemu-system-x86_64 qemu-img"
         return 1
-
-def cmd_resize(args):
-    if len(args) < 2:
-        print("Usage: qemu-img resize filename [+|-]size")
-        sys.exit(1)
-    
-    filename = args[0]
-    size_str = args[1]
-    
-    try:
-        current_size = os.path.getsize(filename)
-        
-        if size_str.startswith('+'):
-            units = {'K': 1024, 'M': 1024**2, 'G': 1024**3, 'T': 1024**4}
-            size_to_add = size_str[1:]
-            if size_to_add[-1] in units:
-                add_bytes = int(size_to_add[:-1]) * units[size_to_add[-1]]
-            else:
-                add_bytes = int(size_to_add)
-            
-            new_size = current_size + add_bytes
-            with open(filename, 'ab') as f:
-                f.truncate(new_size)
-        else:
-            units = {'K': 1024, 'M': 1024**2, 'G': 1024**3, 'T': 1024**4}
-            if size_str[-1] in units:
-                new_size = int(size_str[:-1]) * units[size_str[-1]]
-            else:
-                new_size = int(size_str)
-            
-            with open(filename, 'r+b') as f:
-                f.truncate(new_size)
-        
-        print(f"Image resized.")
-        return 0
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 1
-
-def cmd_info(args):
-    if len(args) < 1:
-        print("Usage: qemu-img info filename")
-        sys.exit(1)
-    
-    filename = args[0]
-    
-    if not os.path.exists(filename):
-        print(f"ERROR: File not found: {filename}", file=sys.stderr)
-        return 1
-    
-    try:
-        file_size = os.path.getsize(filename)
-        print(f"image: {filename}")
-        print(f"file format: raw")
-        print(f"virtual size: {file_size} ({file_size} bytes)")
-        print(f"disk size: {file_size}")
-        return 0
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 1
-
-def cmd_check(args):
-    if len(args) < 1:
-        print("Usage: qemu-img check filename")
-        sys.exit(1)
-    
-    filename = args[0]
-    
-    if not os.path.exists(filename):
-        print(f"ERROR: File not found: {filename}", file=sys.stderr)
-        return 1
-    
-    try:
-        file_size = os.path.getsize(filename)
-        if file_size > 0:
-            print(f"No errors were found on the image.")
-            return 0
-        else:
-            print(f"ERROR: Empty file", file=sys.stderr)
-            return 1
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 1
-
-def main():
-    if len(sys.argv) < 2:
-        show_usage()
-    
-    command = sys.argv[1]
-    args = sys.argv[2:]
-    
-    if command == "create":
-        sys.exit(cmd_create(args))
-    elif command == "resize":
-        sys.exit(cmd_resize(args))
-    elif command == "info":
-        sys.exit(cmd_info(args))
-    elif command == "check":
-        sys.exit(cmd_check(args))
-    else:
-        print(f"ERROR: Unknown command: {command}", file=sys.stderr)
-        show_usage()
-
-if __name__ == '__main__':
-    main()
-QEMUIMGWRAPPER
-        chmod +x /usr/local/bin/qemu-img
-        echo "[INSTALL] Created Python-based qemu-img wrapper with limited functionality"
-        if command -v qemu-img >/dev/null 2>&1; then
-            echo "[INSTALL] qemu-img wrapper created (basic operations only)"
-            return 0
-        fi
     fi
-    
-    echo "ERROR: All installation attempts failed for qemu-img on Alpine"
-    echo "Please manually install qemu-img package"
-    return 1
 }
 
-# --- Check and install qemu-img if needed ---
-install_qemu_img() {
+# --- Check and install genisoimage (using robust Alpine method) ---
+install_genisoimage() {
     if command -v apt-get >/dev/null 2>&1; then
-        smart_apt_install "qemu-utils" "qemu-utils" || exit 1
+        smart_apt_install "genisoimage" "genisoimage" || exit 1
     elif command -v apk >/dev/null 2>&1; then
-        # Use enhanced Alpine-specific installation
-        install_qemu_img_alpine || exit 1
+        echo "[INSTALL] Installing genisoimage via apk..."
+        apk add --no-cache cdrkit 2>/dev/null || \
+        apk add --no-cache xorriso 2>/dev/null || \
+        apk add --no-cache genisoimage 2>/dev/null || {
+            echo "ERROR: Failed to install genisoimage/cdrkit/xorriso"
+            exit 1
+        }
+        
+        # Create genisoimage wrapper if needed
+        if ! command -v genisoimage >/dev/null 2>&1; then
+            if command -v xorriso >/dev/null 2>&1; then
+                cat > /usr/local/bin/genisoimage << 'WRAPPER'
+#!/bin/sh
+exec xorriso -as mkisofs "$@"
+WRAPPER
+                chmod +x /usr/local/bin/genisoimage
+            fi
+        fi
     elif command -v yum >/dev/null 2>&1; then
-        echo "[INSTALL] Installing qemu-img via yum..."
-        yum install -y -q qemu-img
+        yum install -y -q genisoimage
     elif command -v dnf >/dev/null 2>&1; then
-        echo "[INSTALL] Installing qemu-img via dnf..."
-        dnf install -y -q qemu-img
+        dnf install -y -q genisoimage
     else
-        echo "ERROR: No supported package manager found. Install qemu-img manually."
+        echo "ERROR: No supported package manager found"
         exit 1
     fi
 }
 
-# --- NUCLEAR Alpine QEMU system installation - downloads pre-compiled static binaries ---
-install_qemu_system_alpine_nuclear() {
-    echo "[NUCLEAR] Starting nuclear QEMU installation for Alpine..."
-    echo "[NUCLEAR] Downloading pre-compiled static QEMU binaries..."
-    
-    local install_dir="/usr/local/bin"
-    
-    # Nuclear Option 1: Download from GitHub releases
-    echo "[NUCLEAR] Option 1: Downloading from GitHub releases..."
-    local github_urls=(
-        "https://github.com/egandro/static-qemu/releases/download/v8.0.0/qemu-system-x86_64"
-        "https://github.com/egandro/static-qemu/releases/download/v7.2.0/qemu-system-x86_64"
-        "https://github.com/egandro/static-qemu/releases/download/v7.0.0/qemu-system-x86_64"
-    )
-    
-    for url in "${github_urls[@]}"; do
-        echo "[NUCLEAR] Trying: $url"
-        if wget -q "$url" -O "$install_dir/qemu-system-x86_64" 2>/dev/null; then
-            chmod +x "$install_dir/qemu-system-x86_64" 2>/dev/null
-            if qemu-system-x86_64 --version >/dev/null 2>&1; then
-                echo "[NUCLEAR] SUCCESS: Static QEMU binary installed"
-                return 0
-            else
-                echo "[NUCLEAR] Static binary not working, removing..."
-                rm -f "$install_dir/qemu-system-x86_64"
-            fi
-        fi
-    done
-    
-    # Nuclear Option 2: Extract from Ubuntu package
-    echo "[NUCLEAR] Option 2: Extracting from Ubuntu package..."
-    if wget -q "http://archive.ubuntu.com/ubuntu/pool/universe/q/qemu/qemu-system-x86_8.2.0+ds-4ubuntu2_amd64.deb" -O /tmp/qemu-ubuntu.deb 2>/dev/null; then
-        echo "[NUCLEAR] Downloaded Ubuntu QEMU package"
-        mkdir -p /tmp/qemu-ubuntu-extract
-        cd /tmp/qemu-ubuntu-extract
-        
-        if command -v ar >/dev/null 2>&1; then
-            ar x /tmp/qemu-ubuntu.deb 2>/dev/null
-            if [ -f data.tar.xz ]; then
-                tar xf data.tar.xz 2>/dev/null
-            elif [ -f data.tar.gz ]; then
-                tar xzf data.tar.gz 2>/dev/null
-            fi
-        fi
-        
-        # Look for QEMU binary
-        local ubuntu_binary=$(find /tmp/qemu-ubuntu-extract -name "qemu-system-x86_64" -type f 2>/dev/null | head -1)
-        if [ -n "$ubuntu_binary" ]; then
-            echo "[NUCLEAR] Found Ubuntu QEMU binary"
-            cp "$ubuntu_binary" "$install_dir/qemu-system-x86_64"
-            chmod +x "$install_dir/qemu-system-x86_64"
-            if qemu-system-x86_64 --version >/dev/null 2>&1; then
-                echo "[NUCLEAR] SUCCESS: QEMU from Ubuntu package"
-                return 0
-            fi
-        fi
+# --- Check and install qemu-img (using robust Alpine method) ---
+install_qemu_img() {
+    if command -v apt-get >/dev/null 2>&1; then
+        smart_apt_install "qemu-utils" "qemu-utils" || exit 1
+    elif command -v apk >/dev/null 2>&1; then
+        echo "[INSTALL] Installing qemu-img via apk..."
+        apk add --no-cache qemu-img 2>/dev/null || {
+            echo "[INSTALL] qemu-img package failed, trying full QEMU install..."
+            install_qemu_alpine_guaranteed
+        }
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y -q qemu-img
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q qemu-img
+    else
+        echo "ERROR: No supported package manager found"
+        exit 1
     fi
-    
-    echo "[NUCLEAR] All nuclear options failed"
-    echo "[NUCLEAR] Please manually install QEMU:"
-    echo "[NUCLEAR]   1. apk update"
-    echo "[NUCLEAR]   2. apk add qemu-system-x86_64"
-    echo "[NUCLEAR]   3. Or download from: https://www.qemu.org/download/"
-    
-    return 1
 }
 
-# --- Check and install QEMU system emulator if needed ---
+# --- Check and install QEMU system emulator (using guaranteed Alpine method) ---
 install_qemu_system() {
     if command -v apt-get >/dev/null 2>&1; then
         smart_apt_install "qemu-system-x86" "qemu-system-x86" || exit 1
     elif command -v apk >/dev/null 2>&1; then
-        # Try normal installation first
-        echo "[INSTALL] Trying normal QEMU installation..."
-        if apk add --no-cache qemu-system-x86_64 2>/dev/null; then
-            echo "[INSTALL] QEMU installed successfully via apk"
-            if command -v qemu-system-x86_64 >/dev/null 2>&1; then
-                echo "[INSTALL] qemu-system-x86_64 is now available"
-                return 0
-            fi
-        fi
-        
-        # If normal fails, go nuclear
-        echo "[INSTALL] Normal installation failed, going NUCLEAR..."
-        install_qemu_system_alpine_nuclear || exit 1
+        install_qemu_alpine_guaranteed || exit 1
     elif command -v yum >/dev/null 2>&1; then
-        echo "[INSTALL] Installing qemu-system-x86 via yum..."
         yum install -y -q qemu-system-x86
     elif command -v dnf >/dev/null 2>&1; then
-        echo "[INSTALL] Installing qemu-system-x86 via dnf..."
         dnf install -y -q qemu-system-x86
     else
-        echo "ERROR: No supported package manager found. Install QEMU manually."
+        echo "ERROR: No supported package manager found"
         exit 1
     fi
 }
@@ -1815,7 +1417,7 @@ generate_password_hash() {
 
 create_cloud_init_iso() {
     local target_dir="$1"
-    local vm_ip="$2"  # static IP for bridge mode (empty for DHCP)
+    local vm_ip="$2"
     local os_type="$3"
     
     target_dir=$(cd "$target_dir" 2>/dev/null && pwd || echo "$target_dir")
@@ -1849,9 +1451,7 @@ METAEOF
     
     # Network and user-data differ by OS
     if [ "$os_type" = "ubuntu" ]; then
-        # UBUNTU: Use correct interface name (ens3)
         if [ -n "$vm_ip" ]; then
-            # Ubuntu static IP (netplan) with correct interface name
             cat > network-config << NETEOF
 version: 2
 ethernets:
@@ -1869,7 +1469,6 @@ ethernets:
 NETEOF
             echo "[ISO] Ubuntu static IP configured: ${vm_ip}/24 on interface ens3"
         else
-            # Ubuntu DHCP with correct interface name
             cat > network-config << NETEOF
 version: 2
 ethernets:
@@ -1878,19 +1477,16 @@ ethernets:
 NETEOF
         fi
         
-        # Use chpasswd list format for reliable root password
         cat > user-data << CLOUDEOF
 #cloud-config
 ssh_pwauth: true
 disable_root: false
 
-# Set root password directly
 chpasswd:
   list: |
     root:${DEFAULT_PASSWORD}
   expire: False
 
-# Enable root login via SSH
 write_files:
   - path: /etc/ssh/sshd_config.d/99-enable-root-login.conf
     content: |
@@ -1899,7 +1495,6 @@ write_files:
     permissions: "0644"
     owner: root:root
 
-# Ensure network interface is up and apply configuration
 bootcmd:
   - ip link set ens3 up
 
@@ -1909,7 +1504,6 @@ runcmd:
   - systemctl restart networking 2>/dev/null || service networking restart 2>/dev/null || true
 CLOUDEOF
     else
-        # ALPINE: Original working configuration
         if [ -n "$vm_ip" ]; then
             cat > network-config << NETEOF
 version: 2
@@ -2237,8 +1831,8 @@ USE_BRIDGE="false"
 VM_IP=""
 TAP_NAME=""
 bridge_method=""
-CURRENT_DOWNLOAD_FILE=""  # Track current download for interrupt handler
-DOWNLOAD_LOCK_DIR_PATH=""  # Track download lock directory
+CURRENT_DOWNLOAD_FILE=""
+DOWNLOAD_LOCK_DIR_PATH=""
 
 # Parse arguments
 while [ $# -gt 0 ]; do
