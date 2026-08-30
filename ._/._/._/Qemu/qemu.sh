@@ -1416,12 +1416,10 @@ install_qemu_img_alpine() {
 # Minimal qemu-img replacement for basic operations
 import sys
 import os
-import subprocess
-import shutil
 
 def show_usage():
     print("Usage: qemu-img [command] [options]")
-    print("Commands: create, resize, info, check, convert")
+    print("Commands: create, resize, info, check")
     print("Note: This is a minimal replacement with limited functionality")
     sys.exit(1)
 
@@ -1461,13 +1459,7 @@ def cmd_create(args):
     
     try:
         with open(filename, 'wb') as f:
-            if fmt == "qcow2":
-                # Create minimal qcow2 header
-                # This is a simplified version, not fully functional
-                f.seek(size_bytes - 1)
-                f.write(b'\0')
-            else:
-                f.truncate(size_bytes)
+            f.truncate(size_bytes)
         print(f"Formatting '{filename}', fmt={fmt} size={size}")
         return 0
     except Exception as e:
@@ -1486,7 +1478,6 @@ def cmd_resize(args):
         current_size = os.path.getsize(filename)
         
         if size_str.startswith('+'):
-            # Grow file
             units = {'K': 1024, 'M': 1024**2, 'G': 1024**3, 'T': 1024**4}
             size_to_add = size_str[1:]
             if size_to_add[-1] in units:
@@ -1497,20 +1488,7 @@ def cmd_resize(args):
             new_size = current_size + add_bytes
             with open(filename, 'ab') as f:
                 f.truncate(new_size)
-        elif size_str.startswith('-'):
-            # Shrink file (not recommended for qcow2)
-            units = {'K': 1024, 'M': 1024**2, 'G': 1024**3, 'T': 1024**4}
-            size_to_sub = size_str[1:]
-            if size_to_sub[-1] in units:
-                sub_bytes = int(size_to_sub[:-1]) * units[size_to_sub[-1]]
-            else:
-                sub_bytes = int(size_to_sub)
-            
-            new_size = max(0, current_size - sub_bytes)
-            with open(filename, 'r+b') as f:
-                f.truncate(new_size)
         else:
-            # Set absolute size
             units = {'K': 1024, 'M': 1024**2, 'G': 1024**3, 'T': 1024**4}
             if size_str[-1] in units:
                 new_size = int(size_str[:-1]) * units[size_str[-1]]
@@ -1612,7 +1590,8 @@ install_qemu_img() {
         smart_apt_install "qemu-utils" "qemu-utils" || exit 1
     elif command -v apk >/dev/null 2>&1; then
         # Use enhanced Alpine-specific installation
-        install_qemu_img_alpine || exit 1    elif command -v yum >/dev/null 2>&1; then
+        install_qemu_img_alpine || exit 1
+    elif command -v yum >/dev/null 2>&1; then
         echo "[INSTALL] Installing qemu-img via yum..."
         yum install -y -q qemu-img
     elif command -v dnf >/dev/null 2>&1; then
@@ -1629,87 +1608,20 @@ install_qemu_system_alpine_nuclear() {
     echo "[NUCLEAR] Starting nuclear QEMU installation for Alpine..."
     echo "[NUCLEAR] Downloading pre-compiled static QEMU binaries..."
     
-    local arch=$(uname -m)
-    local qemu_version="8.2.0"
     local install_dir="/usr/local/bin"
-    local download_dir="/tmp/qemu-nuclear"
     
-    mkdir -p "$download_dir"
-    cd "$download_dir" || return 1
-    
-    # Nuclear Option 1: Download static QEMU from multiarch/qemu
-    echo "[NUCLEAR] Option 1: Downloading from multiarch/qemu..."
-    local docker_image="multiarch/qemu-user-static"
-    
-    # Try to extract QEMU from Docker image without Docker
-    echo "[NUCLEAR] Downloading Docker image layers..."
-    
-    # Get Docker image manifest
-    if wget -q "https://registry.hub.docker.com/v2/repositories/multiarch/qemu-user-static/tags/latest" -O /tmp/qemu-manifest.json 2>/dev/null; then
-        echo "[NUCLEAR] Got Docker manifest"
-    fi
-    
-    # Nuclear Option 2: Download from GitHub releases
-    echo "[NUCLEAR] Option 2: Downloading from GitHub releases..."
+    # Nuclear Option 1: Download from GitHub releases
+    echo "[NUCLEAR] Option 1: Downloading from GitHub releases..."
     local github_urls=(
-        "https://github.com/multiarch/qemu-user-static/releases/download/v7.2.0-1/qemu-x86_64-static"
-        "https://github.com/tonistiigi/binfmt/releases/download/v7.0.0-12/qemu-x86_64"
-        "https://github.com/qemu/qemu/releases/download/v8.2.0/qemu-8.2.0.tar.xz"
-    )
-    
-    for url in "${github_urls[@]}"; do
-        echo "[NUCLEAR] Trying: $url"
-        if wget -q "$url" 2>/dev/null; then
-            local filename=$(basename "$url")
-            echo "[NUCLEAR] Downloaded: $filename"
-            
-            # If it's a tar.xz, extract it
-            if echo "$filename" | grep -q "tar.xz"; then
-                echo "[NUCLEAR] Extracting archive..."
-                if command -v tar >/dev/null 2>&1; then
-                    tar xf "$filename" 2>/dev/null
-                    # Look for qemu-system-x86_64 in extracted files
-                    local found_binary=$(find . -name "qemu-system-x86_64" -type f 2>/dev/null | head -1)
-                    if [ -n "$found_binary" ]; then
-                        echo "[NUCLEAR] Found binary: $found_binary"
-                        cp "$found_binary" "$install_dir/qemu-system-x86_64"
-                        chmod +x "$install_dir/qemu-system-x86_64"
-                        if command -v qemu-system-x86_64 >/dev/null 2>&1; then
-                            echo "[NUCLEAR] SUCCESS: QEMU installed from source archive"
-                            return 0
-                        fi
-                    fi
-                fi
-            else
-                # Direct binary download
-                mv "$filename" "$install_dir/qemu-system-x86_64" 2>/dev/null
-                chmod +x "$install_dir/qemu-system-x86_64" 2>/dev/null
-                if command -v qemu-system-x86_64 >/dev/null 2>&1; then
-                    # Test if it actually works
-                    if qemu-system-x86_64 --version >/dev/null 2>&1; then
-                        echo "[NUCLEAR] SUCCESS: QEMU binary downloaded and working"
-                        return 0
-                    else
-                        echo "[NUCLEAR] Binary downloaded but not working, removing..."
-                        rm -f "$install_dir/qemu-system-x86_64"
-                    fi
-                fi
-            fi
-        fi
-    done
-    
-    # Nuclear Option 3: Download from static-qemu builds
-    echo "[NUCLEAR] Option 3: Downloading static QEMU builds..."
-    local static_urls=(
         "https://github.com/egandro/static-qemu/releases/download/v8.0.0/qemu-system-x86_64"
         "https://github.com/egandro/static-qemu/releases/download/v7.2.0/qemu-system-x86_64"
         "https://github.com/egandro/static-qemu/releases/download/v7.0.0/qemu-system-x86_64"
     )
     
-    for url in "${static_urls[@]}"; do
-        echo "[NUCLEAR] Trying static build: $url"
+    for url in "${github_urls[@]}"; do
+        echo "[NUCLEAR] Trying: $url"
         if wget -q "$url" -O "$install_dir/qemu-system-x86_64" 2>/dev/null; then
-            chmod +x "$install_dir/qemu-system-x86_64"
+            chmod +x "$install_dir/qemu-system-x86_64" 2>/dev/null
             if qemu-system-x86_64 --version >/dev/null 2>&1; then
                 echo "[NUCLEAR] SUCCESS: Static QEMU binary installed"
                 return 0
@@ -1720,18 +1632,14 @@ install_qemu_system_alpine_nuclear() {
         fi
     done
     
-    # Nuclear Option 4: Download from Fedora/Ubuntu packages and extract
-    echo "[NUCLEAR] Option 4: Extracting from other distro packages..."
-    
-    # Try Ubuntu package
-    echo "[NUCLEAR] Trying Ubuntu package..."
+    # Nuclear Option 2: Extract from Ubuntu package
+    echo "[NUCLEAR] Option 2: Extracting from Ubuntu package..."
     if wget -q "http://archive.ubuntu.com/ubuntu/pool/universe/q/qemu/qemu-system-x86_8.2.0+ds-4ubuntu2_amd64.deb" -O /tmp/qemu-ubuntu.deb 2>/dev/null; then
         echo "[NUCLEAR] Downloaded Ubuntu QEMU package"
-        if command -v dpkg-deb >/dev/null 2>&1; then
-            dpkg-deb -x /tmp/qemu-ubuntu.deb /tmp/qemu-ubuntu-extract 2>/dev/null
-        elif command -v ar >/dev/null 2>&1; then
-            mkdir -p /tmp/qemu-ubuntu-extract
-            cd /tmp/qemu-ubuntu-extract
+        mkdir -p /tmp/qemu-ubuntu-extract
+        cd /tmp/qemu-ubuntu-extract
+        
+        if command -v ar >/dev/null 2>&1; then
             ar x /tmp/qemu-ubuntu.deb 2>/dev/null
             if [ -f data.tar.xz ]; then
                 tar xf data.tar.xz 2>/dev/null
@@ -1753,56 +1661,13 @@ install_qemu_system_alpine_nuclear() {
         fi
     fi
     
-    # Nuclear Option 5: Download from Alpine edge testing with direct binary extraction
-    echo "[NUCLEAR] Option 5: Extracting from Alpine APK directly..."
-    local alpine_version=$(cat /etc/alpine-release 2>/dev/null | cut -d'.' -f1,2)
-    if [ -n "$alpine_version" ]; then
-        local pkg_url="http://dl-cdn.alpinelinux.org/alpine/edge/community/x86_64/qemu-system-x86_64-8.2.0-r0.apk"
-        echo "[NUCLEAR] Downloading: $pkg_url"
-        if wget -q "$pkg_url" -O /tmp/qemu.apk 2>/dev/null; then
-            echo "[NUCLEAR] Extracting APK..."
-            cd /tmp
-            tar xzf qemu.apk 2>/dev/null
-            # APK contains .tar.gz inside
-            for apk_inner in *.tar.gz; do
-                tar xzf "$apk_inner" 2>/dev/null
-            done
-            
-            # Look for QEMU binary
-            local apk_binary=$(find /tmp -path "*/usr/bin/qemu-system-x86_64" -type f 2>/dev/null | head -1)
-            if [ -n "$apk_binary" ]; then
-                echo "[NUCLEAR] Found QEMU in APK"
-                cp "$apk_binary" "$install_dir/qemu-system-x86_64"
-                chmod +x "$install_dir/qemu-system-x86_64"
-                if qemu-system-x86_64 --version >/dev/null 2>&1; then
-                    echo "[NUCLEAR] SUCCESS: QEMU extracted from APK"
-                    return 0
-                fi
-            fi
-        fi
-    fi
-    
-    # Nuclear Option 6: Last resort - use busybox-style minimal VM
-    echo "[NUCLEAR] Option 6: Creating minimal VM runner..."
-    cat > "$install_dir/qemu-system-x86_64" << 'MINIQEMU'
-#!/bin/sh
-# Minimal QEMU-like runner - WILL NOT actually run VMs
-# This is a last resort that provides helpful error messages
-echo "ERROR: QEMU is not properly installed" >&2
-echo "Please install with: apk add qemu-system-x86_64" >&2
-echo "Or visit: https://www.qemu.org/download/" >&2
-exit 1
-MINIQEMU
-    chmod +x "$install_dir/qemu-system-x86_64"
-    
     echo "[NUCLEAR] All nuclear options failed"
-    echo "[NUCLEAR] Created placeholder to prevent script crash"
     echo "[NUCLEAR] Please manually install QEMU:"
     echo "[NUCLEAR]   1. apk update"
     echo "[NUCLEAR]   2. apk add qemu-system-x86_64"
     echo "[NUCLEAR]   3. Or download from: https://www.qemu.org/download/"
     
-    return 0  # Return success to continue script (will fail when actually running VM)
+    return 1
 }
 
 # --- Check and install QEMU system emulator if needed ---
