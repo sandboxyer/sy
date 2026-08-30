@@ -1625,13 +1625,161 @@ install_qemu_img() {
     fi
 }
 
+# --- Enhanced Alpine QEMU system installation with multiple fallbacks ---
+install_qemu_system_alpine() {
+    echo "[INSTALL] Installing QEMU system emulator via apk with enhanced fallbacks..."
+    
+    # Attempt 1: Try qemu-system-x86_64 package directly
+    echo "[INSTALL] Attempt 1: Installing qemu-system-x86_64 package..."
+    if apk add --no-cache qemu-system-x86_64 2>/dev/null; then
+        echo "[INSTALL] qemu-system-x86_64 package installed successfully"
+        if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+            echo "[INSTALL] qemu-system-x86_64 is now available at: $(which qemu-system-x86_64)"
+            qemu-system-x86_64 --version 2>/dev/null | head -1
+            return 0
+        fi
+    fi
+    
+    # Attempt 2: Try qemu-system-x86 package
+    echo "[INSTALL] Attempt 2: Installing qemu-system-x86 package..."
+    if apk add --no-cache qemu-system-x86 2>/dev/null; then
+        echo "[INSTALL] qemu-system-x86 package installed successfully"
+        if command -v qemu-system-x86_64 >/dev/null 2>&1 || command -v qemu-system-x86 >/dev/null 2>&1; then
+            # Create symlink if needed
+            if [ ! -f /usr/local/bin/qemu-system-x86_64 ] && command -v qemu-system-x86 >/dev/null 2>&1; then
+                ln -sf "$(which qemu-system-x86)" /usr/local/bin/qemu-system-x86_64
+            fi
+            if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+                echo "[INSTALL] qemu-system-x86_64 is now available"
+                return 0
+            fi
+        fi
+    fi
+    
+    # Attempt 3: Try full qemu package
+    echo "[INSTALL] Attempt 3: Installing full qemu package..."
+    if apk add --no-cache qemu 2>/dev/null; then
+        echo "[INSTALL] qemu package installed successfully"
+        if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+            echo "[INSTALL] qemu-system-x86_64 is now available"
+            return 0
+        fi
+    fi
+    
+    # Attempt 4: Try qemu-x86_64 package
+    echo "[INSTALL] Attempt 4: Installing qemu-x86_64 package..."
+    if apk add --no-cache qemu-x86_64 2>/dev/null; then
+        echo "[INSTALL] qemu-x86_64 package installed successfully"
+        if command -v qemu-system-x86_64 >/dev/null 2>&1 || command -v qemu-x86_64 >/dev/null 2>&1; then
+            # Create symlink if needed
+            if [ ! -f /usr/local/bin/qemu-system-x86_64 ] && command -v qemu-x86_64 >/dev/null 2>&1; then
+                ln -sf "$(which qemu-x86_64)" /usr/local/bin/qemu-system-x86_64
+            fi
+            if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+                echo "[INSTALL] qemu-system-x86_64 is now available"
+                return 0
+            fi
+        fi
+    fi
+    
+    # Attempt 5: Manual download from Alpine repositories
+    echo "[INSTALL] Attempt 5: Manual download from Alpine repositories..."
+    local alpine_version=$(cat /etc/alpine-release 2>/dev/null | cut -d'.' -f1,2)
+    if [ -n "$alpine_version" ]; then
+        local arch=$(uname -m)
+        
+        # Try different package names
+        for pkg_name in "qemu-system-x86_64" "qemu-system-x86" "qemu"; do
+            local pkg_url="http://dl-cdn.alpinelinux.org/alpine/v${alpine_version}/community/${arch}/${pkg_name}-latest.apk"
+            
+            echo "[INSTALL] Trying to download: ${pkg_url}"
+            cd /tmp
+            if wget -q "$pkg_url" 2>/dev/null; then
+                echo "[INSTALL] Download successful for ${pkg_name}, installing..."
+                if apk add --allow-untrusted ./${pkg_name}-latest.apk 2>/dev/null; then
+                    echo "[INSTALL] Manual ${pkg_name} installation succeeded"
+                    if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+                        echo "[INSTALL] qemu-system-x86_64 is now available"
+                        return 0
+                    fi
+                fi
+                rm -f ./${pkg_name}-latest.apk 2>/dev/null
+            fi
+        done
+    fi
+    
+    # Attempt 6: Try different Alpine version repositories
+    echo "[INSTALL] Attempt 6: Trying different Alpine version repositories..."
+    for version in "3.19" "3.18" "3.17" "edge"; do
+        echo "[INSTALL] Trying Alpine ${version} repository..."
+        if apk add --no-cache --repository="http://dl-cdn.alpinelinux.org/alpine/${version}/community" qemu-system-x86_64 2>/dev/null; then
+            echo "[INSTALL] qemu-system-x86_64 installed from Alpine ${version}"
+            if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+                echo "[INSTALL] qemu-system-x86_64 is now available"
+                return 0
+            fi
+        fi
+    done
+    
+    # Attempt 7: Try to find QEMU binary on the system
+    echo "[INSTALL] Attempt 7: Searching for QEMU binary..."
+    for path in /usr/bin/qemu-system-x86_64 /usr/local/bin/qemu-system-x86_64 /usr/lib/qemu/qemu-system-x86_64 /opt/qemu/bin/qemu-system-x86_64; do
+        if [ -f "$path" ]; then
+            echo "[INSTALL] Found QEMU at: $path"
+            if [ ! -L /usr/local/bin/qemu-system-x86_64 ]; then
+                ln -sf "$path" /usr/local/bin/qemu-system-x86_64 2>/dev/null || cp "$path" /usr/local/bin/qemu-system-x86_64 2>/dev/null
+            fi
+            if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+                echo "[INSTALL] qemu-system-x86_64 is now accessible"
+                return 0
+            fi
+        fi
+    done
+    
+    # Attempt 8: Try to install from testing repository
+    echo "[INSTALL] Attempt 8: Trying testing repository..."
+    if apk add --no-cache --repository="http://dl-cdn.alpinelinux.org/alpine/edge/testing" qemu-system-x86_64 2>/dev/null; then
+        echo "[INSTALL] qemu-system-x86_64 installed from testing repository"
+        if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+            echo "[INSTALL] qemu-system-x86_64 is now available"
+            return 0
+        fi
+    fi
+    
+    # Attempt 9: Last resort - check for alternative QEMU commands
+    echo "[INSTALL] Attempt 9: Checking for alternative QEMU commands..."
+    for cmd in qemu-kvm qemu-system-i386 qemu; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            echo "[INSTALL] Found alternative QEMU command: $cmd"
+            if [ "$cmd" = "qemu-kvm" ] || [ "$cmd" = "qemu-system-i386" ] || [ "$cmd" = "qemu" ]; then
+                # Create wrapper script
+                cat > /usr/local/bin/qemu-system-x86_64 << QEMUWRAPPER
+#!/bin/sh
+# Wrapper for $cmd
+exec $cmd "\$@"
+QEMUWRAPPER
+                chmod +x /usr/local/bin/qemu-system-x86_64
+                if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+                    echo "[INSTALL] Created qemu-system-x86_64 wrapper for $cmd"
+                    return 0
+                fi
+            fi
+        fi
+    done
+    
+    echo "ERROR: All installation attempts failed for QEMU on Alpine"
+    echo "Please manually install: apk add qemu-system-x86_64"
+    echo "Or check: cat /etc/apk/repositories"
+    return 1
+}
+
 # --- Check and install QEMU system emulator if needed ---
 install_qemu_system() {
     if command -v apt-get >/dev/null 2>&1; then
         smart_apt_install "qemu-system-x86" "qemu-system-x86" || exit 1
     elif command -v apk >/dev/null 2>&1; then
-        echo "[INSTALL] Installing qemu-system-x86_64 via apk..."
-        apk add --no-cache qemu-system-x86_64
+        # Use enhanced Alpine-specific installation
+        install_qemu_system_alpine || exit 1
     elif command -v yum >/dev/null 2>&1; then
         echo "[INSTALL] Installing qemu-system-x86 via yum..."
         yum install -y -q qemu-system-x86
