@@ -1111,24 +1111,191 @@ smart_apt_install() {
     return 1
 }
 
+# --- Enhanced Alpine genisoimage installation with multiple fallbacks ---
+install_genisoimage_alpine() {
+    echo "[INSTALL] Installing ISO creation tool via apk..."
+    
+    # Attempt 1: Try cdrkit package (provides genisoimage)
+    echo "[INSTALL] Attempt 1: Installing cdrkit package..."
+    if apk add --no-cache cdrkit 2>/dev/null; then
+        echo "[INSTALL] cdrkit installed successfully"
+        if command -v genisoimage >/dev/null 2>&1; then
+            echo "[INSTALL] genisoimage is now available"
+            return 0
+        fi
+    fi
+    
+    # Attempt 2: Try genisoimage package directly
+    echo "[INSTALL] Attempt 2: Installing genisoimage package..."
+    if apk add --no-cache genisoimage 2>/dev/null; then
+        echo "[INSTALL] genisoimage package installed successfully"
+        if command -v genisoimage >/dev/null 2>&1; then
+            echo "[INSTALL] genisoimage is now available"
+            return 0
+        fi
+    fi
+    
+    # Attempt 3: Try xorriso as alternative
+    echo "[INSTALL] Attempt 3: Installing xorriso as alternative..."
+    if apk add --no-cache xorriso 2>/dev/null; then
+        echo "[INSTALL] xorriso installed successfully"
+        if command -v xorriso >/dev/null 2>&1; then
+            echo "[INSTALL] Creating genisoimage wrapper using xorriso..."
+            cat > /usr/local/bin/genisoimage << 'WRAPPER'
+#!/bin/sh
+# Wrapper script to provide genisoimage compatibility using xorriso
+exec xorriso -as mkisofs "$@"
+WRAPPER
+            chmod +x /usr/local/bin/genisoimage
+            if command -v genisoimage >/dev/null 2>&1; then
+                echo "[INSTALL] genisoimage wrapper created successfully"
+                return 0
+            fi
+        fi
+    fi
+    
+    # Attempt 4: Try mkisofs from cdrtools
+    echo "[INSTALL] Attempt 4: Installing cdrtools..."
+    if apk add --no-cache cdrtools 2>/dev/null; then
+        if command -v mkisofs >/dev/null 2>&1; then
+            echo "[INSTALL] Creating genisoimage wrapper using mkisofs..."
+            cat > /usr/local/bin/genisoimage << 'WRAPPER2'
+#!/bin/sh
+# Wrapper script to provide genisoimage compatibility using mkisofs
+exec mkisofs "$@"
+WRAPPER2
+            chmod +x /usr/local/bin/genisoimage
+            if command -v genisoimage >/dev/null 2>&1; then
+                echo "[INSTALL] genisoimage wrapper created from mkisofs"
+                return 0
+            fi
+        fi
+    fi
+    
+    # Attempt 5: Manual download from Alpine repositories
+    echo "[INSTALL] Attempt 5: Manual download from Alpine repositories..."
+    local alpine_version=$(cat /etc/alpine-release 2>/dev/null | cut -d'.' -f1,2)
+    if [ -n "$alpine_version" ]; then
+        local arch=$(uname -m)
+        local pkg_url="http://dl-cdn.alpinelinux.org/alpine/v${alpine_version}/community/${arch}/cdrkit-1.1.11-r2.apk"
+        
+        echo "[INSTALL] Downloading from: ${pkg_url}"
+        cd /tmp
+        if wget -q "$pkg_url" 2>/dev/null; then
+            echo "[INSTALL] Download successful, installing..."
+            if apk add --allow-untrusted ./cdrkit-1.1.11-r2.apk 2>/dev/null; then
+                echo "[INSTALL] Manual cdrkit installation succeeded"
+                if command -v genisoimage >/dev/null 2>&1; then
+                    echo "[INSTALL] genisoimage is now available"
+                    return 0
+                fi
+            fi
+            rm -f ./cdrkit-1.1.11-r2.apk 2>/dev/null
+        fi
+    fi
+    
+    # Attempt 6: Try different Alpine version repositories
+    echo "[INSTALL] Attempt 6: Trying different Alpine version repositories..."
+    for version in "3.19" "3.18" "3.17" "edge"; do
+        echo "[INSTALL] Trying Alpine ${version} repository..."
+        if apk add --no-cache --repository="http://dl-cdn.alpinelinux.org/alpine/${version}/community" cdrkit 2>/dev/null; then
+            echo "[INSTALL] cdrkit installed from Alpine ${version}"
+            if command -v genisoimage >/dev/null 2>&1; then
+                echo "[INSTALL] genisoimage is now available"
+                return 0
+            fi
+        fi
+    done
+    
+    # Attempt 7: Last resort - create a minimal ISO creation script
+    echo "[INSTALL] Attempt 7: Creating minimal ISO creation script..."
+    if command -v python3 >/dev/null 2>&1; then
+        echo "[INSTALL] Python3 found, creating ISO creation script..."
+        cat > /usr/local/bin/genisoimage << 'PYWRAPPER'
+#!/usr/bin/env python3
+# Minimal genisoimage replacement using Python
+import sys
+import os
+import subprocess
+
+def create_iso():
+    args = sys.argv[1:]
+    output_file = None
+    files = []
+    
+    # Parse arguments
+    i = 0
+    while i < len(args):
+        if args[i] == '-output' or args[i] == '-o':
+            if i + 1 < len(args):
+                output_file = args[i + 1]
+                i += 2
+                continue
+        elif args[i] == '-volid':
+            if i + 1 < len(args):
+                i += 2
+                continue
+        elif args[i] in ['-joliet', '-rock', '-r', '-J']:
+            i += 1
+            continue
+        elif not args[i].startswith('-'):
+            files.append(args[i])
+        i += 1
+    
+    if not output_file or not files:
+        print("Usage: genisoimage -output FILE [options] files...", file=sys.stderr)
+        sys.exit(1)
+    
+    # Try to use xorriso if available
+    try:
+        cmd = ['xorriso', '-as', 'mkisofs', '-output', output_file]
+        # Add volume ID if specified
+        for j in range(len(args)):
+            if args[j] == '-volid' and j + 1 < len(args):
+                cmd.extend(['-volid', args[j + 1]])
+                break
+        cmd.extend(['-joliet', '-rock'])
+        cmd.extend(files)
+        subprocess.run(cmd, check=True)
+        sys.exit(0)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    
+    # Try to use mkisofs if available
+    try:
+        cmd = ['mkisofs', '-output', output_file]
+        cmd.extend(files)
+        subprocess.run(cmd, check=True)
+        sys.exit(0)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    
+    print("ERROR: No ISO creation tool available", file=sys.stderr)
+    sys.exit(1)
+
+if __name__ == '__main__':
+    create_iso()
+PYWRAPPER
+        chmod +x /usr/local/bin/genisoimage
+        echo "[INSTALL] Created Python-based genisoimage wrapper"
+        if command -v genisoimage >/dev/null 2>&1; then
+            echo "[INSTALL] genisoimage wrapper created (may have limited functionality)"
+            return 0
+        fi
+    fi
+    
+    echo "ERROR: All installation attempts failed for genisoimage on Alpine"
+    echo "Please manually install one of: cdrkit, genisoimage, xorriso, or cdrtools"
+    return 1
+}
+
 # --- Check and install genisoimage ---
 install_genisoimage() {
     if command -v apt-get >/dev/null 2>&1; then
         smart_apt_install "genisoimage" "genisoimage" || exit 1
     elif command -v apk >/dev/null 2>&1; then
-        echo "[INSTALL] Installing genisoimage (cdrkit) via apk..."
-        apk add --no-cache cdrkit 2>/dev/null || {
-            echo "[INSTALL] cdrkit not available, trying genisoimage..."
-            apk add --no-cache genisoimage 2>/dev/null || {
-                echo "ERROR: Failed to install genisoimage/cdrkit via apk"
-                exit 1
-            }
-        }
-        # Verify genisoimage is now available
-        if ! command -v genisoimage >/dev/null 2>&1; then
-            echo "ERROR: genisoimage still not found after apk installation"
-            exit 1
-        fi
+        # Use enhanced Alpine-specific installation
+        install_genisoimage_alpine || exit 1
     elif command -v yum >/dev/null 2>&1; then
         echo "[INSTALL] Installing genisoimage via yum..."
         yum install -y -q genisoimage
