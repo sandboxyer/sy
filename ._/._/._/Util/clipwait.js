@@ -188,6 +188,59 @@ class ClipboardMonitor {
         return content.includes(START) && content.includes(END);
     }
 
+    // NEW METHOD: Detect struct generator instruction patterns
+    isStructGeneratorInstruction(content) {
+        // Detect struct generator instruction patterns
+        // These are identifiable by their characteristic markers
+        
+        const markers = [
+            // Primary markers that are unique to struct generator output
+            'AI INSTRUCTIONS',
+            'USER REQUEST:',
+            'OUTPUT FORMAT:',
+            'CRITICAL PATH PRESERVATION ENFORCEMENT',
+            'MANDATORY RULES:',
+            'VERIFICATION CHECK:',
+            'ORIGINAL size:',
+            'Parsed size:',
+            'PARSED FILE:',
+            'REFERENCE ONLY:',
+            'REFERENCE-ONLY FILES'
+        ];
+        
+        // Check for exact markers
+        const hasMarker = markers.some(marker => content.includes(marker));
+        
+        if (hasMarker) {
+            return true;
+        }
+        
+        // Check for structural pattern: repeated separator lines with FILE: headers
+        const fileHeaderPattern = /={50,}\nFILE: .+\n={50,}/g;
+        const fileHeaderMatches = content.match(fileHeaderPattern);
+        
+        if (fileHeaderMatches && fileHeaderMatches.length > 0) {
+            return true;
+        }
+        
+        // Check for AI instruction block pattern
+        const aiInstructionPattern = /={50,}\nAI INSTRUCTIONS\n={50,}/;
+        if (aiInstructionPattern.test(content)) {
+            return true;
+        }
+        
+        // Check for combination of instruction keywords
+        const hasUserRequest = content.includes('USER REQUEST:');
+        const hasOutputFormat = content.includes('OUTPUT FORMAT:');
+        const hasInstructions = content.includes('AI INSTRUCTIONS');
+        
+        if ((hasUserRequest && hasOutputFormat) || (hasInstructions && hasUserRequest)) {
+            return true;
+        }
+        
+        return false;
+    }
+
     validateCodeReplacerPaths(content) {
         const START = '[CODEREPLACER-START]';
         const END = '[/CODEREPLACER-END]';
@@ -242,6 +295,13 @@ class ClipboardMonitor {
             console.log('New clipboard content detected!');
 
             if (this.tagRestrictMode) {
+                // NEW: Check for struct generator instructions first
+                if (this.isStructGeneratorInstruction(currentContent)) {
+                    console.log('✗ Tag Restrict Mode: Content rejected (struct generator instruction detected).');
+                    console.log('='.repeat(60) + '\n');
+                    return;
+                }
+                
                 if (!this.hasCodeReplacerTags(currentContent)) {
                     console.log('✗ Tag Restrict Mode: Content rejected (no CODEREPLACER tags found).');
                     console.log('='.repeat(60) + '\n');
@@ -475,6 +535,7 @@ class ClipboardMonitor {
         console.log(`Commands to execute: ${activeProfile.commands.length}`);
         if (this.tagRestrictMode) {
             console.log('🔒 TAG RESTRICT MODE: Only content with CODEREPLACER tags will be processed');
+            console.log('   (Struct generator instructions will be ignored)');
         }
         console.log('Press P to pause/resume monitoring');
         console.log('Press Ctrl+C to stop monitoring...');
@@ -497,6 +558,7 @@ class ClipboardMonitor {
         if (tagIndex !== -1) {
             this.tagRestrictMode = true;
             console.log('🔒 Tag Restrict Mode enabled: Only content with CODEREPLACER tags will be processed.');
+            console.log('   Struct generator instructions will be automatically filtered out.');
             args.splice(tagIndex, 1);
             argProfile = args[0];
         } else {
@@ -513,6 +575,7 @@ class ClipboardMonitor {
             console.log('Clipboard Monitor - Main Menu');
             if (this.tagRestrictMode) {
                 console.log('🔒 TAG RESTRICT MODE ACTIVE');
+                console.log('   (Struct generator instructions filtered)');
             }
             console.log('='.repeat(60));
             console.log('1. Start monitoring');
