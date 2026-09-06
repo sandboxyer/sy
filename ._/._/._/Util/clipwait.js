@@ -4,6 +4,8 @@ import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import readline from 'readline';
+import { execSync } from 'child_process';
+import SyPM from './../../../SyPM.js';
 
 const execAsync = promisify(exec);
 
@@ -25,6 +27,15 @@ class ClipboardMonitor {
             input: process.stdin,
             output: process.stdout
         });
+
+        // Background mode properties
+        this.bgMode = false;
+        this.originalRoot = process.cwd();
+        this.currentRoot = process.cwd();
+        this.trackerShellPid = null;
+        this.trackerTty = null;
+        this.lastTrackedDir = process.cwd();
+        this.isBackgroundProcess = false;
     }
 
     async question(query) {
@@ -188,13 +199,8 @@ class ClipboardMonitor {
         return content.includes(START) && content.includes(END);
     }
 
-    // NEW METHOD: Detect struct generator instruction patterns
     isStructGeneratorInstruction(content) {
-        // Detect struct generator instruction patterns
-        // These are identifiable by their characteristic markers
-        
         const markers = [
-            // Primary markers that are unique to struct generator output
             'AI INSTRUCTIONS',
             'USER REQUEST:',
             'OUTPUT FORMAT:',
@@ -208,28 +214,22 @@ class ClipboardMonitor {
             'REFERENCE-ONLY FILES'
         ];
         
-        // Check for exact markers
         const hasMarker = markers.some(marker => content.includes(marker));
-        
         if (hasMarker) {
             return true;
         }
         
-        // Check for structural pattern: repeated separator lines with FILE: headers
         const fileHeaderPattern = /={50,}\nFILE: .+\n={50,}/g;
         const fileHeaderMatches = content.match(fileHeaderPattern);
-        
         if (fileHeaderMatches && fileHeaderMatches.length > 0) {
             return true;
         }
         
-        // Check for AI instruction block pattern
         const aiInstructionPattern = /={50,}\nAI INSTRUCTIONS\n={50,}/;
         if (aiInstructionPattern.test(content)) {
             return true;
         }
         
-        // Check for combination of instruction keywords
         const hasUserRequest = content.includes('USER REQUEST:');
         const hasOutputFormat = content.includes('OUTPUT FORMAT:');
         const hasInstructions = content.includes('AI INSTRUCTIONS');
@@ -244,7 +244,7 @@ class ClipboardMonitor {
     validateCodeReplacerPaths(content) {
         const START = '[CODEREPLACER-START]';
         const END = '[/CODEREPLACER-END]';
-        const basePath = process.cwd();
+        const basePath = this.currentRoot;
 
         let searchPos = 0;
         let foundAnyTag = false;
@@ -282,9 +282,131 @@ class ClipboardMonitor {
         return true;
     }
 
+    // New method: Capture terminal info when in background mode
+    captureTerminalInfo() {
+        const info = {
+            myPid: process.pid,
+            myPpid: process.ppid,
+            tty: null,
+            shellPid: null,
+            sessionId: null
+        };
+
+        try {
+            info.tty = execSync(`ps -o tty= -p ${info.myPid}`).toString().trim();
+            
+            let currentPid = info.myPpid;
+            let attempts = 0;
+            
+            while (currentPid > 1 && attempts < 10) {
+                try {
+                    const procInfo = execSync(`ps -o comm= -p ${currentPid}`).toString().trim();
+                    const ppid = parseInt(execSync(`ps -o ppid= -p ${currentPid}`).toString().trim());
+                    const tty = execSync(`ps -o tty= -p ${currentPid}`).toString().trim();
+                    
+                    const shellNames = ['bash', 'zsh', 'sh', 'fish', 'ksh', 'tcsh', 'dash'];
+                    if (shellNames.some(shell => procInfo.includes(shell))) {
+                        info.shellPid = currentPid;
+                        info.tty = tty;
+                        info.sessionId = execSync(`ps -o sess= -p ${currentPid}`).toString().trim();
+                        console.log(`✓ Found shell: PID ${currentPid} (${procInfo})`);
+                        break;
+                    }
+                    
+                    currentPid = ppid;
+                    attempts++;
+                } catch (error) {
+                    break;
+                }
+            }
+        } catch (error) {
+            console.error('Error capturing terminal info:', error);
+        }
+        
+        return info;
+    }
+
+    // New method: Get current directory of tracked shell
+    getShellCwd(pid) {
+        try {
+            return execSync(`readlink /proc/${pid}/cwd`).toString().trim();
+        } catch (error) {
+            return null;
+        }
+    }
+
+    // New method: Check if directory changed and update if needed
+    async checkDirectoryChange() {
+        if (!this.trackerShellPid) {
+            return;
+        }
+
+        const newDir = this.getShellCwd(this.trackerShellPid);
+        if (!newDir || newDir === this.lastTrackedDir) {
+            return;
+        }
+
+        this.lastTrackedDir = newDir;
+        console.log(`\n🔄 Terminal directory changed: ${newDir}`);
+
+        // Check if new directory is the same as or inside the current root
+        const relative = path.relative(this.currentRoot, newDir);
+        const isInside = relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+
+        if (isInside) {
+            console.log('   Directory is inside current repo tree. Keeping current root.');
+            return;
+        }
+
+        // Directory is outside current root - check if it's a NEW git repository
+        console.log('   Directory is outside current repo. Checking for .git repository...');
+        
+        // Find nearest ancestor with .git
+        let dir = newDir;
+        let newRepoRoot = null;
+        
+        while (dir !== path.dirname(dir)) {
+            try {
+                const gitPath = path.join(dir, '.git');
+                const stats = await fs.stat(gitPath);
+                if (stats.isDirectory()) {
+                    newRepoRoot = dir;
+                    break;
+                }
+            } catch (e) {
+                // .git not found, continue upward
+            }
+            dir = path.dirname(dir);
+        }
+
+        // Only update if we found a NEW .git repository different from current root
+        if (newRepoRoot && newRepoRoot !== this.currentRoot) {
+            console.log(`   📁 Found new git repository: ${newRepoRoot}`);
+            console.log(`   Updating working directory from ${this.currentRoot} to ${newRepoRoot}`);
+            
+            this.currentRoot = newRepoRoot;
+            
+            // Update output path
+            if (this.config.activeProfile && this.config.profiles[this.config.activeProfile]) {
+                const profile = this.config.profiles[this.config.activeProfile];
+                const outputFile = profile.outputFile || this.config.activeProfile;
+                this.outputPath = path.join(newRepoRoot, outputFile);
+                console.log(`   Output file path updated to: ${this.outputPath}`);
+                await this.ensureDirectoryExists();
+            }
+        } else {
+            console.log('   No new .git repository found. Keeping current root.');
+        }
+    }
+
     async checkClipboard() {
         if (this.isPaused) {
             return;
+        }
+
+        // Check directory change if in background mode
+        if (this.bgMode && this.isBackgroundProcess) {
+            await this.checkDirectoryChange();
         }
         
         const currentContent = await this.getClipboardContent();
@@ -295,7 +417,6 @@ class ClipboardMonitor {
             console.log('New clipboard content detected!');
 
             if (this.tagRestrictMode) {
-                // NEW: Check for struct generator instructions first
                 if (this.isStructGeneratorInstruction(currentContent)) {
                     console.log('✗ Tag Restrict Mode: Content rejected (struct generator instruction detected).');
                     console.log('='.repeat(60) + '\n');
@@ -503,18 +624,20 @@ class ClipboardMonitor {
         }
     }
 
-    async startMonitoring(profileName) {
+    async startMonitoring(profileName, isBackground = false) {
+        this.isBackgroundProcess = isBackground;
+        
         if (profileName) {
             if (this.config.profiles[profileName]) {
                 this.config.activeProfile = profileName;
-                this.outputPath = path.join(process.cwd(), this.config.profiles[profileName].outputFile || profileName);
+                this.outputPath = path.join(this.currentRoot, this.config.profiles[profileName].outputFile || profileName);
                 await this.saveConfig();
             } else {
                 console.error(`✗ Profile "${profileName}" not found.`);
                 return false;
             }
         } else if (this.config.activeProfile && this.config.profiles[this.config.activeProfile]) {
-            this.outputPath = path.join(process.cwd(), this.config.profiles[this.config.activeProfile].outputFile || this.config.activeProfile);
+            this.outputPath = path.join(this.currentRoot, this.config.profiles[this.config.activeProfile].outputFile || this.config.activeProfile);
         } else {
             console.log('No active profile set. Please configure profiles first.');
             return false;
@@ -537,6 +660,13 @@ class ClipboardMonitor {
             console.log('🔒 TAG RESTRICT MODE: Only content with CODEREPLACER tags will be processed');
             console.log('   (Struct generator instructions will be ignored)');
         }
+        if (this.bgMode && isBackground) {
+            console.log('🔍 BACKGROUND TRACKING: Directory changes will be monitored');
+            console.log(`   Current root: ${this.currentRoot}`);
+            if (this.trackerShellPid) {
+                console.log(`   Tracking shell PID: ${this.trackerShellPid}`);
+            }
+        }
         console.log('Press P to pause/resume monitoring');
         console.log('Press Ctrl+C to stop monitoring...');
         console.log('='.repeat(60) + '\n');
@@ -548,11 +678,419 @@ class ClipboardMonitor {
         return true;
     }
 
+    // Create background process script
+    createBackgroundScript(profileName, tagMode, shellPid, tty) {
+        return `
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import fs from 'fs/promises';
+import path from 'path';
+import os from 'os';
+import { execSync } from 'child_process';
+
+const execAsync = promisify(exec);
+
+class BackgroundClipboardMonitor {
+    constructor() {
+        this.configDir = path.join(os.tmpdir(), 'clipboard-monitor');
+        this.configPath = path.join(this.configDir, 'clipboard-config.json');
+        this.outputPath = path.join(process.cwd(), 'result');
+        this.lastClipboardContent = '';
+        this.isMonitoring = true;
+        this.tagRestrictMode = ${tagMode};
+        this.config = {
+            profiles: {},
+            activeProfile: null,
+            interval: 1000
+        };
+        this.originalRoot = process.cwd();
+        this.currentRoot = process.cwd();
+        this.trackerShellPid = ${shellPid};
+        this.trackerTty = '${tty || ''}';
+        this.lastTrackedDir = process.cwd();
+        
+        this.logFile = path.join(os.tmpdir(), 'clipwait-bg.log');
+    }
+    
+    log(message) {
+        const timestamp = new Date().toISOString();
+        const logEntry = timestamp + ' - ' + message;
+        console.log(logEntry);
+        
+        try {
+            fs.appendFile(this.logFile, logEntry + '\\n', 'utf8');
+        } catch (error) {
+            // Ignore logging errors
+        }
+    }
+    
+    async loadConfig() {
+        try {
+            const configData = await fs.readFile(this.configPath, 'utf8');
+            this.config = { ...this.config, ...JSON.parse(configData) };
+            this.log('✓ Configuration loaded');
+        } catch (error) {
+            this.log('✗ Error loading config: ' + error.message);
+        }
+    }
+    
+    async getClipboardContent() {
+        try {
+            let command;
+            
+            if (process.platform === 'darwin') {
+                command = 'pbpaste';
+            } else if (process.platform === 'linux') {
+                command = 'xclip -selection clipboard -o 2>/dev/null || xsel --clipboard --output 2>/dev/null';
+            } else if (process.platform === 'win32') {
+                command = 'powershell -command "Get-Clipboard"';
+            } else {
+                return '';
+            }
+
+            const { stdout } = await execAsync(command);
+            return stdout;
+        } catch (error) {
+            return '';
+        }
+    }
+    
+    async writeToFile(content) {
+        try {
+            const stats = await fs.stat(this.outputPath).catch(() => null);
+            if (stats && stats.isDirectory()) {
+                this.log('✗ Error: ' + this.outputPath + ' is a directory');
+                return false;
+            }
+            
+            await fs.writeFile(this.outputPath, content, 'utf8');
+            this.log('✓ Clipboard content written to ' + this.outputPath);
+            return true;
+        } catch (error) {
+            this.log('✗ Error writing to file: ' + error.message);
+            return false;
+        }
+    }
+    
+    hasCodeReplacerTags(content) {
+        const START = '[CODEREPLACER-START]';
+        const END = '[/CODEREPLACER-END]';
+        return content.includes(START) && content.includes(END);
+    }
+    
+    isStructGeneratorInstruction(content) {
+        const markers = [
+            'AI INSTRUCTIONS',
+            'USER REQUEST:',
+            'OUTPUT FORMAT:',
+            'CRITICAL PATH PRESERVATION ENFORCEMENT',
+            'MANDATORY RULES:',
+            'VERIFICATION CHECK:',
+            'ORIGINAL size:',
+            'Parsed size:',
+            'PARSED FILE:',
+            'REFERENCE ONLY:',
+            'REFERENCE-ONLY FILES'
+        ];
+        
+        const hasMarker = markers.some(marker => content.includes(marker));
+        if (hasMarker) return true;
+        
+        const fileHeaderPattern = /={50,}\\nFILE: .+\\n={50,}/g;
+        const fileHeaderMatches = content.match(fileHeaderPattern);
+        if (fileHeaderMatches && fileHeaderMatches.length > 0) return true;
+        
+        const aiInstructionPattern = /={50,}\\nAI INSTRUCTIONS\\n={50,}/;
+        if (aiInstructionPattern.test(content)) return true;
+        
+        const hasUserRequest = content.includes('USER REQUEST:');
+        const hasOutputFormat = content.includes('OUTPUT FORMAT:');
+        const hasInstructions = content.includes('AI INSTRUCTIONS');
+        
+        if ((hasUserRequest && hasOutputFormat) || (hasInstructions && hasUserRequest)) return true;
+        
+        return false;
+    }
+    
+    validateCodeReplacerPaths(content) {
+        const START = '[CODEREPLACER-START]';
+        const END = '[/CODEREPLACER-END]';
+        const basePath = this.currentRoot;
+        
+        let searchPos = 0;
+        
+        while (true) {
+            const startIdx = content.indexOf(START, searchPos);
+            if (startIdx === -1) break;
+            
+            const endIdx = content.indexOf(END, startIdx + START.length);
+            if (endIdx === -1) {
+                this.log('✗ Validation error: Incomplete CODEREPLACER block');
+                return false;
+            }
+            
+            const block = content.slice(startIdx, endIdx + END.length);
+            const pathRegex = /PATH='([^']*)'/g;
+            let match;
+            while ((match = pathRegex.exec(block)) !== null) {
+                const rawPath = match[1];
+                const resolved = path.resolve(rawPath);
+                const relative = path.relative(basePath, resolved);
+                
+                if (relative.startsWith('..') || path.isAbsolute(relative)) {
+                    this.log('✗ Validation failed: PATH ' + rawPath + ' is outside ' + basePath);
+                    return false;
+                }
+            }
+            
+            searchPos = endIdx + END.length;
+        }
+        
+        return true;
+    }
+    
+    getShellCwd() {
+        if (!this.trackerShellPid) return null;
+        try {
+            return execSync('readlink /proc/' + this.trackerShellPid + '/cwd').toString().trim();
+        } catch (error) {
+            return null;
+        }
+    }
+    
+    async checkDirectoryChange() {
+        const newDir = this.getShellCwd();
+        if (!newDir || newDir === this.lastTrackedDir) return;
+        
+        this.lastTrackedDir = newDir;
+        this.log('🔄 Terminal directory changed: ' + newDir);
+        
+        // Check if new directory is inside the current root
+        const relative = path.relative(this.currentRoot, newDir);
+        const isInside = relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+        
+        if (isInside) {
+            this.log('   Directory is inside current repo tree. Keeping current root.');
+            return;
+        }
+        
+        // Directory is outside current root - check if it's a NEW git repository
+        this.log('   Directory is outside current repo. Checking for .git repository...');
+        
+        // Find nearest ancestor with .git
+        let dir = newDir;
+        let newRepoRoot = null;
+        
+        while (dir !== path.dirname(dir)) {
+            try {
+                const gitPath = path.join(dir, '.git');
+                const stats = await fs.stat(gitPath);
+                if (stats.isDirectory()) {
+                    newRepoRoot = dir;
+                    break;
+                }
+            } catch (e) {
+                // .git not found, continue upward
+            }
+            dir = path.dirname(dir);
+        }
+        
+        // Only update if we found a NEW .git repository different from current root
+        if (newRepoRoot && newRepoRoot !== this.currentRoot) {
+            this.log('📁 Found new git repository: ' + newRepoRoot);
+            this.log('   Updating working directory from ' + this.currentRoot + ' to ' + newRepoRoot);
+            
+            this.currentRoot = newRepoRoot;
+            
+            if (this.config.activeProfile && this.config.profiles[this.config.activeProfile]) {
+                const profile = this.config.profiles[this.config.activeProfile];
+                const outputFile = profile.outputFile || this.config.activeProfile;
+                this.outputPath = path.join(newRepoRoot, outputFile);
+                this.log('   Output file path updated to: ' + this.outputPath);
+            }
+        } else {
+            this.log('   No new .git repository found. Keeping current root.');
+        }
+    }
+    
+    async executeCommands(profile) {
+        if (!profile.commands || profile.commands.length === 0) {
+            return;
+        }
+        
+        this.log('Executing ' + profile.commands.length + ' command(s)...');
+        
+        for (let i = 0; i < profile.commands.length; i++) {
+            const command = profile.commands[i];
+            this.log('[' + (i + 1) + '/' + profile.commands.length + '] Executing: ' + command);
+            
+            try {
+                const { stdout, stderr } = await execAsync(command);
+                if (stdout) this.log('  Output: ' + stdout.trim());
+                if (stderr) this.log('  Stderr: ' + stderr.trim());
+                this.log('  ✓ Command completed successfully');
+            } catch (error) {
+                this.log('  ✗ Command failed: ' + error.message);
+                break;
+            }
+        }
+    }
+    
+    async checkClipboard() {
+        await this.checkDirectoryChange();
+        
+        const currentContent = await this.getClipboardContent();
+        
+        if (currentContent && currentContent !== this.lastClipboardContent) {
+            this.lastClipboardContent = currentContent;
+            this.log('New clipboard content detected');
+            
+            if (this.tagRestrictMode) {
+                if (this.isStructGeneratorInstruction(currentContent)) {
+                    this.log('✗ Tag Restrict Mode: Content rejected (struct generator instruction)');
+                    return;
+                }
+                
+                if (!this.hasCodeReplacerTags(currentContent)) {
+                    this.log('✗ Tag Restrict Mode: Content rejected (no CODEREPLACER tags)');
+                    return;
+                }
+                this.log('✓ Tag Restrict Mode: CODEREPLACER tags detected');
+            }
+            
+            if (!this.validateCodeReplacerPaths(currentContent)) {
+                this.log('✗ Clipboard content rejected due to path validation failure');
+                return;
+            }
+            
+            const writeSuccess = await this.writeToFile(currentContent);
+            
+            if (writeSuccess && this.config.activeProfile) {
+                const profile = this.config.profiles[this.config.activeProfile];
+                if (profile) {
+                    await this.executeCommands(profile);
+                }
+            }
+        }
+    }
+    
+    async start() {
+        this.log('🚀 Background Clipboard Monitor Started');
+        this.log('   Current root: ' + this.currentRoot);
+        if (this.trackerShellPid) {
+            this.log('   Tracking shell PID: ' + this.trackerShellPid);
+        }
+        
+        await this.loadConfig();
+        
+        if (this.config.activeProfile && this.config.profiles[this.config.activeProfile]) {
+            const profile = this.config.profiles[this.config.activeProfile];
+            const outputFile = profile.outputFile || this.config.activeProfile;
+            this.outputPath = path.join(this.currentRoot, outputFile);
+            this.log('   Output file: ' + this.outputPath);
+        } else {
+            this.log('✗ No active profile configured');
+            return;
+        }
+        
+        while (this.isMonitoring) {
+            await this.checkClipboard();
+            await new Promise(resolve => setTimeout(resolve, this.config.interval));
+        }
+    }
+}
+
+const monitor = new BackgroundClipboardMonitor();
+
+process.on('SIGINT', () => {
+    monitor.isMonitoring = false;
+    monitor.log('👋 Background monitor stopped');
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    monitor.isMonitoring = false;
+    monitor.log('👋 Background monitor stopped');
+    process.exit(0);
+});
+
+monitor.start().catch(error => {
+    monitor.log('✗ Fatal error: ' + error.message);
+    process.exit(1);
+});
+`;
+    }
+
+    async startBackgroundMode(profileName) {
+        console.log('🚀 Starting ClipWait in background mode with terminal tracking...');
+        
+        // Capture terminal info before backgrounding
+        const info = this.captureTerminalInfo();
+        if (!info.shellPid) {
+            console.error('✗ Could not find shell PID. Cannot track terminal directory.');
+            return false;
+        }
+        
+        this.trackerShellPid = info.shellPid;
+        this.trackerTty = info.tty;
+        
+        console.log(`✓ Shell PID: ${info.shellPid}`);
+        console.log(`✓ TTY: ${info.tty || 'unknown'}`);
+        console.log(`✓ Current directory: ${this.currentRoot}`);
+        
+        // Create background script
+        const bgScript = this.createBackgroundScript(
+            profileName || this.config.activeProfile,
+            this.tagRestrictMode,
+            info.shellPid,
+            info.tty
+        );
+        
+        // Write background script to temp file
+        const bgFile = path.join(os.tmpdir(), `clipwait-bg-${Date.now()}.mjs`);
+        await fs.writeFile(bgFile, bgScript, 'utf8');
+        
+        console.log('📝 Created background script: ' + bgFile);
+        console.log('🚀 Starting background process with SyPM...');
+        
+        try {
+            const processInfo = SyPM.run(bgFile, {
+                name: 'clipwait-bg',
+                autoRestart: true,
+                restartTries: 10,
+                uniqueNameLock: true
+            });
+            
+            console.log('✅ ClipWait background process started successfully!');
+            console.log('📋 Process Info:');
+            console.log('  - Name: ' + processInfo.name);
+            console.log('  - PID: ' + processInfo.pid);
+            console.log('  - ID: ' + processInfo.id);
+            console.log('  - Log: ' + processInfo.log);
+            
+            console.log('\n📝 To view logs:');
+            console.log('  node SyPM.js --log ' + processInfo.id);
+            console.log('  or');
+            console.log('  tail -f ' + path.join(os.tmpdir(), 'clipwait-bg.log'));
+            
+            console.log('\n🔍 To stop ClipWait:');
+            console.log('  node SyPM.js --kill ' + processInfo.id);
+            console.log('  or');
+            console.log('  node SyPM.js --kill clipwait-bg');
+            
+            return true;
+        } catch (error) {
+            console.error('❌ Error starting background process:', error);
+            return false;
+        }
+    }
+
     async mainMenu() {
         await this.loadOrCreateConfig();
         
         const args = process.argv.slice(2);
         const tagIndex = args.indexOf('--tag');
+        const bgIndex = args.indexOf('--bg');
         let argProfile = null;
         
         if (tagIndex !== -1) {
@@ -560,11 +1098,35 @@ class ClipboardMonitor {
             console.log('🔒 Tag Restrict Mode enabled: Only content with CODEREPLACER tags will be processed.');
             console.log('   Struct generator instructions will be automatically filtered out.');
             args.splice(tagIndex, 1);
-            argProfile = args[0];
-        } else {
+        }
+        
+        if (bgIndex !== -1) {
+            this.bgMode = true;
+            console.log('🔍 Background Mode enabled: ClipWait will run in background with terminal tracking.');
+            args.splice(bgIndex, 1);
+        }
+        
+        if (args.length > 0) {
             argProfile = args[0];
         }
         
+        // If background mode is enabled, start background process and exit
+        if (this.bgMode) {
+            if (argProfile && !this.config.profiles[argProfile]) {
+                console.error(`✗ Profile "${argProfile}" not found.`);
+                return;
+            }
+            if (!argProfile && !this.config.activeProfile) {
+                console.error('✗ No active profile set. Please configure profiles first.');
+                return;
+            }
+            
+            await this.startBackgroundMode(argProfile);
+            this.rl.close();
+            return;
+        }
+        
+        // Regular mode
         if (argProfile && this.config.profiles[argProfile]) {
             await this.startMonitoring(argProfile);
             return;
@@ -640,23 +1202,26 @@ process.on('uncaughtException', (error) => {
     process.exit(1);
 });
 
-process.stdin.setRawMode(true);
-process.stdin.resume();
-process.stdin.setEncoding('utf8');
+// Only set up interactive key handling if not in background mode
+if (!process.argv.includes('--bg')) {
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.setEncoding('utf8');
 
-process.stdin.on('data', (key) => {
-    if (key === 'p' || key === 'P') {
-        if (monitor.isMonitoring) {
-            monitor.togglePause();
+    process.stdin.on('data', (key) => {
+        if (key === 'p' || key === 'P') {
+            if (monitor.isMonitoring) {
+                monitor.togglePause();
+            }
         }
-    }
-    if (key === '\u0003') {
-        console.log('\nReceived Ctrl+C. Stopping...');
-        monitor.isMonitoring = false;
-        monitor.rl.close();
-        process.exit(0);
-    }
-});
+        if (key === '\u0003') {
+            console.log('\nReceived Ctrl+C. Stopping...');
+            monitor.isMonitoring = false;
+            monitor.rl.close();
+            process.exit(0);
+        }
+    });
+}
 
 monitor.mainMenu().catch(error => {
     console.error('Failed to start:', error);
