@@ -373,7 +373,7 @@ class Sy extends SyAPP.Func() {
 
           this.Button(uid, ' ');
           this.Button(uid, {
-            name: this.TextColor.orange('＋ New Main'),
+            name: this.TextColor.orange('＋ New'),
             props: { new_instance: true, page }
           });
 

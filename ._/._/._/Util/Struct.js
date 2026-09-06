@@ -200,12 +200,28 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
             structContent += `Ensure the original text exactly matches the file content (including whitespace).\n`;
             structContent += `CRITICAL: In PATH='...', copy the path EXACTLY from the FILE: header.\n`;
             structContent += `Verify each character matches before outputting.\n\n`;
+            structContent += `CRITICAL RULE - STANDALONE REPLACEMENTS:\n`;
+            structContent += `EVERY response with [CODEREPLACER] tags must be COMPLETE and STANDALONE.\n`;
+            structContent += `Treat each response as if it will be applied to a FRESH copy of the original files.\n`;
+            structContent += `You must include ALL replacements needed to fully implement the user's request - even if\n`;
+            structContent += `you previously provided them in an earlier message. NEVER reference or rely on\n`;
+            structContent += `previous responses. Imagine the user has just run 'git restore .' before applying your\n`;
+            structContent += `tags. If a replacement depends on another replacement, INCLUDE BOTH in the same response.\n`;
+            structContent += `A response containing only partial or incremental changes is INVALID and will fail.\n\n`;
         } else if (outputFormat === 'both') {
             structContent += `OUTPUT FORMAT: BOTH FULL FILES AND TAGGED REPLACEMENTS\n`;
             structContent += `You may provide either full file contents or tagged replacements, as appropriate.\n`;
             structContent += `For each file, decide which method is cleaner and use that.\n`;
             structContent += `Clearly separate the two approaches if mixed.\n`;
             structContent += `CRITICAL: Regardless of format, preserve the exact path in all outputs.\n\n`;
+            structContent += `CRITICAL RULE - STANDALONE REPLACEMENTS:\n`;
+            structContent += `EVERY response with [CODEREPLACER] tags must be COMPLETE and STANDALONE.\n`;
+            structContent += `Treat each response as if it will be applied to a FRESH copy of the original files.\n`;
+            structContent += `You must include ALL replacements needed to fully implement the user's request - even if\n`;
+            structContent += `you previously provided them in an earlier message. NEVER reference or rely on\n`;
+            structContent += `previous responses. Imagine the user has just run 'git restore .' before applying your\n`;
+            structContent += `tags. If a replacement depends on another replacement, INCLUDE BOTH in the same response.\n`;
+            structContent += `A response containing only partial or incremental changes is INVALID and will fail.\n\n`;
         }
 
         structContent += `${'='.repeat(50)}\n\n`;
