@@ -1172,55 +1172,65 @@ monitor.start().catch(error => {
 
     async manageBackgroundProcesses() {
         console.log('\n' + '='.repeat(70));
-        console.log('ClipWait Background Processes Manager');
+        console.log('ClipWait Background Processes');
         console.log('='.repeat(70));
 
         let metadata = await this.loadBgMetadata();
         let processes = metadata.processes || [];
         const syPMList = SyPM.list();
 
+        // Auto-cleanup dead processes
+        const aliveProcesses = processes.filter(bgProc => {
+            const syProc = syPMList.find(p => p.id === bgProc.sypmId);
+            return syProc && (syProc.status === 'Running' || syProc.status === 'Restarting');
+        });
+        if (aliveProcesses.length !== processes.length) {
+            const removedCount = processes.length - aliveProcesses.length;
+            metadata.processes = aliveProcesses;
+            await this.saveBgMetadata(metadata);
+            processes = aliveProcesses;
+            console.log(`🧹 Auto-cleaned ${removedCount} dead process(es).`);
+        }
+
         if (processes.length === 0) {
-            console.log('No ClipWait background processes found.');
+            console.log('No ClipWait background processes running.');
             console.log('Start one with: node clipwait.js --bg <profile>');
             return;
         }
 
+        // Capture current session for highlighting
+        const info = this.captureTerminalInfo();
+        const currentSessionId = info.sessionId;
+
+        // Display compact list
         for (let i = 0; i < processes.length; i++) {
             const bgProc = processes[i];
             const syProc = syPMList.find(p => p.id === bgProc.sypmId);
             const isAlive = syProc && (syProc.status === 'Running' || syProc.status === 'Restarting');
-            const status = isAlive ? '🟢 Running' : '🔴 Dead';
+            const statusSymbol = isAlive ? '🟢' : '🔴';
+            const pid = syProc ? syProc.pid : 'N/A';
             const idleSeconds = bgProc.lastActivityAt ? Math.floor((Date.now() - new Date(bgProc.lastActivityAt).getTime()) / 1000) : null;
             const idleStr = idleSeconds === null ? 'N/A' : this.formatIdleTime(idleSeconds);
+            const isCurrentSession = currentSessionId && bgProc.sessionId === currentSessionId;
+            const sessionMarker = isCurrentSession ? ' *' : '';
 
-            console.log(`\n${i + 1}. ${bgProc.name}`);
-            console.log(`   Status: ${status}`);
-            console.log(`   SyPM ID: ${bgProc.sypmId} | PID: ${syProc ? syProc.pid : 'N/A'}`);
-            console.log(`   Profile: ${bgProc.profile}`);
-            console.log(`   Terminal: tty=${bgProc.tty || '?'}, shellPID=${bgProc.shellPid}, session=${bgProc.sessionId || '?'}`);
-            console.log(`   Started: ${new Date(bgProc.startedAt).toLocaleString()}`);
-            console.log(`   Last Activity: ${bgProc.lastActivityAt ? new Date(bgProc.lastActivityAt).toLocaleString() + ' (' + idleStr + ' idle)' : 'Never'}`);
-            console.log(`   Last 3 Paths:`);
-            if (bgProc.lastTrackedDirs && bgProc.lastTrackedDirs.length > 0) {
-                bgProc.lastTrackedDirs.forEach(dir => console.log(`     - ${dir}`));
-            } else {
-                console.log('     (none)');
+            let line = `${i+1}. [${statusSymbol}] ${bgProc.name} PID:${pid} idle:${idleStr}${sessionMarker}`;
+            if (isCurrentSession) {
+                line = `\x1b[1;32m${line}\x1b[0m`; // bold green
+            } else if (!isAlive) {
+                line = `\x1b[31m${line}\x1b[0m`; // red
             }
-            console.log(`   Last 5 Commands:`);
-            if (bgProc.executedCommands && bgProc.executedCommands.length > 0) {
-                bgProc.executedCommands.forEach(cmd => console.log(`     - ${cmd}`));
-            } else {
-                console.log('     (none)');
-            }
-            if (syProc && syProc.log) {
-                console.log(`   Log: ${syProc.log}`);
-            }
+            console.log(line);
+        }
+        if (currentSessionId) {
+            console.log('* = process from current terminal session');
         }
 
         console.log('\nOptions:');
-        console.log('  r <number>  Remove (kill) a process');
-        console.log('  l <number>  Show live logs for a process (Ctrl+C to stop)');
-        console.log('  q           Quit manager');
+        console.log('  l <num>  Show live logs');
+        console.log('  d <num>  Show details');
+        console.log('  r <num>  Remove (kill)');
+        console.log('  q        Quit manager');
 
         while (true) {
             const input = await this.question('\nAction: ');
@@ -1230,7 +1240,7 @@ monitor.start().catch(error => {
 
             if (cmd === 'q') break;
 
-            if ((cmd === 'r' || cmd === 'l') && parts.length >= 2) {
+            if ((cmd === 'r' || cmd === 'l' || cmd === 'd') && parts.length >= 2) {
                 const idx = parseInt(parts[1]) - 1;
                 if (idx >= 0 && idx < processes.length) {
                     const bgProc = processes[idx];
@@ -1250,6 +1260,8 @@ monitor.start().catch(error => {
                         console.log(`Following logs for ${bgProc.name}...`);
                         SyPM.log(bgProc.sypmId);
                         console.log('Log following ended.');
+                    } else if (cmd === 'd') {
+                        this.showBgProcessDetails(bgProc, syPMList.find(p => p.id === bgProc.sypmId));
                     }
                 } else {
                     console.log('Invalid process number.');
@@ -1258,6 +1270,65 @@ monitor.start().catch(error => {
                 console.log('Invalid command.');
             }
         }
+    }
+
+    showBgProcessDetails(bgProc, syProc) {
+        const isAlive = syProc && (syProc.status === 'Running' || syProc.status === 'Restarting');
+        const status = isAlive ? '🟢 Running' : '🔴 Dead';
+        const idleSeconds = bgProc.lastActivityAt ? Math.floor((Date.now() - new Date(bgProc.lastActivityAt).getTime()) / 1000) : null;
+        const idleStr = idleSeconds === null ? 'N/A' : this.formatIdleTime(idleSeconds);
+        console.log(`\nDetails for ${bgProc.name}:`);
+        console.log(`  Status: ${status}`);
+        console.log(`  SyPM ID: ${bgProc.sypmId} | PID: ${syProc ? syProc.pid : 'N/A'}`);
+        console.log(`  Profile: ${bgProc.profile}`);
+        console.log(`  Terminal: tty=${bgProc.tty || '?'}, shellPID=${bgProc.shellPid}, session=${bgProc.sessionId || '?'}`);
+        console.log(`  Started: ${new Date(bgProc.startedAt).toLocaleString()}`);
+        console.log(`  Last Activity: ${bgProc.lastActivityAt ? new Date(bgProc.lastActivityAt).toLocaleString() + ' (' + idleStr + ' idle)' : 'Never'}`);
+        console.log(`  Last 3 Paths:`);
+        if (bgProc.lastTrackedDirs && bgProc.lastTrackedDirs.length > 0) {
+            bgProc.lastTrackedDirs.forEach(dir => console.log(`    - ${dir}`));
+        } else {
+            console.log(`    (none)`);
+        }
+        console.log(`  Last 5 Commands:`);
+        if (bgProc.executedCommands && bgProc.executedCommands.length > 0) {
+            bgProc.executedCommands.forEach(cmd => console.log(`    - ${cmd}`));
+        } else {
+            console.log(`    (none)`);
+        }
+        if (syProc && syProc.log) {
+            console.log(`  Log: ${syProc.log}`);
+        }
+    }
+
+    async showStatusForCurrentSession() {
+        console.log('🔍 Checking ClipWait background process for current terminal session...');
+        const info = this.captureTerminalInfo();
+        if (!info.sessionId) {
+            console.log('✗ Could not determine terminal session ID.');
+            return;
+        }
+        const metadata = await this.loadBgMetadata();
+        const processes = (metadata.processes || []).filter(p => p.sessionId === info.sessionId);
+        if (processes.length === 0) {
+            console.log('No ClipWait background process found for this session.');
+            return;
+        }
+        // Filter alive
+        const syPMList = SyPM.list();
+        const alive = processes.filter(p => {
+            const syProc = syPMList.find(sp => sp.id === p.sypmId);
+            return syProc && (syProc.status === 'Running' || syProc.status === 'Restarting');
+        });
+        if (alive.length === 0) {
+            console.log('No alive ClipWait background process for this session.');
+            return;
+        }
+        // Sort by startedAt descending, pick first
+        alive.sort((a,b) => new Date(b.startedAt) - new Date(a.startedAt));
+        const target = alive[0];
+        console.log(`Following logs for ClipWait background process: ${target.name} (ID: ${target.sypmId})`);
+        SyPM.log(target.sypmId);
     }
 
     async startBackgroundMode(profileName) {
@@ -1360,7 +1431,15 @@ monitor.start().catch(error => {
         const args = process.argv.slice(2);
         const tagIndex = args.indexOf('--tag');
         const bgIndex = args.indexOf('--bg');
+        const statusIndex = args.indexOf('--status');
         let argProfile = null;
+        
+        if (statusIndex !== -1) {
+            args.splice(statusIndex, 1);
+            await this.showStatusForCurrentSession();
+            this.rl.close();
+            return;
+        }
         
         if (tagIndex !== -1) {
             this.tagRestrictMode = true;
