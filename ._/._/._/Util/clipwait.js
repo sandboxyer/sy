@@ -726,7 +726,7 @@ class ClipboardMonitor {
     }
 
     // Create background process script
-    createBackgroundScript(profileName, tagMode, shellPid, tty, sessionId) {
+    createBackgroundScript(profileName, tagMode, shellPid, tty, sessionId, bgToken) {
         return `
 import { exec } from 'child_process';
 import { promisify } from 'util';
@@ -736,6 +736,9 @@ import os from 'os';
 import { execSync } from 'child_process';
 
 const execAsync = promisify(exec);
+
+const BG_TOKEN = '${bgToken}';
+const METADATA_PATH = path.join(os.tmpdir(), 'clipboard-monitor', 'bg-processes.json');
 
 class BackgroundClipboardMonitor {
     constructor() {
@@ -757,7 +760,7 @@ class BackgroundClipboardMonitor {
         this.trackerSessionId = '${sessionId || ''}';
         this.lastTrackedDir = process.cwd();
         
-        this.logFile = path.join(os.tmpdir(), 'clipwait-bg.log');
+        this.logFile = path.join(os.tmpdir(), 'clipwait-bg-' + BG_TOKEN + '.log');
     }
     
     log(message) {
@@ -938,6 +941,32 @@ class BackgroundClipboardMonitor {
             return null;
         }
     }
+
+    async updateMetadataActivity(type, value) {
+        try {
+            const data = JSON.parse(await fs.readFile(METADATA_PATH, 'utf8'));
+            const proc = data.processes?.find(p => p.bgToken === BG_TOKEN);
+            if (proc) {
+                proc.lastActivityAt = new Date().toISOString();
+                if (type === 'directory') {
+                    proc.lastTrackedDirs = proc.lastTrackedDirs || [];
+                    proc.lastTrackedDirs.unshift(value);
+                    if (proc.lastTrackedDirs.length > 3) {
+                        proc.lastTrackedDirs = proc.lastTrackedDirs.slice(0, 3);
+                    }
+                } else if (type === 'command') {
+                    proc.executedCommands = proc.executedCommands || [];
+                    proc.executedCommands.unshift(value);
+                    if (proc.executedCommands.length > 5) {
+                        proc.executedCommands = proc.executedCommands.slice(0, 5);
+                    }
+                }
+                await fs.writeFile(METADATA_PATH, JSON.stringify(data, null, 2), 'utf8');
+            }
+        } catch (error) {
+            // Ignore metadata update errors
+        }
+    }
     
     async checkDirectoryChange() {
         const activePid = await this.findActiveShellPid();
@@ -953,6 +982,7 @@ class BackgroundClipboardMonitor {
         
         this.lastTrackedDir = newDir;
         this.log('🔄 Terminal directory changed: ' + newDir);
+        await this.updateMetadataActivity('directory', newDir);
         
         // Check if new directory is inside the current root
         const relative = path.relative(this.currentRoot, newDir);
@@ -1012,6 +1042,7 @@ class BackgroundClipboardMonitor {
         for (let i = 0; i < profile.commands.length; i++) {
             const command = profile.commands[i];
             this.log('[' + (i + 1) + '/' + profile.commands.length + '] Executing: ' + command);
+            await this.updateMetadataActivity('command', command);
             
             try {
                 const { stdout, stderr } = await execAsync(command);
@@ -1113,6 +1144,122 @@ monitor.start().catch(error => {
 `;
     }
 
+    async loadBgMetadata() {
+        const metadataPath = path.join(this.configDir, 'bg-processes.json');
+        try {
+            const data = await fs.readFile(metadataPath, 'utf8');
+            return JSON.parse(data);
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                return { processes: [] };
+            }
+            console.error('Error loading bg metadata:', error);
+            return { processes: [] };
+        }
+    }
+
+    async saveBgMetadata(data) {
+        const metadataPath = path.join(this.configDir, 'bg-processes.json');
+        await fs.mkdir(path.dirname(metadataPath), { recursive: true });
+        await fs.writeFile(metadataPath, JSON.stringify(data, null, 2), 'utf8');
+    }
+
+    formatIdleTime(seconds) {
+        if (seconds < 60) return `${seconds}s`;
+        if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+        return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+    }
+
+    async manageBackgroundProcesses() {
+        console.log('\n' + '='.repeat(70));
+        console.log('ClipWait Background Processes Manager');
+        console.log('='.repeat(70));
+
+        let metadata = await this.loadBgMetadata();
+        let processes = metadata.processes || [];
+        const syPMList = SyPM.list();
+
+        if (processes.length === 0) {
+            console.log('No ClipWait background processes found.');
+            console.log('Start one with: node clipwait.js --bg <profile>');
+            return;
+        }
+
+        for (let i = 0; i < processes.length; i++) {
+            const bgProc = processes[i];
+            const syProc = syPMList.find(p => p.id === bgProc.sypmId);
+            const isAlive = syProc && (syProc.status === 'Running' || syProc.status === 'Restarting');
+            const status = isAlive ? '🟢 Running' : '🔴 Dead';
+            const idleSeconds = bgProc.lastActivityAt ? Math.floor((Date.now() - new Date(bgProc.lastActivityAt).getTime()) / 1000) : null;
+            const idleStr = idleSeconds === null ? 'N/A' : this.formatIdleTime(idleSeconds);
+
+            console.log(`\n${i + 1}. ${bgProc.name}`);
+            console.log(`   Status: ${status}`);
+            console.log(`   SyPM ID: ${bgProc.sypmId} | PID: ${syProc ? syProc.pid : 'N/A'}`);
+            console.log(`   Profile: ${bgProc.profile}`);
+            console.log(`   Terminal: tty=${bgProc.tty || '?'}, shellPID=${bgProc.shellPid}, session=${bgProc.sessionId || '?'}`);
+            console.log(`   Started: ${new Date(bgProc.startedAt).toLocaleString()}`);
+            console.log(`   Last Activity: ${bgProc.lastActivityAt ? new Date(bgProc.lastActivityAt).toLocaleString() + ' (' + idleStr + ' idle)' : 'Never'}`);
+            console.log(`   Last 3 Paths:`);
+            if (bgProc.lastTrackedDirs && bgProc.lastTrackedDirs.length > 0) {
+                bgProc.lastTrackedDirs.forEach(dir => console.log(`     - ${dir}`));
+            } else {
+                console.log('     (none)');
+            }
+            console.log(`   Last 5 Commands:`);
+            if (bgProc.executedCommands && bgProc.executedCommands.length > 0) {
+                bgProc.executedCommands.forEach(cmd => console.log(`     - ${cmd}`));
+            } else {
+                console.log('     (none)');
+            }
+            if (syProc && syProc.log) {
+                console.log(`   Log: ${syProc.log}`);
+            }
+        }
+
+        console.log('\nOptions:');
+        console.log('  r <number>  Remove (kill) a process');
+        console.log('  l <number>  Show live logs for a process (Ctrl+C to stop)');
+        console.log('  q           Quit manager');
+
+        while (true) {
+            const input = await this.question('\nAction: ');
+            const parts = input.trim().split(/\s+/);
+            if (parts.length === 0) continue;
+            const cmd = parts[0].toLowerCase();
+
+            if (cmd === 'q') break;
+
+            if ((cmd === 'r' || cmd === 'l') && parts.length >= 2) {
+                const idx = parseInt(parts[1]) - 1;
+                if (idx >= 0 && idx < processes.length) {
+                    const bgProc = processes[idx];
+                    if (cmd === 'r') {
+                        console.log(`Removing process: ${bgProc.name} (${bgProc.sypmId})`);
+                        const killed = SyPM.kill(bgProc.sypmId);
+                        if (killed) {
+                            metadata.processes = metadata.processes.filter(p => p.bgToken !== bgProc.bgToken);
+                            await this.saveBgMetadata(metadata);
+                            console.log('✓ Process removed from manager.');
+                        } else {
+                            console.log('⚠ Could not kill process.');
+                        }
+                        // Refresh and return to show updated list
+                        return this.manageBackgroundProcesses();
+                    } else if (cmd === 'l') {
+                        console.log(`Following logs for ${bgProc.name}...`);
+                        SyPM.log(bgProc.sypmId);
+                        console.log('Log following ended.');
+                    }
+                } else {
+                    console.log('Invalid process number.');
+                }
+            } else {
+                console.log('Invalid command.');
+            }
+        }
+    }
+
     async startBackgroundMode(profileName) {
         console.log('🚀 Starting ClipWait in background mode with terminal tracking...');
         
@@ -1132,17 +1279,22 @@ monitor.start().catch(error => {
         console.log(`✓ Session ID: ${info.sessionId || 'unknown'}`);
         console.log(`✓ Current directory: ${this.currentRoot}`);
         
+        // Generate unique token for this background process
+        const bgToken = `bg_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+        const processName = `clipwait-bg-${bgToken}`;
+        
         // Create background script
         const bgScript = this.createBackgroundScript(
             profileName || this.config.activeProfile,
             this.tagRestrictMode,
             info.shellPid,
             info.tty,
-            info.sessionId
+            info.sessionId,
+            bgToken
         );
         
         // Write background script to temp file
-        const bgFile = path.join(os.tmpdir(), `clipwait-bg-${Date.now()}.mjs`);
+        const bgFile = path.join(os.tmpdir(), `clipwait-bg-${bgToken}.mjs`);
         await fs.writeFile(bgFile, bgScript, 'utf8');
         
         console.log('📝 Created background script: ' + bgFile);
@@ -1150,11 +1302,30 @@ monitor.start().catch(error => {
         
         try {
             const processInfo = SyPM.run(bgFile, {
-                name: 'clipwait-bg',
+                name: processName,
                 autoRestart: true,
                 restartTries: 10,
                 uniqueNameLock: true
             });
+            
+            // Save metadata
+            const metadata = await this.loadBgMetadata();
+            metadata.processes = metadata.processes || [];
+            metadata.processes.push({
+                bgToken: bgToken,
+                sypmId: processInfo.id,
+                name: processName,
+                profile: profileName || this.config.activeProfile,
+                shellPid: info.shellPid,
+                tty: info.tty,
+                sessionId: info.sessionId,
+                startedAt: new Date().toISOString(),
+                lastActivityAt: new Date().toISOString(),
+                lastTrackedDirs: [this.currentRoot],
+                executedCommands: [],
+                currentRoot: this.currentRoot
+            });
+            await this.saveBgMetadata(metadata);
             
             console.log('✅ ClipWait background process started successfully!');
             console.log('📋 Process Info:');
@@ -1163,15 +1334,18 @@ monitor.start().catch(error => {
             console.log('  - ID: ' + processInfo.id);
             console.log('  - Log: ' + processInfo.log);
             
+            console.log('\n📝 To manage background processes:');
+            console.log('  node clipwait.js --bg');
+            
             console.log('\n📝 To view logs:');
             console.log('  node SyPM.js --log ' + processInfo.id);
             console.log('  or');
-            console.log('  tail -f ' + path.join(os.tmpdir(), 'clipwait-bg.log'));
+            console.log('  tail -f ' + path.join(os.tmpdir(), 'clipwait-bg-' + bgToken + '.log'));
             
             console.log('\n🔍 To stop ClipWait:');
             console.log('  node SyPM.js --kill ' + processInfo.id);
             console.log('  or');
-            console.log('  node SyPM.js --kill clipwait-bg');
+            console.log('  node SyPM.js --kill ' + processName);
             
             return true;
         } catch (error) {
@@ -1197,7 +1371,7 @@ monitor.start().catch(error => {
         
         if (bgIndex !== -1) {
             this.bgMode = true;
-            console.log('🔍 Background Mode enabled: ClipWait will run in background with terminal tracking.');
+            console.log('🔍 Background Mode enabled.');
             args.splice(bgIndex, 1);
         }
         
@@ -1205,7 +1379,14 @@ monitor.start().catch(error => {
             argProfile = args[0];
         }
         
-        // If background mode is enabled, start background process and exit
+        // If background mode is enabled and no profile specified, open manager
+        if (this.bgMode && !argProfile) {
+            await this.manageBackgroundProcesses();
+            this.rl.close();
+            return;
+        }
+        
+        // If background mode is enabled with a profile, start background process and exit
         if (this.bgMode) {
             if (argProfile && !this.config.profiles[argProfile]) {
                 console.error(`✗ Profile "${argProfile}" not found.`);
