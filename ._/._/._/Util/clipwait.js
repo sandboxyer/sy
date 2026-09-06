@@ -34,6 +34,7 @@ class ClipboardMonitor {
         this.currentRoot = process.cwd();
         this.trackerShellPid = null;
         this.trackerTty = null;
+        this.trackerSessionId = null; // NEW
         this.lastTrackedDir = process.cwd();
         this.isBackgroundProcess = false;
     }
@@ -282,7 +283,7 @@ class ClipboardMonitor {
         return true;
     }
 
-    // New method: Capture terminal info when in background mode
+    // Capture terminal info including session ID
     captureTerminalInfo() {
         const info = {
             myPid: process.pid,
@@ -326,7 +327,7 @@ class ClipboardMonitor {
         return info;
     }
 
-    // New method: Get current directory of tracked shell
+    // Get current directory of tracked shell
     getShellCwd(pid) {
         try {
             return execSync(`readlink /proc/${pid}/cwd`).toString().trim();
@@ -335,11 +336,20 @@ class ClipboardMonitor {
         }
     }
 
-    // New method: Check if directory changed and update if needed
+    // Check if directory changed and update if needed
     async checkDirectoryChange() {
-        if (!this.trackerShellPid) {
+        if (!this.trackerShellPid && !this.trackerSessionId) {
             return;
         }
+
+        // Dynamically find the active shell PID in the same session
+        const activePid = await this.findActiveShellPid();
+        if (activePid && activePid !== this.trackerShellPid) {
+            console.log(`\n🔄 Active shell changed: ${this.trackerShellPid} → ${activePid}`);
+            this.trackerShellPid = activePid;
+        }
+
+        if (!this.trackerShellPid) return;
 
         const newDir = this.getShellCwd(this.trackerShellPid);
         if (!newDir || newDir === this.lastTrackedDir) {
@@ -678,8 +688,45 @@ class ClipboardMonitor {
         return true;
     }
 
+    // Dynamically find the active shell PID in the same session
+    async findActiveShellPid() {
+        if (!this.trackerSessionId) return this.trackerShellPid;
+
+        const shellNames = ['bash', 'zsh', 'sh', 'fish', 'ksh', 'tcsh', 'dash'];
+        let highestPid = null;
+
+        try {
+            const procDirs = await fs.readdir('/proc');
+            for (const dir of procDirs) {
+                if (!/^\d+$/.test(dir)) continue;
+                const pid = parseInt(dir, 10);
+                try {
+                    const comm = (await fs.readFile(`/proc/${pid}/comm`, 'utf8')).trim();
+                    if (!shellNames.some(shell => comm.includes(shell))) continue;
+
+                    // Read session ID from /proc/<pid>/stat (field 6)
+                    const stat = await fs.readFile(`/proc/${pid}/stat`, 'utf8');
+                    const statParts = stat.split(' ');
+                    // Fields: pid (0), comm (1), state (2), ppid (3), pgrp (4), session (5), ...
+                    const sessionId = statParts[5]; // session is field 6 (0-indexed 5)
+                    if (sessionId === this.trackerSessionId) {
+                        if (highestPid === null || pid > highestPid) {
+                            highestPid = pid;
+                        }
+                    }
+                } catch (e) {
+                    // Ignore processes that disappear
+                }
+            }
+        } catch (e) {
+            // Ignore /proc read errors
+        }
+
+        return highestPid || this.trackerShellPid;
+    }
+
     // Create background process script
-    createBackgroundScript(profileName, tagMode, shellPid, tty) {
+    createBackgroundScript(profileName, tagMode, shellPid, tty, sessionId) {
         return `
 import { exec } from 'child_process';
 import { promisify } from 'util';
@@ -707,6 +754,7 @@ class BackgroundClipboardMonitor {
         this.currentRoot = process.cwd();
         this.trackerShellPid = ${shellPid};
         this.trackerTty = '${tty || ''}';
+        this.trackerSessionId = '${sessionId || ''}';
         this.lastTrackedDir = process.cwd();
         
         this.logFile = path.join(os.tmpdir(), 'clipwait-bg.log');
@@ -849,17 +897,58 @@ class BackgroundClipboardMonitor {
         return true;
     }
     
-    getShellCwd() {
-        if (!this.trackerShellPid) return null;
+    async findActiveShellPid() {
+        if (!this.trackerSessionId) return this.trackerShellPid;
+
+        const shellNames = ['bash', 'zsh', 'sh', 'fish', 'ksh', 'tcsh', 'dash'];
+        let highestPid = null;
+
         try {
-            return execSync('readlink /proc/' + this.trackerShellPid + '/cwd').toString().trim();
+            const procDirs = await fs.readdir('/proc');
+            for (const dir of procDirs) {
+                if (!/^\\d+$/.test(dir)) continue;
+                const pid = parseInt(dir, 10);
+                try {
+                    const comm = (await fs.readFile('/proc/' + pid + '/comm', 'utf8')).trim();
+                    if (!shellNames.some(shell => comm.includes(shell))) continue;
+
+                    const stat = await fs.readFile('/proc/' + pid + '/stat', 'utf8');
+                    const statParts = stat.split(' ');
+                    const sessionId = statParts[5];
+                    if (sessionId === this.trackerSessionId) {
+                        if (highestPid === null || pid > highestPid) {
+                            highestPid = pid;
+                        }
+                    }
+                } catch (e) {
+                    // Ignore
+                }
+            }
+        } catch (e) {
+            // Ignore
+        }
+
+        return highestPid || this.trackerShellPid;
+    }
+
+    getShellCwd(pid) {
+        try {
+            return execSync('readlink /proc/' + pid + '/cwd').toString().trim();
         } catch (error) {
             return null;
         }
     }
     
     async checkDirectoryChange() {
-        const newDir = this.getShellCwd();
+        const activePid = await this.findActiveShellPid();
+        if (activePid && activePid !== this.trackerShellPid) {
+            this.log('🔄 Active shell changed: ' + this.trackerShellPid + ' → ' + activePid);
+            this.trackerShellPid = activePid;
+        }
+
+        if (!this.trackerShellPid) return;
+
+        const newDir = this.getShellCwd(this.trackerShellPid);
         if (!newDir || newDir === this.lastTrackedDir) return;
         
         this.lastTrackedDir = newDir;
@@ -978,7 +1067,10 @@ class BackgroundClipboardMonitor {
         this.log('🚀 Background Clipboard Monitor Started');
         this.log('   Current root: ' + this.currentRoot);
         if (this.trackerShellPid) {
-            this.log('   Tracking shell PID: ' + this.trackerShellPid);
+            this.log('   Initial shell PID: ' + this.trackerShellPid);
+            if (this.trackerSessionId) {
+                this.log('   Session ID: ' + this.trackerSessionId);
+            }
         }
         
         await this.loadConfig();
@@ -1033,9 +1125,11 @@ monitor.start().catch(error => {
         
         this.trackerShellPid = info.shellPid;
         this.trackerTty = info.tty;
+        this.trackerSessionId = info.sessionId; // NEW
         
         console.log(`✓ Shell PID: ${info.shellPid}`);
         console.log(`✓ TTY: ${info.tty || 'unknown'}`);
+        console.log(`✓ Session ID: ${info.sessionId || 'unknown'}`);
         console.log(`✓ Current directory: ${this.currentRoot}`);
         
         // Create background script
@@ -1043,7 +1137,8 @@ monitor.start().catch(error => {
             profileName || this.config.activeProfile,
             this.tagRestrictMode,
             info.shellPid,
-            info.tty
+            info.tty,
+            info.sessionId
         );
         
         // Write background script to temp file
