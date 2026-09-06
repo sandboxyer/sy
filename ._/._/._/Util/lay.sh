@@ -11,6 +11,8 @@
 #   new [name]      - Create new layer (clean copy, only tracked files)
 #   new --changes [name] - Create new layer with changes (includes untracked)
 #   delete          - Delete current layer and return to main repo
+#   clearall        - Clear all repo instances (with verification)
+#   clear           - Clear instances of current repo only (with verification)
 #   swi [N|name]    - Switch to layer by number or custom name (0 = main repo)
 #   reposwi [name|N]- Switch to a different repository (by name or index)
 #   repo [name|N]   - Switch to a different repository (alternative to reposwi)
@@ -89,6 +91,8 @@ show_help() {
     printf "  lay new [name]     # Create new layer (clean copy, only tracked files)\n"
     printf "  lay new --changes [name] # Create new layer with changes (includes untracked)\n"
     printf "  lay delete         # Delete current layer and return to main repo\n"
+    printf "  lay clearall       # Clear all repo instances (with verification)\n"
+    printf "  lay clear          # Clear instances of current repo only (with verification)\n"
     printf "  lay swi [N|name]   # Switch to layer by number or custom name (0 = main repo)\n"
     printf "  lay repo [name|N]  # Switch to a different repository (by name or 1-based index)\n"
     printf "  lay reposwi [name|N] # Alternative: switch to different repository\n"
@@ -120,6 +124,8 @@ CREATE_NEW_LAYER=0
 INCLUDE_UNCOMMITTED=0
 CUSTOM_LAYER_NAME=""
 DELETE_CURRENT_LAYER=0
+CLEAR_ALL_LAYERS=0
+CLEAR_CURRENT_REPO=0
 SWITCH_TO_LAYER=0
 TARGET_LAYER_NUMBER=""
 SWITCH_REPOSITORY=0
@@ -160,6 +166,14 @@ while [ $# -gt 0 ]; do
             ;;
         delete|--delete|-d|del)
             DELETE_CURRENT_LAYER=1
+            shift
+            ;;
+        clearall|--clearall|-ca|clear-all)
+            CLEAR_ALL_LAYERS=1
+            shift
+            ;;
+        clear|--clear|-c)
+            CLEAR_CURRENT_REPO=1
             shift
             ;;
         swi|--swi|-s|switch|--switch)
@@ -733,6 +747,351 @@ delete_current_layer() {
     return 0
 }
 
+# Clear instances of current repo only
+clear_current_repo_instances() {
+    # Determine current repo root and parent dir
+    repository_root="$CURRENT_DIRECTORY"
+    if [ "$(basename "$repository_root")" = "$LAYER_NAME" ]; then
+        repository_root="$(dirname "$repository_root")"
+    fi
+    parent_directory="$(dirname "$repository_root")"
+    
+    # Get current repo name
+    current_repository=$(get_repo_name_from_git "$repository_root")
+    if [ -z "$current_repository" ]; then
+        current_repository=$(get_main_repo_name "$repository_root")
+    fi
+    
+    [ $VERBOSE_MODE -eq 1 ] && printf "Clearing instances for repository '%s'...\n" "$current_repository"
+    
+    # Check if main repo exists
+    if [ ! -d "$parent_directory/$current_repository" ]; then
+        [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_RED}Error: Main repository '%s' not found${COLOR_RESET}\n" "$current_repository"
+        return 1
+    fi
+    
+    # Determine main repo branch
+    main_repo_branch=$(get_current_branch "$parent_directory/$current_repository")
+    [ $VERBOSE_MODE -eq 1 ] && printf "Main repo branch: %s\n" "$main_repo_branch"
+    
+    # Collect instances and categorize them
+    instances_to_delete=""
+    instances_needing_verification=""
+    verification_details=""
+    
+    for directory in "$parent_directory"/${current_repository}_*; do
+        [ -d "$directory" ] || continue
+        basename_directory=$(basename "$directory")
+        # Skip ._ directories
+        if [ "$basename_directory" = "$LAYER_NAME" ]; then
+            continue
+        fi
+        
+        # Check if this instance has uncommitted changes
+        has_uncommitted_changes=0
+        if [ -d "$directory/.git" ] && command -v git >/dev/null 2>&1; then
+            if (cd "$directory" 2>/dev/null && git status --porcelain 2>/dev/null | grep -q .); then
+                has_uncommitted_changes=1
+            fi
+        fi
+        
+        # Check if branch differs from main repo
+        branch_differs=0
+        instance_branch=""
+        if [ -d "$directory/.git" ] && command -v git >/dev/null 2>&1; then
+            instance_branch=$(get_current_branch "$directory")
+            if [ "$instance_branch" != "$main_repo_branch" ]; then
+                branch_differs=1
+            fi
+        fi
+        
+        if [ $has_uncommitted_changes -eq 0 ] && [ $branch_differs -eq 0 ]; then
+            # Safe to delete
+            if [ -z "$instances_to_delete" ]; then
+                instances_to_delete="$directory"
+            else
+                instances_to_delete="$instances_to_delete
+$directory"
+            fi
+        else
+            # Needs verification
+            if [ -z "$instances_needing_verification" ]; then
+                instances_needing_verification="$directory"
+            else
+                instances_needing_verification="$instances_needing_verification
+$directory"
+            fi
+            
+            # Build verification details
+            instance_details="$basename_directory:"
+            if [ $has_uncommitted_changes -eq 1 ]; then
+                instance_details="$instance_details has_uncommitted_changes"
+            fi
+            if [ $branch_differs -eq 1 ]; then
+                if [ $has_uncommitted_changes -eq 1 ]; then
+                    instance_details="$instance_details,"
+                fi
+                instance_details="$instance_details branch=${instance_branch:-unknown}(main:${main_repo_branch})"
+            fi
+            
+            if [ -z "$verification_details" ]; then
+                verification_details="$instance_details"
+            else
+                verification_details="$verification_details
+$instance_details"
+            fi
+        fi
+    done
+    
+    # Delete instances that are clean
+    if [ -n "$instances_to_delete" ]; then
+        printf "${COLOR_CYAN}Deleting clean instances:${COLOR_RESET}\n"
+        printf "%s\n" "$instances_to_delete" | while IFS= read -r directory; do
+            [ -z "$directory" ] && continue
+            printf "  Removing: %s\n" "$(basename "$directory")"
+            rm -rf "$directory" 2>/dev/null || {
+                [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_YELLOW}Warning: Could not delete %s${COLOR_RESET}\n" "$directory"
+            }
+        done
+    fi
+    
+    # Handle instances needing verification
+    if [ -n "$instances_needing_verification" ]; then
+        printf "${COLOR_YELLOW}The following instances have differences:${COLOR_RESET}\n"
+        printf "%s\n" "$verification_details" | while IFS= read -r details; do
+            [ -z "$details" ] && continue
+            printf "  %s\n" "$details"
+        done
+        
+        printf "\n${COLOR_YELLOW}Do you want to delete these instances too? (y/n): ${COLOR_RESET}"
+        read -r user_response
+        
+        case "$user_response" in
+            [Yy]|[Yy][Ee][Ss])
+                printf "%s\n" "$instances_needing_verification" | while IFS= read -r directory; do
+                    [ -z "$directory" ] && continue
+                    printf "  Removing: %s\n" "$(basename "$directory")"
+                    rm -rf "$directory" 2>/dev/null || {
+                        [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_YELLOW}Warning: Could not delete %s${COLOR_RESET}\n" "$directory"
+                    }
+                done
+                printf "${COLOR_GREEN}All instances cleared.${COLOR_RESET}\n"
+                ;;
+            *)
+                printf "${COLOR_YELLOW}Skipped deletion of instances with differences.${COLOR_RESET}\n"
+                ;;
+        esac
+    else
+        printf "${COLOR_GREEN}All clean instances cleared.${COLOR_RESET}\n"
+    fi
+    
+    # Navigate to main repo if we're in a deleted instance
+    if [ ! -d "$CURRENT_DIRECTORY" ]; then
+        cd "$parent_directory/$current_repository" || return 1
+        [ $VERBOSE_MODE -eq 1 ] && printf "Now at: %s\n" "$PWD"
+    fi
+    
+    return 0
+}
+
+# Clear all repo instances (across all repos)
+clear_all_layers() {
+    # Determine current repo root and parent dir
+    repository_root="$CURRENT_DIRECTORY"
+    if [ "$(basename "$repository_root")" = "$LAYER_NAME" ]; then
+        repository_root="$(dirname "$repository_root")"
+    fi
+    parent_directory="$(dirname "$repository_root")"
+    
+    [ $VERBOSE_MODE -eq 1 ] && printf "Clearing instances for all repositories in: %s\n" "$parent_directory"
+    
+    # Collect unique repo names using temp file
+    seen_file=$(mktemp /tmp/lay_seen.XXXXXX) || return 1
+    trap 'rm -f "$seen_file"' RETURN
+    
+    for directory in "$parent_directory"/*/; do
+        [ -d "$directory" ] || continue
+        basename_directory=$(basename "$directory")
+        # Skip ._ directories
+        if [ "$basename_directory" = "$LAYER_NAME" ]; then
+            continue
+        fi
+        # Extract base repo name (everything before the last underscore)
+        base_repository_name=$(printf "%s" "$basename_directory" | sed 's/_[^_]*$//')
+        # Check if we've seen this repo before
+        if ! grep -q "^${base_repository_name}$" "$seen_file" 2>/dev/null; then
+            printf "%s\n" "$base_repository_name" >> "$seen_file"
+        fi
+    done
+    
+    # Arrays to store all instances needing verification across repos
+    all_verification_instances=""
+    all_verification_details=""
+    all_clean_instances=""
+    
+    # Process each unique repo to collect instances
+    while IFS= read -r repo_name; do
+        [ -z "$repo_name" ] && continue
+        
+        [ $VERBOSE_MODE -eq 1 ] && printf "\nCollecting instances for repository: %s\n" "$repo_name"
+        
+        # Check if main repo exists
+        if [ ! -d "$parent_directory/$repo_name" ]; then
+            [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_YELLOW}Main repo '%s' not found, skipping${COLOR_RESET}\n" "$repo_name"
+            continue
+        fi
+        
+        # Determine main repo branch
+        main_repo_branch=$(get_current_branch "$parent_directory/$repo_name")
+        
+        for directory in "$parent_directory"/${repo_name}_*; do
+            [ -d "$directory" ] || continue
+            basename_directory=$(basename "$directory")
+            # Skip ._ directories
+            if [ "$basename_directory" = "$LAYER_NAME" ]; then
+                continue
+            fi
+            
+            # Check if this instance has uncommitted changes
+            has_uncommitted_changes=0
+            if [ -d "$directory/.git" ] && command -v git >/dev/null 2>&1; then
+                if (cd "$directory" 2>/dev/null && git status --porcelain 2>/dev/null | grep -q .); then
+                    has_uncommitted_changes=1
+                fi
+            fi
+            
+            # Check if branch differs from main repo
+            branch_differs=0
+            instance_branch=""
+            if [ -d "$directory/.git" ] && command -v git >/dev/null 2>&1; then
+                instance_branch=$(get_current_branch "$directory")
+                if [ "$instance_branch" != "$main_repo_branch" ]; then
+                    branch_differs=1
+                fi
+            fi
+            
+            if [ $has_uncommitted_changes -eq 0 ] && [ $branch_differs -eq 0 ]; then
+                # Clean instance
+                if [ -z "$all_clean_instances" ]; then
+                    all_clean_instances="$directory"
+                else
+                    all_clean_instances="$all_clean_instances
+$directory"
+                fi
+            else
+                # Needs verification
+                if [ -z "$all_verification_instances" ]; then
+                    all_verification_instances="$directory"
+                else
+                    all_verification_instances="$all_verification_instances
+$directory"
+                fi
+                
+                # Build verification details
+                instance_details="$basename_directory:"
+                if [ $has_uncommitted_changes -eq 1 ]; then
+                    instance_details="$instance_details has_uncommitted_changes"
+                fi
+                if [ $branch_differs -eq 1 ]; then
+                    if [ $has_uncommitted_changes -eq 1 ]; then
+                        instance_details="$instance_details,"
+                    fi
+                    instance_details="$instance_details branch=${instance_branch:-unknown}(main:${main_repo_branch})"
+                fi
+                
+                if [ -z "$all_verification_details" ]; then
+                    all_verification_details="$instance_details"
+                else
+                    all_verification_details="$all_verification_details
+$instance_details"
+                fi
+            fi
+        done
+    done < "$seen_file"
+    
+    # Delete all clean instances
+    if [ -n "$all_clean_instances" ]; then
+        printf "${COLOR_CYAN}Deleting clean instances:${COLOR_RESET}\n"
+        printf "%s\n" "$all_clean_instances" | while IFS= read -r directory; do
+            [ -z "$directory" ] && continue
+            printf "  Removing: %s\n" "$(basename "$directory")"
+            rm -rf "$directory" 2>/dev/null || {
+                [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_YELLOW}Warning: Could not delete %s${COLOR_RESET}\n" "$directory"
+            }
+        done
+    fi
+    
+    # Handle instances needing verification with numbered list
+    if [ -n "$all_verification_instances" ]; then
+        printf "\n${COLOR_YELLOW}The following instances have differences:${COLOR_RESET}\n"
+        
+        # Create numbered list
+        counter=1
+        while IFS= read -r directory; do
+            [ -z "$directory" ] && continue
+            details_line=$(printf "%s\n" "$all_verification_details" | sed -n "${counter}p")
+            printf "  ${COLOR_BOLD}%d.${COLOR_RESET} %s\n" "$counter" "$details_line"
+            counter=$((counter + 1))
+        done <<EOF
+$all_verification_instances
+EOF
+        
+        printf "\n${COLOR_YELLOW}Enter numbers to delete (e.g., '1 3 5'), 'all' for all, or 'n' to skip: ${COLOR_RESET}"
+        read -r user_response
+        
+        case "$user_response" in
+            [Nn]|[Nn][Oo]|"")
+                printf "${COLOR_YELLOW}Skipped deletion of instances with differences.${COLOR_RESET}\n"
+                ;;
+            [Aa]|[Aa][Ll][Ll])
+                # Delete all instances with differences
+                printf "%s\n" "$all_verification_instances" | while IFS= read -r directory; do
+                    [ -z "$directory" ] && continue
+                    printf "  Removing: %s\n" "$(basename "$directory")"
+                    rm -rf "$directory" 2>/dev/null || {
+                        [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_YELLOW}Warning: Could not delete %s${COLOR_RESET}\n" "$directory"
+                    }
+                done
+                printf "${COLOR_GREEN}All instances with differences deleted.${COLOR_RESET}\n"
+                ;;
+            *)
+                # Delete selected instances
+                for num in $user_response; do
+                    if printf "%s" "$num" | grep -q '^[0-9][0-9]*$'; then
+                        # Find the directory for this number
+                        selected_directory=$(printf "%s\n" "$all_verification_instances" | sed -n "${num}p")
+                        if [ -n "$selected_directory" ]; then
+                            printf "  Removing: %s\n" "$(basename "$selected_directory")"
+                            rm -rf "$selected_directory" 2>/dev/null || {
+                                [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_YELLOW}Warning: Could not delete %s${COLOR_RESET}\n" "$selected_directory"
+                            }
+                        else
+                            printf "${COLOR_YELLOW}Invalid number: %s${COLOR_RESET}\n" "$num"
+                        fi
+                    fi
+                done
+                printf "${COLOR_GREEN}Selected instances deleted.${COLOR_RESET}\n"
+                ;;
+        esac
+    else
+        printf "${COLOR_GREEN}All clean instances cleared.${COLOR_RESET}\n"
+    fi
+    
+    # Navigate to main repo if we're in a deleted instance
+    if [ ! -d "$CURRENT_DIRECTORY" ]; then
+        # Try to find current repo main
+        current_repo_name=$(get_main_repo_name "$repository_root")
+        if [ -d "$parent_directory/$current_repo_name" ]; then
+            cd "$parent_directory/$current_repo_name" || return 1
+        else
+            cd "$parent_directory" || return 1
+        fi
+        [ $VERBOSE_MODE -eq 1 ] && printf "Now at: %s\n" "$PWD"
+    fi
+    
+    return 0
+}
+
 # Switch to specific layer with fallback
 switch_to_layer() {
     # Determine the actual repository root
@@ -1230,6 +1589,18 @@ fi
 
 if [ $DELETE_CURRENT_LAYER -eq 1 ]; then
     delete_current_layer
+    [ $? -eq 0 ] && [ $VERBOSE_MODE -eq 0 ] && clear
+    return $? 2>/dev/null || exit $?
+fi
+
+if [ $CLEAR_ALL_LAYERS -eq 1 ]; then
+    clear_all_layers
+    [ $? -eq 0 ] && [ $VERBOSE_MODE -eq 0 ] && clear
+    return $? 2>/dev/null || exit $?
+fi
+
+if [ $CLEAR_CURRENT_REPO -eq 1 ]; then
+    clear_current_repo_instances
     [ $? -eq 0 ] && [ $VERBOSE_MODE -eq 0 ] && clear
     return $? 2>/dev/null || exit $?
 fi
