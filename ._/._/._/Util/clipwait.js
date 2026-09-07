@@ -11,7 +11,7 @@ const execAsync = promisify(exec);
 
 class ClipboardMonitor {
     constructor() {
-        this.configDir = path.join(os.tmpdir(), 'clipboard-monitor');
+        this.configDir = path.join(os.homedir(), '.clipboard-monitor');
         this.configPath = path.join(this.configDir, 'clipboard-config.json');
         this.outputPath = path.join(process.cwd(), 'result');
         this.lastClipboardContent = '';
@@ -63,6 +63,27 @@ class ClipboardMonitor {
     }
 
     async loadOrCreateConfig() {
+        // Migrate old config from /tmp if exists
+        const oldConfigDir = path.join(os.tmpdir(), 'clipboard-monitor');
+        const oldConfigPath = path.join(oldConfigDir, 'clipboard-config.json');
+        try {
+            await fs.access(oldConfigPath);
+            // Old config exists, check if new config already exists
+            try {
+                await fs.access(this.configPath);
+                // New config exists, don't overwrite
+            } catch (error) {
+                if (error.code === 'ENOENT') {
+                    // New config doesn't exist, copy old to new
+                    await fs.mkdir(this.configDir, { recursive: true });
+                    await fs.copyFile(oldConfigPath, this.configPath);
+                    console.log(`✓ Migrated configuration from ${oldConfigPath} to ${this.configPath}`);
+                }
+            }
+        } catch (error) {
+            // Old config doesn't exist, ignore
+        }
+
         try {
             await this.ensureConfigDirectory();
             const configData = await fs.readFile(this.configPath, 'utf8');
@@ -478,6 +499,11 @@ class ClipboardMonitor {
             console.log(`\n${index + 1}. ${name}${isActive}`);
             console.log(`   Output file: ${profile.outputFile || name}`);
             console.log(`   Commands: ${profile.commands.length}`);
+            const defaultFlags = [];
+            if (profile.defaultBg) defaultFlags.push('bg');
+            if (profile.defaultTag) defaultFlags.push('tag');
+            if (profile.defaultNotify) defaultFlags.push('notify');
+            console.log(`   Default flags: ${defaultFlags.length > 0 ? defaultFlags.join(', ') : 'none'}`);
             profile.commands.forEach((cmd, cmdIndex) => {
                 console.log(`     ${cmdIndex + 1}. ${cmd}`);
             });
@@ -504,9 +530,17 @@ class ClipboardMonitor {
             commands.push(command);
         }
         
+        // Ask about default flags
+        const defaultBg = (await this.question('Enable --bg by default? (y/n): ')).toLowerCase() === 'y';
+        const defaultTag = (await this.question('Enable --tag by default? (y/n): ')).toLowerCase() === 'y';
+        const defaultNotify = (await this.question('Enable --notify by default? (y/n): ')).toLowerCase() === 'y';
+
         this.config.profiles[name] = {
             outputFile,
-            commands
+            commands,
+            defaultBg,
+            defaultTag,
+            defaultNotify
         };
         
         if (!this.config.activeProfile) {
@@ -534,6 +568,22 @@ class ClipboardMonitor {
         if (outputFile) {
             this.config.profiles[name].outputFile = outputFile;
         }
+
+        // Edit default flags
+        const currentBg = this.config.profiles[name].defaultBg || false;
+        const bgInput = await this.question(`Enable --bg by default? (current: ${currentBg ? 'yes' : 'no'}) [y/n/Enter to keep]: `);
+        if (bgInput.toLowerCase() === 'y') this.config.profiles[name].defaultBg = true;
+        else if (bgInput.toLowerCase() === 'n') this.config.profiles[name].defaultBg = false;
+
+        const currentTag = this.config.profiles[name].defaultTag || false;
+        const tagInput = await this.question(`Enable --tag by default? (current: ${currentTag ? 'yes' : 'no'}) [y/n/Enter to keep]: `);
+        if (tagInput.toLowerCase() === 'y') this.config.profiles[name].defaultTag = true;
+        else if (tagInput.toLowerCase() === 'n') this.config.profiles[name].defaultTag = false;
+
+        const currentNotify = this.config.profiles[name].defaultNotify || false;
+        const notifyInput = await this.question(`Enable --notify by default? (current: ${currentNotify ? 'yes' : 'no'}) [y/n/Enter to keep]: `);
+        if (notifyInput.toLowerCase() === 'y') this.config.profiles[name].defaultNotify = true;
+        else if (notifyInput.toLowerCase() === 'n') this.config.profiles[name].defaultNotify = false;
         
         console.log('Current commands:');
         this.config.profiles[name].commands.forEach((cmd, index) => {
@@ -747,7 +797,7 @@ const METADATA_PATH = path.join(os.tmpdir(), 'clipboard-monitor', 'bg-processes.
 
 class BackgroundClipboardMonitor {
     constructor() {
-        this.configDir = path.join(os.tmpdir(), 'clipboard-monitor');
+        this.configDir = path.join(os.homedir(), '.clipboard-monitor');
         this.configPath = path.join(this.configDir, 'clipboard-config.json');
         this.outputPath = path.join(process.cwd(), 'result');
         this.lastClipboardContent = '';
@@ -766,7 +816,7 @@ class BackgroundClipboardMonitor {
         this.lastTrackedDir = process.cwd();
         this.notifyMode = ${notifyMode};
         
-        this.logFile = path.join(os.tmpdir(), 'clipwait-bg-' + BG_TOKEN + '.log');
+        this.logFile = path.join(os.homedir(), '.clipboard-monitor', 'clipwait-bg-' + BG_TOKEN + '.log');
     }
     
     log(message) {
@@ -1400,7 +1450,7 @@ monitor.start().catch(error => {
         );
         
         // Write background script to temp file
-        const bgFile = path.join(os.tmpdir(), `clipwait-bg-${bgToken}.mjs`);
+        const bgFile = path.join(this.configDir, `clipwait-bg-${bgToken}.mjs`);
         await fs.writeFile(bgFile, bgScript, 'utf8');
         
         console.log('📝 Created background script: ' + bgFile);
@@ -1470,17 +1520,23 @@ monitor.start().catch(error => {
         let notifyMode = false;
         let argProfile = null;
         
-        // Parse arguments in any order
+        // Parse arguments in any order, track explicit flags
         const remainingArgs = [];
+        let explicitBg = false;
+        let explicitTag = false;
+        let explicitNotify = false;
         for (const arg of args) {
             if (arg === '--tag') {
                 tagMode = true;
+                explicitTag = true;
             } else if (arg === '--bg') {
                 bgModeRequested = true;
+                explicitBg = true;
             } else if (arg === '--status') {
                 statusMode = true;
             } else if (arg === '--notify') {
                 notifyMode = true;
+                explicitNotify = true;
             } else {
                 remainingArgs.push(arg);
             }
@@ -1492,6 +1548,17 @@ monitor.start().catch(error => {
             return;
         }
         
+        if (remainingArgs.length > 0) {
+            argProfile = remainingArgs[0];
+            // Apply profile default flags if not explicitly set
+            const profile = this.config.profiles[argProfile];
+            if (profile) {
+                if (!explicitBg && profile.defaultBg) bgModeRequested = true;
+                if (!explicitTag && profile.defaultTag) tagMode = true;
+                if (!explicitNotify && profile.defaultNotify) notifyMode = true;
+            }
+        }
+        
         if (tagMode) {
             this.tagRestrictMode = true;
             console.log('🔒 Tag Restrict Mode enabled: Only content with CODEREPLACER tags will be processed.');
@@ -1501,10 +1568,6 @@ monitor.start().catch(error => {
         if (bgModeRequested) {
             this.bgMode = true;
             console.log('🔍 Background Mode enabled.');
-        }
-        
-        if (remainingArgs.length > 0) {
-            argProfile = remainingArgs[0];
         }
         
         // If background mode is enabled and no profile specified, open manager
