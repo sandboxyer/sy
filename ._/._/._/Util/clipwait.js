@@ -452,7 +452,10 @@ class ClipboardMonitor {
             if (writeSuccess && this.config.activeProfile) {
                 const profile = this.config.profiles[this.config.activeProfile];
                 if (profile) {
-                    await this.executeCommands(profile);
+                    const allCommandsFinished = await this.executeCommands(profile);
+                    if (this.notifyMode && allCommandsFinished) {
+                        this.sendCompletionSignal();
+                    }
                 }
             }
             
@@ -728,7 +731,7 @@ class ClipboardMonitor {
     }
 
     // Create background process script
-    createBackgroundScript(profileName, tagMode, shellPid, tty, sessionId, bgToken) {
+    createBackgroundScript(profileName, tagMode, shellPid, tty, sessionId, bgToken, notifyMode = false) {
         return `
 import { exec } from 'child_process';
 import { promisify } from 'util';
@@ -761,6 +764,7 @@ class BackgroundClipboardMonitor {
         this.trackerTty = '${tty || ''}';
         this.trackerSessionId = '${sessionId || ''}';
         this.lastTrackedDir = process.cwd();
+        this.notifyMode = ${notifyMode};
         
         this.logFile = path.join(os.tmpdir(), 'clipwait-bg-' + BG_TOKEN + '.log');
     }
@@ -1036,7 +1040,7 @@ class BackgroundClipboardMonitor {
     
     async executeCommands(profile) {
         if (!profile.commands || profile.commands.length === 0) {
-            return;
+            return true; // nothing to execute, considered finished
         }
         
         this.log('Executing ' + profile.commands.length + ' command(s)...');
@@ -1053,9 +1057,27 @@ class BackgroundClipboardMonitor {
                 this.log('  ✓ Command completed successfully');
             } catch (error) {
                 this.log('  ✗ Command failed: ' + error.message);
-                break;
+                return false; // did not finish all commands
             }
         }
+        return true; // all commands executed
+    }
+    
+    sendCompletionSignal() {
+        // Send a bell character to the tracked terminal to notify user
+        if (this.trackerTty) {
+            try {
+                const ttyDevice = '/dev/' + this.trackerTty;
+                execSync('printf "\\a" > ' + ttyDevice);
+                this.log('🔔 Notification signal sent to terminal ' + ttyDevice);
+            } catch (error) {
+                this.log('⚠ Could not send notification signal: ' + error.message);
+            }
+        } else {
+            this.log('🔔 No terminal TTY to send notification signal.');
+        }
+        // Also log a clear message
+        this.log('✅ All profile commands have been executed successfully.');
     }
     
     async checkClipboard() {
@@ -1090,7 +1112,10 @@ class BackgroundClipboardMonitor {
             if (writeSuccess && this.config.activeProfile) {
                 const profile = this.config.profiles[this.config.activeProfile];
                 if (profile) {
-                    await this.executeCommands(profile);
+                    const allCommandsFinished = await this.executeCommands(profile);
+                    if (this.notifyMode && allCommandsFinished) {
+                        this.sendCompletionSignal();
+                    }
                 }
             }
         }
@@ -1337,7 +1362,7 @@ monitor.start().catch(error => {
         SyPM.log(target.sypmId);
     }
 
-    async startBackgroundMode(profileName) {
+    async startBackgroundMode(profileName, notifyMode = false) {
         console.log('🚀 Starting ClipWait in background mode with terminal tracking...');
         
         // Capture terminal info before backgrounding
@@ -1355,6 +1380,9 @@ monitor.start().catch(error => {
         console.log(`✓ TTY: ${info.tty || 'unknown'}`);
         console.log(`✓ Session ID: ${info.sessionId || 'unknown'}`);
         console.log(`✓ Current directory: ${this.currentRoot}`);
+        if (notifyMode) {
+            console.log('🔔 Notification mode enabled: will send terminal signal when commands finish.');
+        }
         
         // Generate unique token for this background process
         const bgToken = `bg_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
@@ -1367,7 +1395,8 @@ monitor.start().catch(error => {
             info.shellPid,
             info.tty,
             info.sessionId,
-            bgToken
+            bgToken,
+            notifyMode
         );
         
         // Write background script to temp file
@@ -1438,6 +1467,7 @@ monitor.start().catch(error => {
         let tagMode = false;
         let bgModeRequested = false;
         let statusMode = false;
+        let notifyMode = false;
         let argProfile = null;
         
         // Parse arguments in any order
@@ -1449,6 +1479,8 @@ monitor.start().catch(error => {
                 bgModeRequested = true;
             } else if (arg === '--status') {
                 statusMode = true;
+            } else if (arg === '--notify') {
+                notifyMode = true;
             } else {
                 remainingArgs.push(arg);
             }
@@ -1493,7 +1525,7 @@ monitor.start().catch(error => {
                 return;
             }
             
-            await this.startBackgroundMode(argProfile);
+            await this.startBackgroundMode(argProfile, notifyMode);
             this.rl.close();
             return;
         }
