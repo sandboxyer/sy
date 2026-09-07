@@ -654,6 +654,7 @@ class ClipboardMonitor {
         }
         
         await this.ensureDirectoryExists();
+        // Skip initial clipboard content - only process changes after monitoring starts
         this.lastClipboardContent = await this.getClipboardContent();
         this.isMonitoring = true;
         this.isPaused = false;
@@ -666,6 +667,7 @@ class ClipboardMonitor {
         console.log(`Active profile: ${this.config.activeProfile}`);
         console.log(`Output file: ${this.outputPath}`);
         console.log(`Commands to execute: ${activeProfile.commands.length}`);
+        console.log('ℹ️  Current clipboard content will be ignored - waiting for new changes...');
         if (this.tagRestrictMode) {
             console.log('🔒 TAG RESTRICT MODE: Only content with CODEREPLACER tags will be processed');
             console.log('   (Struct generator instructions will be ignored)');
@@ -1116,6 +1118,10 @@ class BackgroundClipboardMonitor {
             return;
         }
         
+        // Skip initial clipboard content - only process changes after monitoring starts
+        this.lastClipboardContent = await this.getClipboardContent();
+        this.log('ℹ️  Current clipboard content will be ignored - waiting for new changes...');
+        
         while (this.isMonitoring) {
             await this.checkClipboard();
             await new Promise(resolve => setTimeout(resolve, this.config.interval));
@@ -1429,33 +1435,44 @@ monitor.start().catch(error => {
         await this.loadOrCreateConfig();
         
         const args = process.argv.slice(2);
-        const tagIndex = args.indexOf('--tag');
-        const bgIndex = args.indexOf('--bg');
-        const statusIndex = args.indexOf('--status');
+        let tagMode = false;
+        let bgModeRequested = false;
+        let statusMode = false;
         let argProfile = null;
         
-        if (statusIndex !== -1) {
-            args.splice(statusIndex, 1);
+        // Parse arguments in any order
+        const remainingArgs = [];
+        for (const arg of args) {
+            if (arg === '--tag') {
+                tagMode = true;
+            } else if (arg === '--bg') {
+                bgModeRequested = true;
+            } else if (arg === '--status') {
+                statusMode = true;
+            } else {
+                remainingArgs.push(arg);
+            }
+        }
+        
+        if (statusMode) {
             await this.showStatusForCurrentSession();
             this.rl.close();
             return;
         }
         
-        if (tagIndex !== -1) {
+        if (tagMode) {
             this.tagRestrictMode = true;
             console.log('🔒 Tag Restrict Mode enabled: Only content with CODEREPLACER tags will be processed.');
             console.log('   Struct generator instructions will be automatically filtered out.');
-            args.splice(tagIndex, 1);
         }
         
-        if (bgIndex !== -1) {
+        if (bgModeRequested) {
             this.bgMode = true;
             console.log('🔍 Background Mode enabled.');
-            args.splice(bgIndex, 1);
         }
         
-        if (args.length > 0) {
-            argProfile = args[0];
+        if (remainingArgs.length > 0) {
+            argProfile = remainingArgs[0];
         }
         
         // If background mode is enabled and no profile specified, open manager
