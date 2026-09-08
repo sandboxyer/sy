@@ -5699,6 +5699,8 @@ this.JSON = async (id, config = {}) => {
   const configPanelOpenKey = `${storageKey}_configPanelOpen`;
   const lastSearchQueryKey = `${storageKey}_lastSearchQuery`;
   const saveOnlyKey = `${storageKey}_saveOnly`;
+  const tokenSearchKey = `${storageKey}_tokenSearch`;
+  const debugKey = `${storageKey}_debug`;
 
   // Search configuration with defaults
   let searchConfig = {
@@ -5721,6 +5723,9 @@ this.JSON = async (id, config = {}) => {
 
   // Load save-only toggle state
   let saveOnly = this.Storages.Get(id, saveOnlyKey) || false;
+  // Load token search and debug toggles
+  let tokenSearch = this.Storages.Get(id, tokenSearchKey) || false;
+  let debugOutput = this.Storages.Get(id, debugKey) || false;
 
   if (!this.Storages.Has(id, storageKey)) {
     this.Storages.Set(id, storageKey, {
@@ -5750,6 +5755,8 @@ this.JSON = async (id, config = {}) => {
   const updateValueWeightProp = `${storageKey}_updateValueWeight`;
   const updateMinSimilarityProp = `${storageKey}_updateMinSimilarity`;
   const toggleSaveOnlyProp = `${storageKey}_toggleSaveOnly`;
+  const toggleTokenSearchProp = `${storageKey}_toggleTokenSearch`;
+  const toggleDebugProp = `${storageKey}_toggleDebug`;
   const recentLoadProp = `${storageKey}_loadRecent`;
   const returnProp = `${storageKey}_return`;
   const updateRecentTimeWindowProp = `${storageKey}_updateRecentTimeWindow`;
@@ -5936,6 +5943,24 @@ this.JSON = async (id, config = {}) => {
     this.Storages.Set(id, saveOnlyKey, saveOnly);
     delete currentProps[toggleSaveOnlyProp];
   }
+
+  // Handle token search toggle
+  if (currentProps[toggleTokenSearchProp]) {
+    tokenSearch = !tokenSearch;
+    this.Storages.Set(id, tokenSearchKey, tokenSearch);
+    // Reset search results when toggling search engine
+    this.Pagination.Reset(id, `${storageKey}_searchResults`);
+    this.Pagination.Reset(id, `${storageKey}_searchNav`);
+    this.Storages.Set(id, lastSearchQueryKey, '');
+    delete currentProps[toggleTokenSearchProp];
+  }
+
+  // Handle debug toggle
+  if (currentProps[toggleDebugProp]) {
+    debugOutput = !debugOutput;
+    this.Storages.Set(id, debugKey, debugOutput);
+    delete currentProps[toggleDebugProp];
+  }
   // ------------------------------------------------------------------
   // CRITICAL: Check for search change from field storage
   // ------------------------------------------------------------------
@@ -5955,14 +5980,22 @@ this.JSON = async (id, config = {}) => {
     const searchQueryChanged = lastSearchQuery !== storage.searchQuery;
   
     if (storage.searchQuery && storage.searchQuery.trim()) {
-      // Perform search with weighted similarity
+      // Perform search with selected engine
       const searchIndex = this.Storages.Get(id, searchIndexKey);
-      storage.searchResults = weightedSearchJSON(
-        storage.data, 
-        storage.searchQuery.trim(),
-        searchIndex,
-        searchConfig
-      );
+      if (tokenSearch) {
+        storage.searchResults = tokenSearchJSON(
+          storage.data, 
+          storage.searchQuery.trim(),
+          searchIndex
+        );
+      } else {
+        storage.searchResults = weightedSearchJSON(
+          storage.data, 
+          storage.searchQuery.trim(),
+          searchIndex,
+          searchConfig
+        );
+      }
       storage.searchPath = [];
       
       // Only reset pagination if the search query actually changed
@@ -6092,6 +6125,18 @@ this.JSON = async (id, config = {}) => {
       }
     }
   });
+  // Token search toggle
+  this.Button(id, {
+    name: tokenSearch ? '🔤 Token Search: ON' : '🔤 Token Search: OFF',
+    props: { [toggleTokenSearchProp]: true }
+  });
+
+  // Debug output toggle
+  this.Button(id, {
+    name: debugOutput ? '🐞 Debug Output: ON' : '🐞 Debug Output: OFF',
+    props: { [toggleDebugProp]: true }
+  });
+
   // Mode toggle button
   const modeEmoji = {
     'key': '🔑',
@@ -6829,6 +6874,79 @@ function weightedSearchJSON(data, query, searchIndex, searchConfig = {}) {
   results.sort((a, b) => b.similarity - a.similarity);
 
   // Limit to top 100 results for performance
+  return results.slice(0, 100);
+}
+
+// ----------------------------------------------------------------------
+// Tokenize text: remove JSON markers and split into tokens
+// ----------------------------------------------------------------------
+function tokenize(text) {
+  if (!text) return [];
+  return text.toLowerCase()
+    .replace(/[{}[\]",:]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(t => t.length > 0);
+}
+
+// ----------------------------------------------------------------------
+// Token-based search: compute similarity based on token incidence
+// ----------------------------------------------------------------------
+function tokenSearchJSON(data, query, searchIndex) {
+  if (!searchIndex) {
+    searchIndex = buildSearchIndex(data);
+  }
+
+  const queryTokens = tokenize(query);
+  if (queryTokens.length === 0) return [];
+
+  const results = [];
+
+  for (const item of searchIndex) {
+    const docTokens = tokenize(item.fullText || item.value || item.key || '');
+    if (docTokens.length === 0) continue;
+
+    const occurrences = [];
+    let totalIncidence = 0;
+    let tokensFound = 0;
+
+    for (const qToken of queryTokens) {
+      let found = false;
+      for (let i = 0; i < docTokens.length; i++) {
+        if (docTokens[i] === qToken) {
+          found = true;
+          totalIncidence++;
+          const start = Math.max(0, i - 3);
+          const end = Math.min(docTokens.length, i + 4);
+          const before = docTokens.slice(start, i).join(' ');
+          const matched = docTokens[i];
+          const after = docTokens.slice(i + 1, end).join(' ');
+          occurrences.push({ before, matched, after, position: i });
+        }
+      }
+      if (found) tokensFound++;
+    }
+
+    if (totalIncidence === 0) continue;
+
+    const coverage = tokensFound / queryTokens.length;
+    const frequency = totalIncidence / docTokens.length;
+    const similarity = coverage * 0.7 + frequency * 0.3;
+
+    results.push({
+      path: item.path,
+      key: item.path.split('.').pop() || 'root',
+      value: item.fullValue !== undefined ? item.fullValue : item.value,
+      type: item.type,
+      similarity: similarity,
+      matchType: 'token',
+      incidences: totalIncidence,
+      contexts: occurrences.slice(0, 10) // limit to 10 contexts
+    });
+  }
+
+  results.sort((a, b) => b.similarity - a.similarity);
   return results.slice(0, 100);
 }
 
