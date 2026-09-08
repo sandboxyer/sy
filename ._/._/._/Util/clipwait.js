@@ -20,7 +20,6 @@ class ClipboardMonitor {
         this.tagRestrictMode = false;
         this.config = {
             profiles: {},
-            activeProfile: null,
             interval: 1000
         };
         this.rl = readline.createInterface({
@@ -88,6 +87,7 @@ class ClipboardMonitor {
             await this.ensureConfigDirectory();
             const configData = await fs.readFile(this.configPath, 'utf8');
             this.config = { ...this.config, ...JSON.parse(configData) };
+            delete this.config.activeProfile; // Remove legacy activeProfile
             console.log(`✓ Configuration loaded from ${this.configPath}`);
         } catch (error) {
             if (error.code === 'ENOENT') {
@@ -418,9 +418,9 @@ class ClipboardMonitor {
             this.currentRoot = newRepoRoot;
             
             // Update output path
-            if (this.config.activeProfile && this.config.profiles[this.config.activeProfile]) {
-                const profile = this.config.profiles[this.config.activeProfile];
-                const outputFile = profile.outputFile || this.config.activeProfile;
+            if (this.currentProfileName && this.config.profiles[this.currentProfileName]) {
+                const profile = this.config.profiles[this.currentProfileName];
+                const outputFile = profile.outputFile || this.currentProfileName;
                 this.outputPath = path.join(newRepoRoot, outputFile);
                 console.log(`   Output file path updated to: ${this.outputPath}`);
                 await this.ensureDirectoryExists();
@@ -470,8 +470,8 @@ class ClipboardMonitor {
 
             const writeSuccess = await this.writeToFile(currentContent);
             
-            if (writeSuccess && this.config.activeProfile) {
-                const profile = this.config.profiles[this.config.activeProfile];
+            if (writeSuccess && this.currentProfileName) {
+                const profile = this.config.profiles[this.currentProfileName];
                 if (profile) {
                     const allCommandsFinished = await this.executeCommands(profile);
                     if (this.notifyMode && allCommandsFinished) {
@@ -495,8 +495,7 @@ class ClipboardMonitor {
         }
         profiles.forEach((name, index) => {
             const profile = this.config.profiles[name];
-            const isActive = name === this.config.activeProfile ? ' [ACTIVE]' : '';
-            console.log(`\n${index + 1}. ${name}${isActive}`);
+            console.log(`\n${index + 1}. ${name}`);
             console.log(`   Output file: ${profile.outputFile || name}`);
             console.log(`   Commands: ${profile.commands.length}`);
             const defaultFlags = [];
@@ -543,10 +542,6 @@ class ClipboardMonitor {
             defaultNotify
         };
         
-        if (!this.config.activeProfile) {
-            this.config.activeProfile = name;
-        }
-        
         await this.saveConfig();
         console.log(`✓ Profile "${name}" added successfully.`);
     }
@@ -590,26 +585,17 @@ class ClipboardMonitor {
             console.log(`  ${index + 1}. ${cmd}`);
         });
         
-        const editChoice = await this.question('Edit commands? (r=replace all, a=append to end, n=no): ');
-        if (editChoice.toLowerCase() === 'r') {
-            const commands = [];
+        const addCommands = await this.question('Do you want to add commands after the existing ones? (y/n): ');
+        if (addCommands.toLowerCase() === 'y') {
+            const newCommands = [];
             console.log('Enter new commands (one per line, empty line to finish):');
             while (true) {
-                const command = await this.question(`Command ${commands.length + 1}: `);
+                const command = await this.question(`New command ${newCommands.length + 1}: `);
                 if (!command) break;
-                commands.push(command);
+                newCommands.push(command);
             }
-            this.config.profiles[name].commands = commands;
-        } else if (editChoice.toLowerCase() === 'a') {
-            console.log('Appending commands to existing list:');
-            console.log('Enter additional commands (one per line, empty line to finish):');
-            while (true) {
-                const command = await this.question(`Command ${this.config.profiles[name].commands.length + 1}: `);
-                if (!command) break;
-                this.config.profiles[name].commands.push(command);
-            }
-        } else {
-            console.log('Commands unchanged.');
+            this.config.profiles[name].commands = this.config.profiles[name].commands.concat(newCommands);
+            console.log(`✓ ${newCommands.length} command(s) appended.`);
         }
         
         await this.saveConfig();
@@ -628,9 +614,6 @@ class ClipboardMonitor {
         const confirm = await this.question(`Are you sure you want to delete profile "${name}"? (y/n): `);
         if (confirm.toLowerCase() === 'y') {
             delete this.config.profiles[name];
-            if (this.config.activeProfile === name) {
-                this.config.activeProfile = Object.keys(this.config.profiles)[0] || null;
-            }
             await this.saveConfig();
             console.log(`✓ Profile "${name}" deleted successfully.`);
         }
@@ -638,51 +621,27 @@ class ClipboardMonitor {
 
     async duplicateProfile() {
         await this.showProfiles();
-        const sourceName = await this.question('\nProfile name to duplicate: ');
-        
+        const sourceName = await this.question('\nSource profile name to duplicate: ');
         if (!this.config.profiles[sourceName]) {
             console.log('Source profile not found.');
             return;
         }
-        
         const newName = await this.question('New profile name: ');
         if (!newName || this.config.profiles[newName]) {
-            console.log('Invalid or duplicate profile name.');
+            console.log('Invalid or duplicate new profile name.');
             return;
         }
-        
-        // Deep copy the profile object to avoid sharing references
+        // Deep copy the source profile
         const sourceProfile = this.config.profiles[sourceName];
-        const newProfile = {
+        this.config.profiles[newName] = {
             outputFile: sourceProfile.outputFile,
             commands: [...sourceProfile.commands],
             defaultBg: sourceProfile.defaultBg,
             defaultTag: sourceProfile.defaultTag,
             defaultNotify: sourceProfile.defaultNotify
         };
-        
-        this.config.profiles[newName] = newProfile;
-        
-        if (!this.config.activeProfile) {
-            this.config.activeProfile = newName;
-        }
-        
         await this.saveConfig();
-        console.log(`✓ Profile "${newName}" duplicated from "${sourceName}" successfully.`);
-    }
-
-    async setActiveProfile() {
-        await this.showProfiles();
-        const name = await this.question('\nProfile name to set as active: ');
-        
-        if (!this.config.profiles[name]) {
-            console.log('Profile not found.');
-            return;
-        }
-        
-        this.config.activeProfile = name;
-        await this.saveConfig();
-        console.log(`✓ Active profile set to "${name}".`);
+        console.log(`✓ Profile "${sourceName}" duplicated as "${newName}".`);
     }
 
     async manageProfiles() {
@@ -693,10 +652,9 @@ class ClipboardMonitor {
             console.log('1. Show profiles');
             console.log('2. Add new profile');
             console.log('3. Edit profile');
-            console.log('4. Delete profile');
-            console.log('5. Set active profile');
-            console.log('6. Duplicate profile');
-            console.log('7. Back to main menu');
+            console.log('4. Duplicate profile');
+            console.log('5. Delete profile');
+            console.log('6. Back to main menu');
             
             const choice = await this.question('\nSelect option: ');
             
@@ -711,15 +669,12 @@ class ClipboardMonitor {
                     await this.editProfile();
                     break;
                 case '4':
-                    await this.deleteProfile();
-                    break;
-                case '5':
-                    await this.setActiveProfile();
-                    break;
-                case '6':
                     await this.duplicateProfile();
                     break;
-                case '7':
+                case '5':
+                    await this.deleteProfile();
+                    break;
+                case '6':
                     return;
                 default:
                     console.log('Invalid option.');
@@ -739,19 +694,11 @@ class ClipboardMonitor {
     async startMonitoring(profileName, isBackground = false) {
         this.isBackgroundProcess = isBackground;
         
-        if (profileName) {
-            if (this.config.profiles[profileName]) {
-                this.config.activeProfile = profileName;
-                this.outputPath = path.join(this.currentRoot, this.config.profiles[profileName].outputFile || profileName);
-                await this.saveConfig();
-            } else {
-                console.error(`✗ Profile "${profileName}" not found.`);
-                return false;
-            }
-        } else if (this.config.activeProfile && this.config.profiles[this.config.activeProfile]) {
-            this.outputPath = path.join(this.currentRoot, this.config.profiles[this.config.activeProfile].outputFile || this.config.activeProfile);
+        if (profileName && this.config.profiles[profileName]) {
+            this.currentProfileName = profileName;
+            this.outputPath = path.join(this.currentRoot, this.config.profiles[profileName].outputFile || profileName);
         } else {
-            console.log('No active profile set. Please configure profiles first.');
+            console.error(`✗ Profile "${profileName}" not found.`);
             return false;
         }
         
@@ -761,12 +708,12 @@ class ClipboardMonitor {
         this.isMonitoring = true;
         this.isPaused = false;
         
-        const activeProfile = this.config.profiles[this.config.activeProfile];
+        const activeProfile = this.config.profiles[this.currentProfileName];
         
         console.log('\n' + '='.repeat(60));
         console.log('Clipboard Monitor Started');
         console.log('='.repeat(60));
-        console.log(`Active profile: ${this.config.activeProfile}`);
+        console.log(`Active profile: ${this.currentProfileName}`);
         console.log(`Output file: ${this.outputPath}`);
         console.log(`Commands to execute: ${activeProfile.commands.length}`);
         console.log('ℹ️  Current clipboard content will be ignored - waiting for new changes...');
@@ -854,7 +801,6 @@ class BackgroundClipboardMonitor {
         this.tagRestrictMode = ${tagMode};
         this.config = {
             profiles: {},
-            activeProfile: null,
             interval: 1000
         };
         this.originalRoot = process.cwd();
@@ -864,6 +810,7 @@ class BackgroundClipboardMonitor {
         this.trackerSessionId = '${sessionId || ''}';
         this.lastTrackedDir = process.cwd();
         this.notifyMode = ${notifyMode};
+        this.profileName = '${profileName || ''}';
         
         this.logFile = path.join(os.homedir(), '.clipboard-monitor', 'clipwait-bg-' + BG_TOKEN + '.log');
     }
@@ -884,6 +831,7 @@ class BackgroundClipboardMonitor {
         try {
             const configData = await fs.readFile(this.configPath, 'utf8');
             this.config = { ...this.config, ...JSON.parse(configData) };
+            delete this.config.activeProfile; // Remove legacy activeProfile
             this.log('✓ Configuration loaded');
         } catch (error) {
             this.log('✗ Error loading config: ' + error.message);
@@ -1126,9 +1074,9 @@ class BackgroundClipboardMonitor {
             
             this.currentRoot = newRepoRoot;
             
-            if (this.config.activeProfile && this.config.profiles[this.config.activeProfile]) {
-                const profile = this.config.profiles[this.config.activeProfile];
-                const outputFile = profile.outputFile || this.config.activeProfile;
+            if (this.profileName && this.config.profiles[this.profileName]) {
+                const profile = this.config.profiles[this.profileName];
+                const outputFile = profile.outputFile || this.profileName;
                 this.outputPath = path.join(newRepoRoot, outputFile);
                 this.log('   Output file path updated to: ' + this.outputPath);
             }
@@ -1208,8 +1156,8 @@ class BackgroundClipboardMonitor {
             
             const writeSuccess = await this.writeToFile(currentContent);
             
-            if (writeSuccess && this.config.activeProfile) {
-                const profile = this.config.profiles[this.config.activeProfile];
+            if (writeSuccess && this.profileName) {
+                const profile = this.config.profiles[this.profileName];
                 if (profile) {
                     const allCommandsFinished = await this.executeCommands(profile);
                     if (this.notifyMode && allCommandsFinished) {
@@ -1232,13 +1180,13 @@ class BackgroundClipboardMonitor {
         
         await this.loadConfig();
         
-        if (this.config.activeProfile && this.config.profiles[this.config.activeProfile]) {
-            const profile = this.config.profiles[this.config.activeProfile];
-            const outputFile = profile.outputFile || this.config.activeProfile;
+        if (this.profileName && this.config.profiles[this.profileName]) {
+            const profile = this.config.profiles[this.profileName];
+            const outputFile = profile.outputFile || this.profileName;
             this.outputPath = path.join(this.currentRoot, outputFile);
             this.log('   Output file: ' + this.outputPath);
         } else {
-            this.log('✗ No active profile configured');
+            this.log('✗ No profile specified or profile not found');
             return;
         }
         
@@ -1520,7 +1468,7 @@ monitor.start().catch(error => {
                 bgToken: bgToken,
                 sypmId: processInfo.id,
                 name: processName,
-                profile: profileName || this.config.activeProfile,
+                profile: profileName,
                 shellPid: info.shellPid,
                 tty: info.tty,
                 sessionId: info.sessionId,
@@ -1632,10 +1580,6 @@ monitor.start().catch(error => {
                 console.error(`✗ Profile "${argProfile}" not found.`);
                 return;
             }
-            if (!argProfile && !this.config.activeProfile) {
-                console.error('✗ No active profile set. Please configure profiles first.');
-                return;
-            }
             
             await this.startBackgroundMode(argProfile, notifyMode);
             this.rl.close();
@@ -1665,17 +1609,12 @@ monitor.start().catch(error => {
             
             switch (choice) {
                 case '1':
-                    if (this.config.activeProfile && this.config.profiles[this.config.activeProfile]) {
-                        await this.startMonitoring();
+                    await this.showProfiles();
+                    const profileName = await this.question('\nEnter profile name to start: ');
+                    if (this.config.profiles[profileName]) {
+                        await this.startMonitoring(profileName);
                     } else {
-                        console.log('No active profile. Please set a profile first.');
-                        await this.showProfiles();
-                        const profileName = await this.question('\nEnter profile name to start: ');
-                        if (this.config.profiles[profileName]) {
-                            await this.startMonitoring(profileName);
-                        } else {
-                            console.log('Profile not found.');
-                        }
+                        console.log('Profile not found.');
                     }
                     break;
                 case '2':
