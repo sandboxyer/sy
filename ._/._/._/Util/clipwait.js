@@ -590,8 +590,8 @@ class ClipboardMonitor {
             console.log(`  ${index + 1}. ${cmd}`);
         });
         
-        const editCommands = await this.question('Do you want to edit commands? (y/n): ');
-        if (editCommands.toLowerCase() === 'y') {
+        const editChoice = await this.question('Edit commands? (r=replace all, a=append to end, n=no): ');
+        if (editChoice.toLowerCase() === 'r') {
             const commands = [];
             console.log('Enter new commands (one per line, empty line to finish):');
             while (true) {
@@ -600,6 +600,16 @@ class ClipboardMonitor {
                 commands.push(command);
             }
             this.config.profiles[name].commands = commands;
+        } else if (editChoice.toLowerCase() === 'a') {
+            console.log('Appending commands to existing list:');
+            console.log('Enter additional commands (one per line, empty line to finish):');
+            while (true) {
+                const command = await this.question(`Command ${this.config.profiles[name].commands.length + 1}: `);
+                if (!command) break;
+                this.config.profiles[name].commands.push(command);
+            }
+        } else {
+            console.log('Commands unchanged.');
         }
         
         await this.saveConfig();
@@ -626,6 +636,41 @@ class ClipboardMonitor {
         }
     }
 
+    async duplicateProfile() {
+        await this.showProfiles();
+        const sourceName = await this.question('\nProfile name to duplicate: ');
+        
+        if (!this.config.profiles[sourceName]) {
+            console.log('Source profile not found.');
+            return;
+        }
+        
+        const newName = await this.question('New profile name: ');
+        if (!newName || this.config.profiles[newName]) {
+            console.log('Invalid or duplicate profile name.');
+            return;
+        }
+        
+        // Deep copy the profile object to avoid sharing references
+        const sourceProfile = this.config.profiles[sourceName];
+        const newProfile = {
+            outputFile: sourceProfile.outputFile,
+            commands: [...sourceProfile.commands],
+            defaultBg: sourceProfile.defaultBg,
+            defaultTag: sourceProfile.defaultTag,
+            defaultNotify: sourceProfile.defaultNotify
+        };
+        
+        this.config.profiles[newName] = newProfile;
+        
+        if (!this.config.activeProfile) {
+            this.config.activeProfile = newName;
+        }
+        
+        await this.saveConfig();
+        console.log(`✓ Profile "${newName}" duplicated from "${sourceName}" successfully.`);
+    }
+
     async setActiveProfile() {
         await this.showProfiles();
         const name = await this.question('\nProfile name to set as active: ');
@@ -650,7 +695,8 @@ class ClipboardMonitor {
             console.log('3. Edit profile');
             console.log('4. Delete profile');
             console.log('5. Set active profile');
-            console.log('6. Back to main menu');
+            console.log('6. Duplicate profile');
+            console.log('7. Back to main menu');
             
             const choice = await this.question('\nSelect option: ');
             
@@ -671,6 +717,9 @@ class ClipboardMonitor {
                     await this.setActiveProfile();
                     break;
                 case '6':
+                    await this.duplicateProfile();
+                    break;
+                case '7':
                     return;
                 default:
                     console.log('Invalid option.');
