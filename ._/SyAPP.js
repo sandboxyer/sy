@@ -5750,6 +5750,9 @@ this.JSON = async (id, config = {}) => {
   const updateValueWeightProp = `${storageKey}_updateValueWeight`;
   const updateMinSimilarityProp = `${storageKey}_updateMinSimilarity`;
   const toggleSaveOnlyProp = `${storageKey}_toggleSaveOnly`;
+  const recentLoadProp = `${storageKey}_loadRecent`;
+  const returnProp = `${storageKey}_return`;
+  const updateRecentTimeWindowProp = `${storageKey}_updateRecentTimeWindow`;
 
   if (currentProps[backProp]) {
     if (storage.searchResults) {
@@ -5779,6 +5782,7 @@ this.JSON = async (id, config = {}) => {
     storage.searchPath = [];
     storage.filePath = null;
     storage.searchQuery = '';
+    storage.historyStack = [];
     this.FileManager.ClearSelection(id, filePickerName);
     this.Storages.Delete(id, searchFieldName);
     this.Storages.Delete(id, searchIndexKey);
@@ -5793,6 +5797,68 @@ this.JSON = async (id, config = {}) => {
     this.Storages.Delete(id, searchFieldName);
     this.Storages.Set(id, lastSearchQueryKey, '');
     delete currentProps[clearSearchProp];
+  }
+
+  if (currentProps[recentLoadProp]) {
+    const newPath = currentProps[recentLoadProp];
+    delete currentProps[recentLoadProp];
+    if (storage.data !== null && storage.filePath) {
+      if (!storage.historyStack) storage.historyStack = [];
+      storage.historyStack.push(storage.filePath);
+    }
+    try {
+      const content = fs.readFileSync(newPath, 'utf8');
+      const data = JSON.parse(content);
+      storage.data = data;
+      storage.filePath = newPath;
+      storage.path = [];
+      storage.searchResults = null;
+      storage.searchPath = [];
+      storage.searchQuery = '';
+      this.Storages.Delete(id, searchFieldName);
+      this.Storages.Set(id, lastSearchQueryKey, '');
+      const searchIndex = buildSearchIndex(data);
+      this.Storages.Set(id, searchIndexKey, searchIndex);
+      this.Storages.Set(id, storageKey, storage);
+      this.Alert(id, `✅ Loaded: ${path.basename(newPath)} (${searchIndex.length} searchable items)`, { duration: 2000 });
+    } catch (err) {
+      this.Alert(id, `❌ Error loading JSON: ${err.message}`, { duration: 5000 });
+    }
+  }
+
+  if (currentProps[returnProp]) {
+    delete currentProps[returnProp];
+    if (storage.historyStack && storage.historyStack.length > 0) {
+      const prevPath = storage.historyStack.pop();
+      try {
+        const content = fs.readFileSync(prevPath, 'utf8');
+        const data = JSON.parse(content);
+        storage.data = data;
+        storage.filePath = prevPath;
+        storage.path = [];
+        storage.searchResults = null;
+        storage.searchPath = [];
+        storage.searchQuery = '';
+        this.Storages.Delete(id, searchFieldName);
+        this.Storages.Set(id, lastSearchQueryKey, '');
+        const searchIndex = buildSearchIndex(data);
+        this.Storages.Set(id, searchIndexKey, searchIndex);
+        this.Storages.Set(id, storageKey, storage);
+        this.Alert(id, `↩️ Returned to: ${path.basename(prevPath)}`, { duration: 2000 });
+      } catch (err) {
+        this.Alert(id, `❌ Error returning: ${err.message}`, { duration: 5000 });
+      }
+    } else {
+      this.Alert(id, 'No previous JSON to return to', { duration: 2000 });
+    }
+  }
+
+  if (currentProps[updateRecentTimeWindowProp] !== undefined && currentProps[updateRecentTimeWindowProp] !== null) {
+    const newWindow = parseFloat(currentProps[updateRecentTimeWindowProp]);
+    if (!isNaN(newWindow) && newWindow > 0) {
+      this.Storages.Set(id, `${storageKey}_recentTimeWindow`, newWindow);
+    }
+    delete currentProps[updateRecentTimeWindowProp];
   }
 
   // Handle direct search mode selection
@@ -5931,6 +5997,13 @@ this.JSON = async (id, config = {}) => {
         const data = JSON.parse(content);
         storage.data = data;
         storage.filePath = filePath;
+        storage.path = [];
+        storage.searchResults = null;
+        storage.searchPath = [];
+        storage.searchQuery = '';
+        storage.historyStack = [];
+        this.Storages.Delete(id, searchFieldName);
+        this.Storages.Set(id, lastSearchQueryKey, '');
 
         const searchIndex = buildSearchIndex(data);
         this.Storages.Set(id, searchIndexKey, searchIndex);
@@ -6193,6 +6266,36 @@ this.JSON = async (id, config = {}) => {
       props: { [toggleSaveOnlyProp]: true }
     });
     this.Text(id, ' ');
+
+    // Recent Files Time Window
+    this.Text(id, `${this.TextColor.brightCyan('Recent Files Time Window:')}`);
+    const recentTimeWindow = this.Storages.Get(id, `${storageKey}_recentTimeWindow`) || 10;
+    this.Field(id, `${storageKey}_recentTimeWindowField`, {
+      label: '⏱️ Minutes',
+      initialValue: recentTimeWindow.toString(),
+      maxWidth: 4,
+      onChange: (value) => {
+        const minutes = parseFloat(value);
+        if (!isNaN(minutes) && minutes > 0) {
+          self.Storages.Set(id, `${storageKey}_recentTimeWindow`, minutes);
+          const build = self.Builds.get(id);
+          if (build && build.Session) {
+            if (!build.Session.ActualProps) {
+              build.Session.ActualProps = {};
+            }
+            build.Session.ActualProps[updateRecentTimeWindowProp] = minutes;
+          }
+        }
+      }
+    });
+    this.Buttons(id, [
+      { name: '5 min', props: { [updateRecentTimeWindowProp]: 5 } },
+      { name: '10 min', props: { [updateRecentTimeWindowProp]: 10 } },
+      { name: '30 min', props: { [updateRecentTimeWindowProp]: 30 } },
+      { name: '1 h', props: { [updateRecentTimeWindowProp]: 60 } },
+      { name: '2 h', props: { [updateRecentTimeWindowProp]: 120 } }
+    ]);
+    this.Text(id, ' ');
   }
 
   this.Text(id, ' ');
@@ -6254,6 +6357,40 @@ this.JSON = async (id, config = {}) => {
       return `Object(${keys.length} keys)`;
     }
     return abbreviateText(value, maxLength);
+  };
+
+  const formatFileSize = (bytes) => {
+    if (bytes < 1024) return bytes + ' B';
+    else if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    else if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    else return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+  };
+
+  const formatBrazilianTime = (timestamp) => {
+    return new Date(timestamp).toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour12: false });
+  };
+
+  const abbreviateFileName = (fileName) => {
+    const base = path.basename(fileName, '.json');
+    if (base.length <= 6) return base;
+    return base.substring(0, 3) + '..' + base.substring(base.length - 3);
+  };
+
+  const getRecentJsonFiles = () => {
+    const dir = storage.filePath ? path.dirname(storage.filePath) : (config.startPath || process.cwd());
+    try {
+      const files = fs.readdirSync(dir, { withFileTypes: true })
+        .filter(dirent => dirent.isFile() && dirent.name.toLowerCase().endsWith('.json'))
+        .map(dirent => {
+          const fullPath = path.join(dir, dirent.name);
+          const stat = fs.statSync(fullPath);
+          return { name: dirent.name, filePath: fullPath, size: stat.size, mtime: stat.mtimeMs };
+        })
+        .sort((a, b) => b.mtime - a.mtime);
+      return files;
+    } catch (e) {
+      return [];
+    }
   };
 
   // ------------------------------------------------------------------
@@ -6468,6 +6605,28 @@ this.JSON = async (id, config = {}) => {
   }
 
   // ------------------------------------------------------------------
+  // Recent JSON files
+  // ------------------------------------------------------------------
+  if (storage.filePath) {
+    const currentFilePath = storage.filePath;
+    const recentTimeWindowMinutes = this.Storages.Get(id, `${storageKey}_recentTimeWindow`) || 10;
+    const windowMs = recentTimeWindowMinutes * 60 * 1000;
+    const now = Date.now();
+    const recentFiles = getRecentJsonFiles()
+      .filter(f => f.filePath !== currentFilePath)
+      .filter(f => (now - f.mtime) <= windowMs);
+    if (recentFiles.length > 0) {
+      this.Text(id, ' ');
+      this.Text(id, `${this.TextColor.brightCyan('🕒 Recent JSON Files')}`);
+      const recentButtons = recentFiles.map(file => ({
+        name: `${abbreviateFileName(file.filePath)} ${formatBrazilianTime(file.mtime)}`,
+        props: { [recentLoadProp]: file.filePath }
+      }));
+      this.Buttons(id, recentButtons);
+    }
+  }
+
+  // ------------------------------------------------------------------
   // Navigation buttons
   // ------------------------------------------------------------------
   this.Text(id, ' ');
@@ -6479,6 +6638,13 @@ this.JSON = async (id, config = {}) => {
     navButtons.push({
       name: `${this.TextColor.orange('⬆️ Back')}`,
       props: { [`${storageKey}_back`]: true }
+    });
+  }
+
+  if (storage.historyStack && storage.historyStack.length > 0) {
+    navButtons.push({
+      name: `${this.TextColor.orange('🔙 Return')}`,
+      props: { [returnProp]: true }
     });
   }
 
