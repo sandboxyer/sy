@@ -5698,6 +5698,7 @@ this.JSON = async (id, config = {}) => {
   const searchMinSimilarityKey = `${storageKey}_minSimilarity`;
   const configPanelOpenKey = `${storageKey}_configPanelOpen`;
   const lastSearchQueryKey = `${storageKey}_lastSearchQuery`;
+  const saveOnlyKey = `${storageKey}_saveOnly`;
 
   // Search configuration with defaults
   let searchConfig = {
@@ -5717,6 +5718,9 @@ this.JSON = async (id, config = {}) => {
   if (savedKeyWeight !== undefined && savedKeyWeight !== null) searchConfig.keyWeight = savedKeyWeight;
   if (savedValueWeight !== undefined && savedValueWeight !== null) searchConfig.valueWeight = savedValueWeight;
   if (savedMinSimilarity !== undefined && savedMinSimilarity !== null) searchConfig.minSimilarity = savedMinSimilarity;
+
+  // Load save-only toggle state
+  let saveOnly = this.Storages.Get(id, saveOnlyKey) || false;
 
   if (!this.Storages.Has(id, storageKey)) {
     this.Storages.Set(id, storageKey, {
@@ -5745,6 +5749,7 @@ this.JSON = async (id, config = {}) => {
   const updateKeyWeightProp = `${storageKey}_updateKeyWeight`;
   const updateValueWeightProp = `${storageKey}_updateValueWeight`;
   const updateMinSimilarityProp = `${storageKey}_updateMinSimilarity`;
+  const toggleSaveOnlyProp = `${storageKey}_toggleSaveOnly`;
 
   if (currentProps[backProp]) {
     if (storage.searchResults) {
@@ -5858,6 +5863,13 @@ this.JSON = async (id, config = {}) => {
     }
     delete currentProps[updateMinSimilarityProp];
   }
+
+  // Handle save-only toggle
+  if (currentProps[toggleSaveOnlyProp]) {
+    saveOnly = !saveOnly;
+    this.Storages.Set(id, saveOnlyKey, saveOnly);
+    delete currentProps[toggleSaveOnlyProp];
+  }
   // ------------------------------------------------------------------
   // CRITICAL: Check for search change from field storage
   // ------------------------------------------------------------------
@@ -5944,6 +5956,43 @@ this.JSON = async (id, config = {}) => {
       await this.File(id, fileConfig);
       this.Text(id, '👆 Use the file browser above to choose a JSON file.');
       return;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // SAVE-ONLY MODE: If enabled and search query exists, save results to file and clear search
+  // ------------------------------------------------------------------
+  if (saveOnly && storage.searchQuery && storage.searchQuery.trim()) {
+    try {
+      // Ensure we have a file path
+      if (storage.filePath) {
+        const originalDir = path.dirname(storage.filePath);
+        const originalBase = path.basename(storage.filePath, '.json');
+        const timestamp = Date.now();
+        const outputFileName = `${originalBase}_search_${timestamp}.json`;
+        const outputPath = path.join(originalDir, outputFileName);
+
+        // Write search results to file
+        fs.writeFileSync(outputPath, JSON.stringify(storage.searchResults, null, 2), 'utf8');
+
+        // Clear search state completely
+        storage.searchResults = null;
+        storage.searchPath = [];
+        storage.searchQuery = '';
+        this.Storages.Delete(id, searchFieldName);
+        this.Storages.Set(id, lastSearchQueryKey, '');
+        this.Pagination.Reset(id, `${storageKey}_searchResults`);
+        this.Pagination.Reset(id, `${storageKey}_searchNav`);
+        this.Storages.Set(id, storageKey, storage);
+
+        // Alert user
+        this.Alert(id, `💾 Saved search results to: ${path.basename(outputPath)}`, { duration: 4000 });
+      } else {
+        // No file loaded, should not happen
+        this.Alert(id, '❌ Cannot save search: no JSON file loaded', { duration: 3000 });
+      }
+    } catch (err) {
+      this.Alert(id, `❌ Error saving search results: ${err.message}`, { duration: 5000 });
     }
   }
 
@@ -6136,6 +6185,14 @@ this.JSON = async (id, config = {}) => {
         props: { [updateMinSimilarityProp]: 0.7 }
       }
     ]);
+
+    // Save-only toggle
+    this.Text(id, `${this.TextColor.brightCyan('Save-Only Mode:')}`);
+    this.Button(id, {
+      name: saveOnly ? '✅ Just save, don\'t show (ON)' : '⬜ Just save, don\'t show (OFF)',
+      props: { [toggleSaveOnlyProp]: true }
+    });
+    this.Text(id, ' ');
   }
 
   this.Text(id, ' ');
