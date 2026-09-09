@@ -310,6 +310,14 @@ async function askQuestion(query) {
 async function main() {
   const args = process.argv.slice(2);
   let inputFile;
+  let forceAll = false;
+
+  // Check for --all flag
+  const allFlagIndex = args.indexOf('--all');
+  if (allFlagIndex !== -1) {
+    forceAll = true;
+    args.splice(allFlagIndex, 1);
+  }
 
   if (args.length === 0) {
     // Look for default file(s): "result" or "result.txt"
@@ -325,7 +333,7 @@ async function main() {
       }
     }
     if (!found) {
-      console.error('Usage: node replace-codes.mjs <input-file>');
+      console.error('Usage: node replace-codes.mjs <input-file> [--all]');
       console.error('Or ensure a default file "result" or "result.txt" exists in the current directory.');
       process.exit(1);
     }
@@ -389,23 +397,28 @@ async function main() {
     console.log(`${i + 1}. [${lang}] ${rel}`);
   });
 
-  const answer = await askQuestion(
-    '\nEnter numbers to replace (comma-separated), "all" to replace all, or "q" to quit: '
-  );
-
-  if (answer.toLowerCase() === 'q') {
-    console.log('Exiting without changes.');
-    process.exit(0);
-  }
-
   let selectedIndices = [];
-  if (answer.toLowerCase() === 'all') {
+
+  if (forceAll) {
     selectedIndices = matches.map((_, i) => i);
   } else {
-    selectedIndices = answer
-      .split(',')
-      .map((s) => parseInt(s.trim(), 10) - 1)
-      .filter((i) => !isNaN(i) && i >= 0 && i < matches.length);
+    const answer = await askQuestion(
+      '\nEnter numbers to replace (comma-separated), "all" to replace all, or "q" to quit: '
+    );
+
+    if (answer.toLowerCase() === 'q') {
+      console.log('Exiting without changes.');
+      process.exit(0);
+    }
+
+    if (answer.toLowerCase() === 'all') {
+      selectedIndices = matches.map((_, i) => i);
+    } else {
+      selectedIndices = answer
+        .split(',')
+        .map((s) => parseInt(s.trim(), 10) - 1)
+        .filter((i) => !isNaN(i) && i >= 0 && i < matches.length);
+    }
   }
 
   for (const idx of selectedIndices) {
