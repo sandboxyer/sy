@@ -5683,6 +5683,15 @@ this.JSON = async (id, config = {}) => {
   // Capture 'this' context for use in callbacks
   const self = this;
 
+  // Helper to parse JSON or JSONL file content
+  const parseJsonOrJsonl = (filePath, content) => {
+    if (filePath.toLowerCase().endsWith('.jsonl')) {
+      const lines = content.split(/\r?\n/).filter(line => line.trim() !== '');
+      return lines.map(line => JSON.parse(line));
+    }
+    return JSON.parse(content);
+  };
+
   // ------------------------------------------------------------------
   // Setup storage & instance name
   // ------------------------------------------------------------------
@@ -5815,7 +5824,7 @@ this.JSON = async (id, config = {}) => {
     }
     try {
       const content = fs.readFileSync(newPath, 'utf8');
-      const data = JSON.parse(content);
+      const data = parseJsonOrJsonl(newPath, content);
       storage.data = data;
       storage.filePath = newPath;
       storage.path = [];
@@ -5839,7 +5848,7 @@ this.JSON = async (id, config = {}) => {
       const prevPath = storage.historyStack.pop();
       try {
         const content = fs.readFileSync(prevPath, 'utf8');
-        const data = JSON.parse(content);
+        const data = parseJsonOrJsonl(prevPath, content);
         storage.data = data;
         storage.filePath = prevPath;
         storage.path = [];
@@ -6027,7 +6036,7 @@ this.JSON = async (id, config = {}) => {
       const filePath = selected[0];
       try {
         const content = fs.readFileSync(filePath, 'utf8');
-        const data = JSON.parse(content);
+        const data = parseJsonOrJsonl(filePath, content);
         storage.data = data;
         storage.filePath = filePath;
         storage.path = [];
@@ -6053,7 +6062,8 @@ this.JSON = async (id, config = {}) => {
         multiple: false,
         filter: (itemPath, isDir) => {
           if (isDir) return true;
-          return itemPath.toLowerCase().endsWith('.json');
+          const lower = itemPath.toLowerCase();
+          return lower.endsWith('.json') || lower.endsWith('.jsonl');
         },
         startPath: config.startPath || process.cwd(),
         displayName: '📁 Select JSON file'
