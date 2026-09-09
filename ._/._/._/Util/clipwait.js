@@ -1406,7 +1406,31 @@ monitor.start().catch(error => {
         alive.sort((a,b) => new Date(b.startedAt) - new Date(a.startedAt));
         const target = alive[0];
         console.log(`Following logs for ClipWait background process: ${target.name} (ID: ${target.sypmId})`);
-        SyPM.log(target.sypmId);
+        console.log('Press Ctrl+C to stop following logs...\n');
+        
+        // Use tail -f to continuously follow the log file
+        const logPath = path.join(os.homedir(), '.clipboard-monitor', 'clipwait-bg-' + target.bgToken + '.log');
+        const tailProcess = exec('tail -f "' + logPath + '"');
+        
+        tailProcess.stdout.on('data', (data) => {
+            process.stdout.write(data);
+        });
+        
+        tailProcess.stderr.on('data', (data) => {
+            process.stderr.write(data);
+        });
+        
+        // Wait for user to press Ctrl+C
+        await new Promise((resolve) => {
+            const handleSignal = () => {
+                tailProcess.kill();
+                process.removeListener('SIGINT', handleSignal);
+                process.removeListener('SIGTERM', handleSignal);
+                resolve();
+            };
+            process.on('SIGINT', handleSignal);
+            process.on('SIGTERM', handleSignal);
+        });
     }
 
     async startBackgroundMode(profileName, notifyMode = false) {
