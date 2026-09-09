@@ -17,6 +17,7 @@ class ClipboardMonitor {
         this.lastClipboardContent = '';
         this.isMonitoring = false;
         this.isPaused = false;
+        this.skipNextClipboardCheck = false;
         this.tagRestrictMode = false;
         this.config = {
             profiles: {},
@@ -442,6 +443,15 @@ class ClipboardMonitor {
         
         const currentContent = await this.getClipboardContent();
         
+        // If skipNextClipboardCheck is set (after resume from pause),
+        // update lastClipboardContent to current content and clear the flag
+        if (this.skipNextClipboardCheck) {
+            this.lastClipboardContent = currentContent;
+            this.skipNextClipboardCheck = false;
+            console.log('✓ Current clipboard content skipped - waiting for new changes...');
+            return;
+        }
+        
         if (currentContent && currentContent !== this.lastClipboardContent) {
             this.lastClipboardContent = currentContent;
             console.log('\n' + '='.repeat(60));
@@ -687,7 +697,10 @@ class ClipboardMonitor {
         if (this.isPaused) {
             console.log('\n⏸️  Monitoring PAUSED - Press P to resume');
         } else {
-            console.log('\n▶️  Monitoring RESUMED');
+            console.log('\n▶️  Monitoring RESUMED - current clipboard will be ignored, waiting for new changes...');
+            // When resuming from pause, skip the current clipboard content
+            // and only process new clipboard changes after resume
+            this.skipNextClipboardCheck = true;
         }
     }
 
