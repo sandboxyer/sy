@@ -1850,10 +1850,73 @@ if (configuration.remember) {
 
       let { line, column } = this.getCoordinatesFromLinearIndex(normalizedOptions, initialIndex);
 
+      // ------------------------------------------------------------------
+      // VIEWPORT SCROLL STATE (native pagination for small terminals)
+      // ------------------------------------------------------------------
+      // Only a window of the menu is ever drawn so that very small terminals
+      // do not overflow. The window follows the focused item, exactly like
+      // the struct.js file browser pagination. Mouse coordinates are
+      // translated using firstItemRow (the terminal row where the first
+      // visible option is drawn) + scrollOffset, so clicking always hits
+      // the correct button — even when scrolled or resized.
+      // ------------------------------------------------------------------
+      let scrollOffset = 0;
+      let maxVisibleLines = 1;
+
+      const computeViewport = () => {
+        const terminalHeight = stdout.rows || 24;
+        let headerLines = 0;
+        if (question) {
+          // question line(s) + blank line printed by console.log(`${question}\n`)
+          headerLines = question.split('\n').length + 1;
+        }
+        // Reserve 2 rows for the optional up/down indicators so we never
+        // overflow the terminal, and always keep at least 1 visible row.
+        maxVisibleLines = Math.max(1, terminalHeight - headerLines - 2);
+      };
+
       const renderMenu = () => {
+        computeViewport();
+
         console.clear();
-        if (question) console.log(`${question}\n`);
-        normalizedOptions.forEach((lineOptions, lineIndex) => {
+
+        // Track the real terminal row we are currently at (0-indexed)
+        let currentRow = 0;
+
+        if (question) {
+          console.log(`${question}\n`);
+          currentRow += question.split('\n').length + 1;
+        }
+
+        const totalLines = normalizedOptions.length;
+
+        // Keep the focused line inside the visible viewport (auto-scroll)
+        if (line < scrollOffset) scrollOffset = line;
+        if (line >= scrollOffset + maxVisibleLines) {
+          scrollOffset = line - maxVisibleLines + 1;
+        }
+        // Clamp offset
+        const maxScroll = Math.max(0, totalLines - maxVisibleLines);
+        if (scrollOffset > maxScroll) scrollOffset = maxScroll;
+        if (scrollOffset < 0) scrollOffset = 0;
+
+        const startIndex = scrollOffset;
+        const endIndex = Math.min(scrollOffset + maxVisibleLines, totalLines);
+
+        // Up indicator (only when scrolled)
+        const hasUpIndicator = startIndex > 0;
+        if (hasUpIndicator) {
+          console.log(ColorText.dim(`▲ ${startIndex} more above`));
+          currentRow += 1;
+        }
+
+        // This is the terminal row where the FIRST visible option will be drawn.
+        // Used by findOptionIndexAtCoordinates to map mouse clicks back to items.
+        const firstItemRow = currentRow;
+
+        // Render only the visible slice of the menu
+        for (let lineIndex = startIndex; lineIndex < endIndex; lineIndex++) {
+          const lineOptions = normalizedOptions[lineIndex];
           let lineString = lineOptions.map((option, columnIndex) => {
             let text;
             if (option.type === 'field') {
@@ -1881,13 +1944,39 @@ if (configuration.remember) {
             return text;
           }).join('   ');
           console.log(lineString);
-        });
+          currentRow += 1;
+        }
+
+        // Down indicator
+        const remaining = totalLines - endIndex;
+        const hasDownIndicator = remaining > 0;
+        if (hasDownIndicator) {
+          console.log(ColorText.dim(`▼ ${remaining} more below`));
+        }
+
+        // Persist viewport info so mouse handling can map clicks correctly
+        if (this.currentMenuState) {
+          this.currentMenuState.scrollOffset = scrollOffset;
+          this.currentMenuState.maxVisibleLines = maxVisibleLines;
+          this.currentMenuState.firstItemRow = firstItemRow;
+          this.currentMenuState.hasUpIndicator = hasUpIndicator;
+          this.currentMenuState.hasDownIndicator = hasDownIndicator;
+          this.currentMenuState.currentLine = line;
+          this.currentMenuState.currentColumn = column;
+        }
       };
 
       const setFocus = (newLine, newColumn) => {
         line = newLine;
         column = newColumn;
-        
+
+        // Keep currentMenuState in sync so wheel navigation and mouse
+        // clicks always operate on the live focused position.
+        if (this.currentMenuState) {
+          this.currentMenuState.currentLine = newLine;
+          this.currentMenuState.currentColumn = newColumn;
+        }
+
         // Store the focused index for remember functionality
         this.lastFocusedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, newLine, newColumn);
         
@@ -2027,8 +2116,23 @@ this.lastSelectedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, l
         setFocus,
         selectOption,
         currentLine: line,
-        currentColumn: column
+        currentColumn: column,
+        scrollOffset: 0,
+        maxVisibleLines: 1,
+        firstItemRow: 0,
+        hasUpIndicator: false,
+        hasDownIndicator: false
       };
+
+      // Re-render on terminal resize so the viewport adapts to the new
+      // dimensions (both wider and narrower terminals).
+      const resizeHandler = () => {
+        if (this.isInMenu && this.currentMenuState) {
+          try { renderMenu(); } catch (_) { /* ignore resize render errors */ }
+        }
+      };
+      this.currentMenuState.resizeHandler = resizeHandler;
+      stdout.on('resize', resizeHandler);
 
       renderMenu();
     });
@@ -2060,7 +2164,13 @@ this.lastSelectedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, l
    */
   cleanupMenuState() {
     this.isInMenu = false;
-    
+
+    // Remove the terminal-resize listener we attached for this menu
+    if (this.currentMenuState?.resizeHandler) {
+      try { stdout.removeListener('resize', this.currentMenuState.resizeHandler); } catch (_) {}
+      this.currentMenuState.resizeHandler = null;
+    }
+
     // Remove keypress listener
     stdin.removeAllListeners('keypress');
     
@@ -2597,6 +2707,13 @@ getOptionDataForEvent(option) {
    */
   cleanupAll() {
     this.isInMenu = false;
+
+    // Remove the terminal-resize listener if a menu was open
+    if (this.currentMenuState?.resizeHandler) {
+      try { stdout.removeListener('resize', this.currentMenuState.resizeHandler); } catch (_) {}
+      this.currentMenuState.resizeHandler = null;
+    }
+
     this.cleanupMouseSupport();
     
     if (this.doubleClickTimeout) {
@@ -2873,34 +2990,59 @@ setFocus(newLine, newColumn);
    * @returns {number} Index of the option or -1 if not found
    */
   findOptionIndexAtCoordinates(terminalY, terminalX, normalizedOptions, question) {
-    let startRow = 0;
-    if (question) {
-      const questionLines = question.split('\n').length;
-      startRow += questionLines + 1;
+    // The renderer stores the exact terminal row where the first visible
+    // option was drawn (after the header and any "more above" indicator).
+    // This makes clicks work even when the menu is scrolled or the terminal
+    // was resized, without ever cutting or offsetting the first button.
+    const state = this.currentMenuState;
+
+    let firstItemRow;
+    let scrollOffset = 0;
+    let maxVisible;
+
+    if (state && typeof state.firstItemRow === 'number') {
+      // Preferred: use the precise info from the last render.
+      firstItemRow = state.firstItemRow;
+      scrollOffset = state.scrollOffset || 0;
+      maxVisible = typeof state.maxVisibleLines === 'number'
+        ? state.maxVisibleLines
+        : normalizedOptions.length;
+    } else {
+      // Fallback (e.g. very first paint before state is set): compute the
+      // header height from the question so behaviour matches the original.
+      firstItemRow = 0;
+      if (question) {
+        firstItemRow += question.split('\n').length + 1;
+      }
+      scrollOffset = 0;
+      maxVisible = normalizedOptions.length;
     }
 
-    for (let row = 0; row < normalizedOptions.length; row++) {
-      const actualRow = startRow + row;
-      
-      if (actualRow === terminalY) {
-        let currentColumn = 0;
-        for (let column = 0; column < normalizedOptions[row].length; column++) {
-          const option = normalizedOptions[row][column];
-          const rawText = typeof option === 'string' ? option : option.name || JSON.stringify(option);
-          const text = rawText.replace(/\x1b\[[0-9;]*m/g, '');   // strip escape sequences
-          const textWidth = text.length;
+    // Convert terminal Y to a row index inside normalizedOptions
+    const row = terminalY - firstItemRow + scrollOffset;
 
-          const optionStart = currentColumn;
-          const optionEnd = currentColumn + textWidth;
-          
-          if (terminalX >= optionStart && terminalX <= optionEnd + 2) {
-            return this.getLinearIndexFromCoordinates(normalizedOptions, row, column);
-          }
+    // Out of the visible window / out of data
+    if (row < 0) return -1;
+    if (row < scrollOffset) return -1;
+    if (row >= scrollOffset + maxVisible) return -1;
+    if (row >= normalizedOptions.length) return -1;
 
-          currentColumn += textWidth + 3;
-        }
-        break;
+    // Find the column inside that row
+    let currentColumn = 0;
+    for (let column = 0; column < normalizedOptions[row].length; column++) {
+      const option = normalizedOptions[row][column];
+      const rawText = typeof option === 'string' ? option : option.name || JSON.stringify(option);
+      const text = rawText.replace(/\x1b\[[0-9;]*m/g, '');   // strip escape sequences
+      const textWidth = text.length;
+
+      const optionStart = currentColumn;
+      const optionEnd = currentColumn + textWidth;
+
+      if (terminalX >= optionStart && terminalX <= optionEnd + 2) {
+        return this.getLinearIndexFromCoordinates(normalizedOptions, row, column);
       }
+
+      currentColumn += textWidth + 3;
     }
 
     return -1;
