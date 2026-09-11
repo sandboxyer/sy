@@ -340,6 +340,163 @@ async function collectAllFiles(directory) {
 }
 
 // ============================================================
+//  Fast content-based file search
+// ============================================================
+
+// Directories that are almost never relevant for code search.
+// Skipping them keeps recursive walks extremely fast on real projects.
+const SEARCH_SKIP_DIRS = new Set([
+    'node_modules',
+    '.git',
+    '.svn',
+    '.hg',
+    '__pycache__',
+    '.cache',
+    '.next',
+    '.nuxt',
+    '.svelte-kit',
+    '.turbo',
+    '.parcel-cache',
+    'dist',
+    'build',
+    'coverage',
+    '.idea',
+    '.vscode',
+]);
+
+// Binary file extensions - pre-filtered before any read() syscall.
+const BINARY_EXTENSIONS = new Set([
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.tiff', '.tif', '.avif',
+    '.mp3', '.mp4', '.wav', '.avi', '.mov', '.mkv', '.flv', '.webm', '.ogg', '.m4a', '.opus',
+    '.zip', '.tar', '.gz', '.bz2', '.7z', '.rar', '.xz', '.tgz', '.zst',
+    '.exe', '.dll', '.so', '.dylib', '.bin', '.o', '.a', '.class', '.jar', '.war',
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt', '.ods',
+    '.woff', '.woff2', '.ttf', '.otf', '.eot',
+    '.pyc', '.pyo', '.wasm', '.node', '.db', '.sqlite', '.sqlite3', '.mdb',
+    '.iso', '.img', '.dmg', '.pkg', '.deb', '.rpm',
+]);
+
+function isProbablyBinaryByExtension(filePath) {
+    const ext = path.extname(filePath).toLowerCase();
+    return BINARY_EXTENSIONS.has(ext);
+}
+
+// Iterative recursive walk that prunes junk directories.
+// Iterative (stack) avoids deep-recursion issues on huge trees.
+async function collectSearchableFiles(directory) {
+    const results = [];
+    const stack = [directory];
+
+    while (stack.length > 0) {
+        const dir = stack.pop();
+        let entries;
+
+        try {
+            entries = await fs.readdir(dir, { withFileTypes: true });
+        } catch {
+            continue;
+        }
+
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+
+            if (entry.isDirectory()) {
+                if (SEARCH_SKIP_DIRS.has(entry.name)) continue;
+                stack.push(fullPath);
+            } else if (entry.isFile()) {
+                if (isProbablyBinaryByExtension(fullPath)) continue;
+                results.push(fullPath);
+            }
+        }
+    }
+
+    return results;
+}
+
+// Returns true if the given file contains the search term.
+// Performance notes:
+//   * stat() first - skip huge files (>16MB) that are almost never source code.
+//   * Extension pre-filter for binaries (never even read them).
+//   * Read as Buffer, then NUL-byte scan on the first 8KB to catch binary content.
+//   * Case-sensitive path uses Buffer.includes() (native, memmem-like, very fast).
+//   * Case-insensitive path falls back to a single lowercase string pass.
+async function fileContainsTerm(filePath, searchTerm, caseSensitive, termBuffer) {
+    let stats;
+
+    try {
+        stats = await fs.stat(filePath);
+    } catch {
+        return false;
+    }
+
+    if (stats.size === 0) return false;
+    if (stats.size > 16 * 1024 * 1024) return false;
+
+    let buffer;
+
+    try {
+        buffer = await fs.readFile(filePath);
+    } catch {
+        return false;
+    }
+
+    // Fast binary content check on the first 8KB (NUL byte = binary).
+    const scanLen = Math.min(buffer.length, 8192);
+    for (let i = 0; i < scanLen; i++) {
+        if (buffer[i] === 0) return false;
+    }
+
+    if (caseSensitive) {
+        return buffer.includes(termBuffer);
+    }
+
+    // Case-insensitive: decode once, lowercase, then match.
+    const text = buffer.toString('utf8');
+    return text.toLowerCase().includes(searchTerm);
+}
+
+// Parallel worker-pool search across the given file paths.
+// concurrency ~= number of in-flight reads. 32 is a sweet spot for local SSDs:
+// high enough to saturate I/O, low enough to avoid EMFILE / thrashing.
+async function searchFilesForTerm(filePaths, searchTerm, caseSensitive, concurrency = 32) {
+    const matches = [];
+
+    if (filePaths.length === 0) return matches;
+
+    const termBuffer = Buffer.from(searchTerm, 'utf8');
+    const normalizedTerm = caseSensitive ? searchTerm : searchTerm.toLowerCase();
+
+    let nextIndex = 0;
+
+    const worker = async () => {
+        while (true) {
+            const i = nextIndex++;
+            if (i >= filePaths.length) return;
+
+            const filePath = filePaths[i];
+
+            try {
+                const found = await fileContainsTerm(filePath, normalizedTerm, caseSensitive, termBuffer);
+                if (found) matches.push(filePath);
+            } catch {
+                // Ignore per-file errors so one bad file doesn't abort the search.
+            }
+        }
+    };
+
+    const workerCount = Math.min(concurrency, filePaths.length);
+    const workers = new Array(workerCount);
+
+    for (let i = 0; i < workerCount; i++) {
+        workers[i] = worker();
+    }
+
+    await Promise.all(workers);
+
+    return matches;
+}
+
+// ============================================================
 //  Run CodeParser CLI menu for a specific file
 //  Returns the selection made by the user
 // ============================================================
@@ -602,7 +759,7 @@ async function interactiveMode() {
         }
         
         console.log('─'.repeat(process.stdout.columns || 80));
-        console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, PgUp/PgDn page, Enter open/select, Space toggle, a current, A recursive, g gen, b back, q quit`);
+        console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, PgUp/PgDn page, Enter open/select, Space toggle, a current, A recursive, f find, g gen, b back, q quit`);
         console.log('─'.repeat(process.stdout.columns || 80));
 
         visibleEntries.forEach((entry, index) => {
@@ -729,6 +886,90 @@ async function interactiveMode() {
 
         if (key === 'A') {
             await toggleAllRecursivelyFromCurrentDirectory();
+            render();
+            return;
+        }
+
+        if (key === 'f' || key === 'F') {
+            // Temporarily leave raw mode so readline can prompt cleanly.
+            process.stdin.removeListener('data', onKeypress);
+            process.stdin.setRawMode(false);
+
+            console.log(`\n${YELLOW}${BOLD}=== FIND FILES BY CONTENT ===${RESET}`);
+            console.log(`Recursive search under: ${currentDirectory}`);
+            console.log(`${BOLD}Smart case:${RESET} lowercase = case-insensitive, any UPPERCASE = case-sensitive`);
+            console.log(`${MAGENTA}(node_modules, .git and other junk dirs are skipped)${RESET}\n`);
+
+            const rawTerm = await askQuestion('Enter search term (empty to cancel):');
+
+            if (!rawTerm || rawTerm.trim() === '') {
+                process.stdin.setRawMode(true);
+                process.stdin.resume();
+                process.stdin.on('data', onKeypress);
+                render();
+                return;
+            }
+
+            const term = rawTerm.trim();
+            const caseSensitive = /[A-Z]/.test(term);
+
+            console.log(`\nSearching for "${term}" (${caseSensitive ? 'case-sensitive' : 'case-insensitive'})...`);
+
+            const startTime = Date.now();
+
+            let allFiles = [];
+            try {
+                allFiles = await collectSearchableFiles(currentDirectory);
+            } catch (err) {
+                console.error(`${RED}Failed to walk directory: ${err.message}${RESET}`);
+            }
+
+            // Skip already-selected files - no need to re-read them.
+            const filesToSearch = allFiles.filter(f => !selectedFiles.has(f));
+
+            console.log(`Candidate files: ${formatNumber(filesToSearch.length)}`);
+
+            let matches = [];
+            try {
+                matches = await searchFilesForTerm(filesToSearch, term, caseSensitive, 32);
+            } catch (err) {
+                console.error(`${RED}Search error: ${err.message}${RESET}`);
+            }
+
+            const elapsed = Date.now() - startTime;
+
+            // Additively select all matches (existing selection is preserved).
+            let newlySelected = 0;
+            for (const filePath of matches) {
+                if (!selectedFiles.has(filePath)) {
+                    await selectFile(filePath);
+                    newlySelected++;
+                }
+            }
+
+            console.log(`\n${GREEN}${BOLD}✓ Search complete${RESET}`);
+            console.log(`  Elapsed:   ${elapsed} ms`);
+            console.log(`  Scanned:   ${formatNumber(filesToSearch.length)} file(s)`);
+            console.log(`  Matched:   ${formatNumber(matches.length)} file(s)`);
+            console.log(`  Added:     ${formatNumber(newlySelected)} new selection(s)`);
+
+            if (matches.length > 0) {
+                const preview = matches.slice(0, 15);
+                console.log(`\n${BOLD}Matches:${RESET}`);
+                preview.forEach(m => {
+                    console.log(`  ${GREEN}•${RESET} ${path.relative(currentDirectory, m) || m}`);
+                });
+                if (matches.length > preview.length) {
+                    console.log(`  ... and ${formatNumber(matches.length - preview.length)} more`);
+                }
+            }
+
+            await askQuestion(`\n${YELLOW}Press Enter to continue...${RESET}`);
+
+            // Restore raw mode + keypress handler and re-render the menu.
+            process.stdin.setRawMode(true);
+            process.stdin.resume();
+            process.stdin.on('data', onKeypress);
             render();
             return;
         }
