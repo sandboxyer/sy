@@ -1736,7 +1736,7 @@ if (configuration.remember) {
   
   return this.numberedMenus
     ? this.displayMenuFromOptions(menuTitle, menu.options, { ...configuration, initialSelectedIndex: finalIndex })
-    : this.displayMenuWithArrows(menuTitle, menu.options, configuration, finalIndex);
+    : this.displayMenuWithArrows(menuTitle, menu.options, { ...configuration, pinnedTitle: menu.pinnedTitle, pinnedTopTitle: menu.pinnedTopTitle }, finalIndex);
 }
 
   /**
@@ -1845,7 +1845,66 @@ if (configuration.remember) {
     }
 
     return new Promise((resolve) => {
-      const normalizedOptions = this.normalizeOptions(options);
+      // ------------------------------------------------------------------
+      // PINNED OPTIONS SUPPORT (TOP + BOTTOM)
+      // ------------------------------------------------------------------
+      // Options marked with `pinnedTop: true` are moved to the top of the
+      // screen, above a single separator line. Options marked with
+      // `pinned: true` are moved to the bottom of the screen, below a
+      // single separator line. In both cases, their relative order among
+      // themselves is preserved (invocation order). The middle area keeps
+      // its existing infinite-scroll viewport + ▼ indicator.
+      // ------------------------------------------------------------------
+      const normalizedAll = this.normalizeOptions(options);
+
+      const isPinnedTopOption = (opt) => {
+        if (!opt || typeof opt !== 'object') return false;
+        if (opt.pinnedTop === true) return true;
+        if (opt.metadata && opt.metadata.pinnedTop === true) return true;
+        return false;
+      };
+
+      const isPinnedBottomOption = (opt) => {
+        if (!opt || typeof opt !== 'object') return false;
+        if (opt.pinned === true) return true;
+        if (opt.metadata && opt.metadata.pinned === true) return true;
+        return false;
+      };
+
+      const scrollableOptions = [];
+      const pinnedTopOptions = [];
+      const pinnedBottomOptions = [];
+      for (const lineArr of normalizedAll) {
+        const hasTop = Array.isArray(lineArr) && lineArr.some(isPinnedTopOption);
+        const hasBottom = Array.isArray(lineArr) && lineArr.some(isPinnedBottomOption);
+        if (hasTop) pinnedTopOptions.push(lineArr);
+        else if (hasBottom) pinnedBottomOptions.push(lineArr);
+        else scrollableOptions.push(lineArr);
+      }
+
+      // Combined ordering for focus indexing:
+      //   [pinned-top] → [scrollable] → [pinned-bottom]
+      const normalizedOptions = [
+        ...pinnedTopOptions,
+        ...scrollableOptions,
+        ...pinnedBottomOptions
+      ];
+      const pinnedTopCount = pinnedTopOptions.length;
+      const scrollableCount = scrollableOptions.length;
+      const pinnedCount = pinnedBottomOptions.length;
+      const hasPinnedTopArea = pinnedTopCount > 0;
+      const hasPinnedArea = pinnedCount > 0;
+
+      // Index offset of the scrollable block inside normalizedOptions
+      const scrollableStartIndex = pinnedTopCount;
+      // Index offset of the pinned-bottom block inside normalizedOptions
+      const pinnedBottomStartIndex = pinnedTopCount + scrollableCount;
+
+      const pinnedTopTitle = configuration.pinnedTopTitle || '';
+      const pinnedTopTitleLines = pinnedTopTitle ? pinnedTopTitle.split('\n') : [];
+      const pinnedTitle = configuration.pinnedTitle || '';
+      const pinnedTitleLines = pinnedTitle ? pinnedTitle.split('\n') : [];
+
       if (configuration.clear) console.clear();
 
       let { line, column } = this.getCoordinatesFromLinearIndex(normalizedOptions, initialIndex);
@@ -1853,26 +1912,97 @@ if (configuration.remember) {
       // ------------------------------------------------------------------
       // VIEWPORT SCROLL STATE (native pagination for small terminals)
       // ------------------------------------------------------------------
-      // Only a window of the menu is ever drawn so that very small terminals
-      // do not overflow. The window follows the focused item, exactly like
-      // the struct.js file browser pagination. Mouse coordinates are
-      // translated using firstItemRow (the terminal row where the first
-      // visible option is drawn) + scrollOffset, so clicking always hits
-      // the correct button — even when scrolled or resized.
-      // ------------------------------------------------------------------
       let scrollOffset = 0;
       let maxVisibleLines = 1;
+
+      // ------------------------------------------------------------------
+      // DOUBLE-TAP DETECTION (up and down arrow keys)
+      // ------------------------------------------------------------------
+      // Auto-repeat from holding a key fires at roughly 30–50ms intervals
+      // on most terminals, and NEVER sends a "release" event. A genuine
+      // human double-tap also tends to be fast, so timing alone is not
+      // enough to tell them apart reliably.
+      //
+      // To eliminate conflict with holding the key, we additionally require
+      // that the FIRST press of the pair did NOT stay "down" for the full
+      // window. We track both press times and a "hold detected" flag: if a
+      // third press arrives while the previous two were still within the
+      // auto-repeat cadence, we treat it as a hold and permanently disable
+      // the double-tap trigger until the key is released.
+      // ------------------------------------------------------------------
+      const DOUBLE_TAP_WINDOW_MS = 120;  // max gap between the two taps
+      const HOLD_RESET_MS = 400;         // no press for this long = released
+
+      let lastUpPressTime = 0;
+      let upHoldDetected = false;
+      let upLastSeenTime = 0;
+
+      let lastDownPressTime = 0;
+      let downHoldDetected = false;
+      let downLastSeenTime = 0;
+
+      // Reset the hold flag if no key event has been seen for HOLD_RESET_MS
+      const checkKeyRelease = () => {
+        const now = Date.now();
+        if (upHoldDetected && (now - upLastSeenTime) > HOLD_RESET_MS) {
+          upHoldDetected = false;
+          lastUpPressTime = 0;
+        }
+        if (downHoldDetected && (now - downLastSeenTime) > HOLD_RESET_MS) {
+          downHoldDetected = false;
+          lastDownPressTime = 0;
+        }
+      };
 
       const computeViewport = () => {
         const terminalHeight = stdout.rows || 24;
         let headerLines = 0;
         if (question) {
-          // question line(s) + blank line printed by console.log(`${question}\n`)
           headerLines = question.split('\n').length + 1;
         }
-        // Reserve 2 rows for the optional up/down indicators so we never
-        // overflow the terminal, and always keep at least 1 visible row.
-        maxVisibleLines = Math.max(1, terminalHeight - headerLines - 2);
+        // Reserve space for pinned-top and pinned-bottom areas + separators
+        const topSeparatorRows = hasPinnedTopArea ? 1 : 0;
+        const topRows = hasPinnedTopArea
+          ? (pinnedTopCount + topSeparatorRows + pinnedTopTitleLines.length)
+          : 0;
+        const bottomSeparatorRows = hasPinnedArea ? 1 : 0;
+        const bottomRows = hasPinnedArea
+          ? (pinnedCount + bottomSeparatorRows + pinnedTitleLines.length)
+          : 0;
+        maxVisibleLines = Math.max(
+          1,
+          terminalHeight - headerLines - topRows - bottomRows - 2
+        );
+      };
+
+      // Render a single line of options into a string
+      const renderOptionLine = (lineOptions, lineIndex, focusLine, focusColumn) => {
+        return lineOptions.map((option, columnIndex) => {
+          let text;
+          if (option.type === 'field') {
+            const maxLen = this.fieldMaxWidth || 20;
+            let val = '';
+            const label = option.label || '';
+            if (this.isEditing && lineIndex === focusLine && columnIndex === focusColumn && this.activeField) {
+              val = this.activeField.value;
+              const blink = (Math.floor(Date.now() / 500) % 2 === 0) ? '█' : ' ';
+              const truncated = val.length > maxLen ? val.slice(-maxLen) : val;
+              text = label ? `${label}: ░${truncated}${blink}░` : `░${truncated}${blink}░`;
+            } else {
+              val = option.value || '';
+              const truncated = val.length > maxLen ? val.slice(0, maxLen) : val;
+              text = label ? `${label}: ░${truncated}░` : `░${truncated}░`;
+            }
+          } else {
+            text = typeof option === 'string' ? option : option.name || JSON.stringify(option);
+          }
+          if (lineIndex === focusLine && columnIndex === focusColumn) {
+            return this.highlightColor
+              ? `${this.highlightColor}${text}${this.resetColor()}`
+              : `→ ${text}`;
+          }
+          return text;
+        }).join('   ');
       };
 
       const renderMenu = () => {
@@ -1880,81 +2010,99 @@ if (configuration.remember) {
 
         console.clear();
 
-        // Track the real terminal row we are currently at (0-indexed)
         let currentRow = 0;
 
+        // ---------- Pinned-top area ----------
+        let pinnedTopFirstRow = -1;
+        if (hasPinnedTopArea) {
+          // Optional pinned-top title (rendered as-is, one line at a time)
+          for (const tLine of pinnedTopTitleLines) {
+            console.log(tLine);
+            currentRow += 1;
+          }
+
+          // Row where the first pinned-top option will be drawn
+          pinnedTopFirstRow = currentRow;
+
+          for (let i = 0; i < pinnedTopCount; i++) {
+            const lineString = renderOptionLine(normalizedOptions[i], i, line, column);
+            console.log(lineString);
+            currentRow += 1;
+          }
+
+          // Single separator line
+          const sepWidth = Math.max(10, stdout.columns || 40);
+          console.log(ColorText.dim('─'.repeat(sepWidth)));
+          currentRow += 1;
+        }
+
+        // ---------- Question ----------
         if (question) {
           console.log(`${question}\n`);
           currentRow += question.split('\n').length + 1;
         }
 
-        const totalLines = normalizedOptions.length;
+        // ---------- Scrollable area ----------
+        const focusInScrollable =
+          line >= scrollableStartIndex &&
+          line < scrollableStartIndex + scrollableCount;
 
-        // Keep the focused line inside the visible viewport (auto-scroll)
-        if (line < scrollOffset) scrollOffset = line;
-        if (line >= scrollOffset + maxVisibleLines) {
-          scrollOffset = line - maxVisibleLines + 1;
+        const focusRel = line - scrollableStartIndex;
+
+        if (focusInScrollable) {
+          if (focusRel < scrollOffset) scrollOffset = focusRel;
+          if (focusRel >= scrollOffset + maxVisibleLines) {
+            scrollOffset = focusRel - maxVisibleLines + 1;
+          }
         }
-        // Clamp offset
-        const maxScroll = Math.max(0, totalLines - maxVisibleLines);
+
+        const maxScroll = Math.max(0, scrollableCount - maxVisibleLines);
         if (scrollOffset > maxScroll) scrollOffset = maxScroll;
         if (scrollOffset < 0) scrollOffset = 0;
 
-        const startIndex = scrollOffset;
-        const endIndex = Math.min(scrollOffset + maxVisibleLines, totalLines);
+        const startRel = scrollOffset;
+        const endRel = Math.min(scrollOffset + maxVisibleLines, scrollableCount);
 
-        // Up indicator (only when scrolled)
-        const hasUpIndicator = startIndex > 0;
-        if (hasUpIndicator) {
-          console.log(ColorText.dim(`▲ ${startIndex} more above`));
-          currentRow += 1;
-        }
+        const hasUpIndicator = startRel > 0;
 
-        // This is the terminal row where the FIRST visible option will be drawn.
-        // Used by findOptionIndexAtCoordinates to map mouse clicks back to items.
         const firstItemRow = currentRow;
 
-        // Render only the visible slice of the menu
-        for (let lineIndex = startIndex; lineIndex < endIndex; lineIndex++) {
-          const lineOptions = normalizedOptions[lineIndex];
-          let lineString = lineOptions.map((option, columnIndex) => {
-            let text;
-            if (option.type === 'field') {
-                const maxLen = this.fieldMaxWidth || 20;
-                let val = '';
-                const label = option.label || '';
-                if (this.isEditing && lineIndex === line && columnIndex === column && this.activeField) {
-                    val = this.activeField.value;
-                    const blink = (Math.floor(Date.now() / 500) % 2 === 0) ? '█' : ' ';
-                    const truncated = val.length > maxLen ? val.slice(-maxLen) : val;  // show end while editing
-                    text = label ? `${label}: ░${truncated}${blink}░` : `░${truncated}${blink}░`;
-                } else {
-                    val = option.value || '';
-                    const truncated = val.length > maxLen ? val.slice(0, maxLen) : val;  // show beginning when not editing
-                    text = label ? `${label}: ░${truncated}░` : `░${truncated}░`;
-                }
-            } else {
-                text = typeof option === 'string' ? option : option.name || JSON.stringify(option);
-            }
-            if (lineIndex === line && columnIndex === column) {
-              return this.highlightColor
-                ? `${this.highlightColor}${text}${this.resetColor()}`
-                : `→ ${text}`;
-            }
-            return text;
-          }).join('   ');
+        for (let rel = startRel; rel < endRel; rel++) {
+          const lineIndex = scrollableStartIndex + rel;
+          const lineString = renderOptionLine(normalizedOptions[lineIndex], lineIndex, line, column);
           console.log(lineString);
           currentRow += 1;
         }
 
-        // Down indicator
-        const remaining = totalLines - endIndex;
+        const remaining = scrollableCount - endRel;
         const hasDownIndicator = remaining > 0;
         if (hasDownIndicator) {
-          console.log(ColorText.dim(`▼ ${remaining} more below`));
+          console.log(ColorText.dim(`${remaining} more below`));
+          currentRow += 1;
         }
 
-        // Persist viewport info so mouse handling can map clicks correctly
+        // ---------- Pinned-bottom area ----------
+        let pinnedFirstRow = -1;
+        if (hasPinnedArea) {
+          const sepWidth = Math.max(10, stdout.columns || 40);
+          console.log(ColorText.dim('─'.repeat(sepWidth)));
+          currentRow += 1;
+
+          for (const tLine of pinnedTitleLines) {
+            console.log(tLine);
+            currentRow += 1;
+          }
+
+          pinnedFirstRow = currentRow;
+
+          for (let i = 0; i < pinnedCount; i++) {
+            const lineIndex = pinnedBottomStartIndex + i;
+            const lineString = renderOptionLine(normalizedOptions[lineIndex], lineIndex, line, column);
+            console.log(lineString);
+            currentRow += 1;
+          }
+        }
+
         if (this.currentMenuState) {
           this.currentMenuState.scrollOffset = scrollOffset;
           this.currentMenuState.maxVisibleLines = maxVisibleLines;
@@ -1963,6 +2111,14 @@ if (configuration.remember) {
           this.currentMenuState.hasDownIndicator = hasDownIndicator;
           this.currentMenuState.currentLine = line;
           this.currentMenuState.currentColumn = column;
+
+          this.currentMenuState.pinnedTopCount = pinnedTopCount;
+          this.currentMenuState.scrollableCount = scrollableCount;
+          this.currentMenuState.pinnedCount = pinnedCount;
+          this.currentMenuState.scrollableStartIndex = scrollableStartIndex;
+          this.currentMenuState.pinnedBottomStartIndex = pinnedBottomStartIndex;
+          this.currentMenuState.pinnedTopFirstRow = pinnedTopFirstRow;
+          this.currentMenuState.pinnedFirstRow = pinnedFirstRow;
         }
       };
 
@@ -1970,48 +2126,39 @@ if (configuration.remember) {
         line = newLine;
         column = newColumn;
 
-        // Keep currentMenuState in sync so wheel navigation and mouse
-        // clicks always operate on the live focused position.
         if (this.currentMenuState) {
           this.currentMenuState.currentLine = newLine;
           this.currentMenuState.currentColumn = newColumn;
         }
 
-        // Store the focused index for remember functionality
         this.lastFocusedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, newLine, newColumn);
-        
-        // Emit menu navigation event
+
         this.emitEvent(this.eventTypes.MENU_NAVIGATION, {
           line: newLine,
           column: newColumn,
-          linearIndex: this.lastFocusedIndex,  // Use the stored value
+          linearIndex: this.lastFocusedIndex,
           question
         });
-        
+
         renderMenu();
       };
 
       const selectOption = async (selectionSource = 'mouse') => {
-        // Prevent multiple simultaneous selections
         if (this.isClickInProgress) return;
-        
+
         this.isClickInProgress = true;
-        
-        // Get selected item before cleanup
-        // Check if the selected option is a field
+
         const selectedOption = normalizedOptions[line] && normalizedOptions[line][column];
         if (selectedOption && selectedOption.type === 'field') {
-            // Enter editing mode with raw input handling
-            this.startFieldEditing(selectedOption, line, column, renderMenu);
-            setFocus(line, column);            // keep highlight on the field
-            renderMenu();
-            return;
+          this.startFieldEditing(selectedOption, line, column, renderMenu);
+          setFocus(line, column);
+          renderMenu();
+          return;
         }
 
-this.lastSelectedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, line, column);
+        this.lastSelectedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, line, column);
         const selected = normalizedOptions[line][column];
-        
-        // Emit menu selection event with data
+
         const selectionEventData = {
           index: this.lastSelectedIndex,
           line,
@@ -2020,8 +2167,7 @@ this.lastSelectedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, l
           question,
           source: selectionSource
         };
-        
-        // Add custom data from option if available
+
         if (selected && typeof selected === 'object') {
           if (selected.eventData) {
             selectionEventData.customData = selected.eventData;
@@ -2030,22 +2176,19 @@ this.lastSelectedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, l
             selectionEventData.metadata = selected.metadata;
           }
         }
-        
+
         this.emitEvent(this.eventTypes.MENU_SELECTION, selectionEventData);
-        
-        // Clean up menu state immediately
+
         this.cleanupMenuState();
-        
+
         try {
           if (selected?.action) {
-            // Execute the action
             const result = selected.action();
             if (result instanceof Promise) {
               await result;
             }
           }
-          
-          // Return the selected item for resolution
+
           resolve(selected?.name || selected);
         } catch (error) {
           console.error('Error in menu action:', error);
@@ -2057,8 +2200,7 @@ this.lastSelectedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, l
 
       const handleKeyPress = async (_, key) => {
         if (!this.isInMenu) return;
-        
-        // Emit key press event for menu
+
         this.emitEvent(this.eventTypes.KEY_PRESS, {
           key: key.name,
           sequence: key.sequence,
@@ -2067,35 +2209,106 @@ this.lastSelectedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, l
           meta: key.meta,
           inMenu: true
         });
-        
+
         // --- FIELD EDITING MODE (handled by raw listener, ignore keypress) ---
         if (this.isEditing && this.activeField) {
-            return;
+          return;
         }
-        
+
         // --- NORMAL MENU NAVIGATION ---
         switch (key.name) {
-          case 'up':
+          case 'up': {
+            const now = Date.now();
+            checkKeyRelease();
+            upLastSeenTime = now;
+
+            // If a hold was detected, swallow any potential double-tap
+            // and just navigate normally.
+            if (!upHoldDetected) {
+              const elapsed = now - lastUpPressTime;
+
+              if (lastUpPressTime !== 0 && elapsed <= DOUBLE_TAP_WINDOW_MS) {
+                // Two presses within the window → check if this is actually
+                // auto-repeat. If the previous gap was extremely short (<50ms),
+                // it's more likely a hold; mark hold detected and cancel.
+                // Otherwise treat as a genuine double-tap.
+                if (elapsed < 50) {
+                  upHoldDetected = true;
+                  lastUpPressTime = 0;
+                } else {
+                  // Genuine double-tap
+                  lastUpPressTime = 0;
+
+                  if (hasPinnedTopArea) {
+                    scrollOffset = 0;
+                    setFocus(0, 0);
+                  } else if (normalizedOptions.length > 0) {
+                    setFocus(0, 0);
+                  }
+                  break;
+                }
+              } else {
+                lastUpPressTime = now;
+              }
+            }
+
             if (line > 0) line--;
             if (column >= normalizedOptions[line].length) column = normalizedOptions[line].length - 1;
             setFocus(line, column);
             break;
-          case 'down':
+          }
+
+          case 'down': {
+            const now = Date.now();
+            checkKeyRelease();
+            downLastSeenTime = now;
+
+            if (!downHoldDetected) {
+              const elapsed = now - lastDownPressTime;
+
+              if (lastDownPressTime !== 0 && elapsed <= DOUBLE_TAP_WINDOW_MS) {
+                if (elapsed < 50) {
+                  downHoldDetected = true;
+                  lastDownPressTime = 0;
+                } else {
+                  lastDownPressTime = 0;
+
+                  if (hasPinnedArea) {
+                    computeViewport();
+                    scrollOffset = Math.max(0, scrollableCount - maxVisibleLines);
+                    setFocus(pinnedBottomStartIndex, 0);
+                  } else if (normalizedOptions.length > 0) {
+                    const lastLine = normalizedOptions.length - 1;
+                    const lastCol = Math.max(0, normalizedOptions[lastLine].length - 1);
+                    setFocus(lastLine, lastCol);
+                  }
+                  break;
+                }
+              } else {
+                lastDownPressTime = now;
+              }
+            }
+
             if (line < normalizedOptions.length - 1) line++;
             if (column >= normalizedOptions[line].length) column = normalizedOptions[line].length - 1;
             setFocus(line, column);
             break;
+          }
+
           case 'left':
             if (column > 0) column--;
             setFocus(line, column);
             break;
+
           case 'right':
             if (column < normalizedOptions[line].length - 1) column++;
             setFocus(line, column);
             break;
+
           case 'return':
             await selectOption('keyboard');
             return;
+
           case 'c':
             if (key.ctrl) {
               this.cleanupMenuState();
@@ -2121,7 +2334,14 @@ this.lastSelectedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, l
         maxVisibleLines: 1,
         firstItemRow: 0,
         hasUpIndicator: false,
-        hasDownIndicator: false
+        hasDownIndicator: false,
+        pinnedTopCount,
+        scrollableCount,
+        pinnedCount,
+        scrollableStartIndex,
+        pinnedBottomStartIndex,
+        pinnedTopFirstRow: -1,
+        pinnedFirstRow: -1
       };
 
       // Re-render on terminal resize so the viewport adapts to the new
@@ -2990,42 +3210,73 @@ setFocus(newLine, newColumn);
    * @returns {number} Index of the option or -1 if not found
    */
   findOptionIndexAtCoordinates(terminalY, terminalX, normalizedOptions, question) {
-    // The renderer stores the exact terminal row where the first visible
-    // option was drawn (after the header and any "more above" indicator).
-    // This makes clicks work even when the menu is scrolled or the terminal
-    // was resized, without ever cutting or offsetting the first button.
+    // The renderer stores the exact terminal rows where the first visible
+    // scrollable option, the first pinned-top option and the first
+    // pinned-bottom option were drawn. Mouse coordinates are mapped back
+    // into the combined normalizedOptions array, whose ordering is:
+    //   [pinned-top] → [scrollable] → [pinned-bottom]
     const state = this.currentMenuState;
 
-    let firstItemRow;
-    let scrollOffset = 0;
-    let maxVisible;
+    const pinnedTopCount = (state && typeof state.pinnedTopCount === 'number')
+      ? state.pinnedTopCount
+      : 0;
+    const scrollableCount = (state && typeof state.scrollableCount === 'number')
+      ? state.scrollableCount
+      : normalizedOptions.length;
+    const scrollableStartIndex = (state && typeof state.scrollableStartIndex === 'number')
+      ? state.scrollableStartIndex
+      : pinnedTopCount;
+    const pinnedBottomStartIndex = (state && typeof state.pinnedBottomStartIndex === 'number')
+      ? state.pinnedBottomStartIndex
+      : (pinnedTopCount + scrollableCount);
 
-    if (state && typeof state.firstItemRow === 'number') {
-      // Preferred: use the precise info from the last render.
-      firstItemRow = state.firstItemRow;
-      scrollOffset = state.scrollOffset || 0;
-      maxVisible = typeof state.maxVisibleLines === 'number'
-        ? state.maxVisibleLines
-        : normalizedOptions.length;
+    const pinnedTopFirstRow = (state && typeof state.pinnedTopFirstRow === 'number')
+      ? state.pinnedTopFirstRow
+      : -1;
+    const pinnedFirstRow = (state && typeof state.pinnedFirstRow === 'number')
+      ? state.pinnedFirstRow
+      : -1;
+
+    let row;
+
+    if (pinnedTopFirstRow >= 0 && terminalY >= pinnedTopFirstRow && terminalY < (pinnedTopFirstRow + pinnedTopCount)) {
+      // Click is inside the pinned-top area
+      row = terminalY - pinnedTopFirstRow;
+    } else if (pinnedFirstRow >= 0 && terminalY >= pinnedFirstRow) {
+      // Click is inside the pinned-bottom area (below the separator)
+      row = pinnedBottomStartIndex + (terminalY - pinnedFirstRow);
     } else {
-      // Fallback (e.g. very first paint before state is set): compute the
-      // header height from the question so behaviour matches the original.
-      firstItemRow = 0;
-      if (question) {
-        firstItemRow += question.split('\n').length + 1;
+      // Click is inside the scrollable area
+      let firstItemRow;
+      let scrollOffset = 0;
+      let maxVisible;
+
+      if (state && typeof state.firstItemRow === 'number') {
+        firstItemRow = state.firstItemRow;
+        scrollOffset = state.scrollOffset || 0;
+        maxVisible = typeof state.maxVisibleLines === 'number'
+          ? state.maxVisibleLines
+          : scrollableCount;
+      } else {
+        firstItemRow = 0;
+        if (question) {
+          firstItemRow += question.split('\n').length + 1;
+        }
+        scrollOffset = 0;
+        maxVisible = scrollableCount;
       }
-      scrollOffset = 0;
-      maxVisible = normalizedOptions.length;
+
+      const relRow = terminalY - firstItemRow + scrollOffset;
+
+      if (relRow < 0) return -1;
+      if (relRow < scrollOffset) return -1;
+      if (relRow >= scrollOffset + maxVisible) return -1;
+      if (relRow >= scrollableCount) return -1;
+
+      row = scrollableStartIndex + relRow;
     }
 
-    // Convert terminal Y to a row index inside normalizedOptions
-    const row = terminalY - firstItemRow + scrollOffset;
-
-    // Out of the visible window / out of data
-    if (row < 0) return -1;
-    if (row < scrollOffset) return -1;
-    if (row >= scrollOffset + maxVisible) return -1;
-    if (row >= normalizedOptions.length) return -1;
+    if (row < 0 || row >= normalizedOptions.length) return -1;
 
     // Find the column inside that row
     let currentColumn = 0;
@@ -3272,6 +3523,10 @@ class userBuild {
     this.UserID = this.Session.UserID || undefined
     /** @type {string} */
     this.Text = ''
+    /** @type {string} Text rendered inside the pinned-top area (above pinned-top options) */
+    this.PinnedTopText = ''
+    /** @type {string} Text rendered inside the pinned-bottom area (above pinned-bottom options) */
+    this.PinnedText = ''
     /** @type {Array<Object>} */
     this.Buttons = []
     /** @type {boolean} */
@@ -7886,7 +8141,13 @@ function levenshteinDistance(str1, str2) {
             props: finalConfig.props || {},
             path: finalConfig.path || this.Name,
             resetSelection: finalConfig.resetSelection || false,
-            jumpTo: finalConfig.jumpTo || false
+            jumpTo: finalConfig.jumpTo || false,
+            // If true, this button is rendered in the pinned-bottom
+            // area at the bottom of the screen, below a single separator line.
+            pinned: finalConfig.pinned || false,
+            // If true, this button is rendered in the pinned-top
+            // area at the top of the screen, above a single separator line.
+            pinnedTop: finalConfig.pinnedTop || false
           },
           action: (finalConfig.action) ? finalConfig.action : () => { },
         };
@@ -7998,10 +8259,28 @@ function levenshteinDistance(str1, str2) {
      */
     this.Text = (id, text, config = {}) => {
       if (this.Builds.has(id)) {
-        if (this.Builds.get(id).Text != '') {
-          this.Builds.get(id).Text = `${this.Builds.get(id).Text}\n${text}`
+        const userBuild = this.Builds.get(id);
+
+        if (config.pinnedTop) {
+          // Pinned-top text is rendered above the top separator line.
+          if (userBuild.PinnedTopText != '') {
+            userBuild.PinnedTopText = `${userBuild.PinnedTopText}\n${text}`
+          } else {
+            userBuild.PinnedTopText = text
+          }
+        } else if (config.pinned) {
+          // Pinned text is rendered below the separator, at the bottom of the screen.
+          if (userBuild.PinnedText != '') {
+            userBuild.PinnedText = `${userBuild.PinnedText}\n${text}`
+          } else {
+            userBuild.PinnedText = text
+          }
         } else {
-          this.Builds.get(id).Text = text
+          if (userBuild.Text != '') {
+            userBuild.Text = `${userBuild.Text}\n${text}`
+          } else {
+            userBuild.Text = text
+          }
         }
 
       } else {
@@ -8060,6 +8339,12 @@ function levenshteinDistance(str1, str2) {
             type: 'field',
             label: config.label || '', // empty if not provided
             value: value,
+            // If true, this field is rendered in the pinned-bottom
+            // area at the bottom of the screen, below a single separator line.
+            pinned: config.pinned || false,
+            // If true, this field is rendered in the pinned-top
+            // area at the top of the screen, above a single separator line.
+            pinnedTop: config.pinnedTop || false,
             onChange: (newValue) => {
                 this.Storages.Set(id, storageKey, newValue);
                 if (typeof config.onChange === 'function') {
@@ -8150,6 +8435,8 @@ function levenshteinDistance(str1, str2) {
         let obj_return = {
           hud_obj: {
             title: this.Builds.get(sessionId).Text,
+            pinnedTopTitle: this.Builds.get(sessionId).PinnedTopText || undefined,
+            pinnedTitle: this.Builds.get(sessionId).PinnedText || undefined,
             options: this.Builds.get(sessionId).Buttons
           },
           wait_input: this.Builds.get(sessionId).WaitInput,
@@ -8275,7 +8562,57 @@ class TemplateFunc extends SyAPP_Func {
       async (props) => {
         let uid = props.session.UniqueID
 
-        this.JSON(uid)
+        // ------------------------------------------------------------------
+        // PINNED ELEMENTS DEMO (TOP + BOTTOM, minimalist)
+        // ------------------------------------------------------------------
+        // Elements created with `{ pinnedTop: true }` stay fixed at the top,
+        // above a single separator line. Elements with `{ pinned: true }`
+        // stay fixed at the bottom, below a single separator line. The
+        // middle area keeps its infinite-scroll viewport.
+        //
+        // Double-tap ↑ quickly to jump to the pinned-top area.
+        // Double-tap ↓ quickly to jump to the pinned-bottom area.
+        // ------------------------------------------------------------------
+
+        // Pinned-TOP area (always visible at the top)
+        this.Text(uid, '📌 Top', { pinnedTop: true })
+
+        this.Button(uid, {
+          name: '⬆ Top Action',
+          props: { action: 'top' },
+          pinnedTop: true
+        })
+
+        // Scrollable middle content
+        for (let i = 1; i <= 100; i++) {
+          this.Button(uid, {
+            name: `Item ${i}`,
+            props: { index: i }
+          })
+        }
+
+        // Pinned-BOTTOM area (always visible at the bottom)
+        this.Field(uid, 'pinned_demo_note', {
+          label: '📝 Note',
+          initialValue: 'edit me',
+          pinned: true
+        })
+
+        this.Button(uid, {
+          name: '📌 Home',
+          props: { action: 'home' },
+          pinned: true
+        })
+        this.Button(uid, {
+          name: '📌 Refresh',
+          props: { action: 'refresh' },
+          pinned: true
+        })
+        this.Button(uid, {
+          name: '📌 Exit',
+          props: { action: 'exit' },
+          pinned: true
+        })
       }
     )
   }
