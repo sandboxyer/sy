@@ -1261,6 +1261,14 @@ class TerminalHUD extends EventEmitter {
     this.isEditing = false;
     this.WHEEL_THRESHOLD = 1; // Number of wheel events needed to trigger navigation
 
+    // Persisted viewport scroll offset across menu rebuilds of the SAME
+    // function/page. This is what makes dropdown (and nested dropdown)
+    // toggling feel fluid: instead of snapping the viewport back to the top
+    // and then re-scrolling to re-reveal the focused item (which produces
+    // the "the menu keeps going down" drift), the viewport stays exactly
+    // where the user had it.
+    this._lastScrollOffset = 0;
+
     // Track if we're currently in a menu
     this.isInMenu = false;
 
@@ -1714,6 +1722,15 @@ if (configuration.remember) {
   // Ensure finalIndex is within bounds
   finalIndex = Math.max(0, Math.min(finalIndex, totalOptions - 1));
 
+  // Only reset the persisted viewport scroll when the menu is genuinely
+  // being (re)opened fresh (different function, resetSelection, etc.).
+  // For same-function rebuilds (dropdown toggles, refreshes, navigations
+  // between pages of the same function) we KEEP the previous scroll offset
+  // so the viewport does not jump every time a dropdown is opened/closed.
+  if (!configuration.remember) {
+    this._lastScrollOffset = 0;
+  }
+
   this.lastFocusedIndex = finalIndex;
   
   // Store reference to menu generator for function case
@@ -1912,7 +1929,12 @@ if (configuration.remember) {
       // ------------------------------------------------------------------
       // VIEWPORT SCROLL STATE (native pagination for small terminals)
       // ------------------------------------------------------------------
-      let scrollOffset = 0;
+      // Restore the scroll offset from the previous render of the same
+      // function/page. Preserving it here is what prevents the viewport
+      // from repeatedly snapping back to index 0 and then re-scrolling
+      // (which is what made nested dropdown toggles "drift downward" when
+      // the user was already scrolled mid-list).
+      let scrollOffset = this._lastScrollOffset || 0;
       let maxVisibleLines = 1;
 
       // ------------------------------------------------------------------
@@ -2059,6 +2081,12 @@ if (configuration.remember) {
         const maxScroll = Math.max(0, scrollableCount - maxVisibleLines);
         if (scrollOffset > maxScroll) scrollOffset = maxScroll;
         if (scrollOffset < 0) scrollOffset = 0;
+
+        // Persist the (clamped) scroll offset so the next rebuild of the
+        // same menu keeps the viewport in exactly the same visual place.
+        // This is the key fix that makes dropdown / nested dropdown
+        // toggling fluid even when the user is scrolled mid-list.
+        this._lastScrollOffset = scrollOffset;
 
         const startRel = scrollOffset;
         const endRel = Math.min(scrollOffset + maxVisibleLines, scrollableCount);
