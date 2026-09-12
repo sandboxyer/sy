@@ -37,6 +37,9 @@ class ClipboardMonitor {
         this.trackerSessionId = null; // NEW
         this.lastTrackedDir = process.cwd();
         this.isBackgroundProcess = false;
+
+        // Auto-pause-after-commands mode
+        this.pauseAfterMode = false;
     }
 
     async question(query) {
@@ -140,7 +143,7 @@ class ClipboardMonitor {
     async executeCommands(profile) {
         if (!profile.commands || profile.commands.length === 0) {
             console.log('No commands to execute');
-            return;
+            return true;
         }
 
         console.log('Waiting for file creation to complete...');
@@ -148,12 +151,13 @@ class ClipboardMonitor {
         
         if (!fileCreated) {
             console.error('✗ File was not created within timeout period');
-            return;
+            return false;
         }
 
         console.log(`✓ File confirmed created and stable: ${this.outputPath}`);
         console.log(`Executing ${profile.commands.length} command(s) sequentially...`);
         
+        let allSucceeded = true;
         for (let i = 0; i < profile.commands.length; i++) {
             const command = profile.commands[i];
             console.log(`[${i + 1}/${profile.commands.length}] Executing: ${command}`);
@@ -169,6 +173,7 @@ class ClipboardMonitor {
                 console.log(`  ✓ Command completed successfully`);
             } catch (error) {
                 console.error(`  ✗ Command failed: ${error.message}`);
+                allSucceeded = false;
                 const continueExec = await this.question('  Continue with next commands? (y/n): ');
                 if (continueExec.toLowerCase() !== 'y') {
                     console.log('  Stopping command execution.');
@@ -176,6 +181,7 @@ class ClipboardMonitor {
                 }
             }
         }
+        return allSucceeded;
     }
 
     async getClipboardContent() {
@@ -487,11 +493,22 @@ class ClipboardMonitor {
                     if (this.notifyMode && allCommandsFinished) {
                         this.sendCompletionSignal();
                     }
+                    if (this.pauseAfterMode && allCommandsFinished) {
+                        this.autoPauseAfterCommands();
+                    }
                 }
             }
             
             console.log('='.repeat(60) + '\n');
         }
+    }
+
+    autoPauseAfterCommands() {
+        if (this.isPaused) {
+            return;
+        }
+        this.isPaused = true;
+        console.log('\n⏸️  Auto-paused after commands finished - Press P to resume');
     }
 
     async showProfiles() {
@@ -512,6 +529,7 @@ class ClipboardMonitor {
             if (profile.defaultBg) defaultFlags.push('bg');
             if (profile.defaultTag) defaultFlags.push('tag');
             if (profile.defaultNotify) defaultFlags.push('notify');
+            if (profile.defaultPauseAfter) defaultFlags.push('pause-after');
             console.log(`   Default flags: ${defaultFlags.length > 0 ? defaultFlags.join(', ') : 'none'}`);
             profile.commands.forEach((cmd, cmdIndex) => {
                 console.log(`     ${cmdIndex + 1}. ${cmd}`);
@@ -543,13 +561,15 @@ class ClipboardMonitor {
         const defaultBg = (await this.question('Enable --bg by default? (y/n): ')).toLowerCase() === 'y';
         const defaultTag = (await this.question('Enable --tag by default? (y/n): ')).toLowerCase() === 'y';
         const defaultNotify = (await this.question('Enable --notify by default? (y/n): ')).toLowerCase() === 'y';
+        const defaultPauseAfter = (await this.question('Enable --pause-after by default? (y/n): ')).toLowerCase() === 'y';
 
         this.config.profiles[name] = {
             outputFile,
             commands,
             defaultBg,
             defaultTag,
-            defaultNotify
+            defaultNotify,
+            defaultPauseAfter
         };
         
         await this.saveConfig();
@@ -589,6 +609,11 @@ class ClipboardMonitor {
         const notifyInput = await this.question(`Enable --notify by default? (current: ${currentNotify ? 'yes' : 'no'}) [y/n/Enter to keep]: `);
         if (notifyInput.toLowerCase() === 'y') this.config.profiles[name].defaultNotify = true;
         else if (notifyInput.toLowerCase() === 'n') this.config.profiles[name].defaultNotify = false;
+
+        const currentPauseAfter = this.config.profiles[name].defaultPauseAfter || false;
+        const pauseAfterInput = await this.question(`Enable --pause-after by default? (current: ${currentPauseAfter ? 'yes' : 'no'}) [y/n/Enter to keep]: `);
+        if (pauseAfterInput.toLowerCase() === 'y') this.config.profiles[name].defaultPauseAfter = true;
+        else if (pauseAfterInput.toLowerCase() === 'n') this.config.profiles[name].defaultPauseAfter = false;
         
         console.log('Current commands:');
         this.config.profiles[name].commands.forEach((cmd, index) => {
@@ -648,7 +673,8 @@ class ClipboardMonitor {
             commands: [...sourceProfile.commands],
             defaultBg: sourceProfile.defaultBg,
             defaultTag: sourceProfile.defaultTag,
-            defaultNotify: sourceProfile.defaultNotify
+            defaultNotify: sourceProfile.defaultNotify,
+            defaultPauseAfter: sourceProfile.defaultPauseAfter
         };
         await this.saveConfig();
         console.log(`✓ Profile "${sourceName}" duplicated as "${newName}".`);
@@ -790,7 +816,7 @@ class ClipboardMonitor {
     }
 
     // Create background process script
-    createBackgroundScript(profileName, tagMode, shellPid, tty, sessionId, bgToken, notifyMode = false) {
+    createBackgroundScript(profileName, tagMode, shellPid, tty, sessionId, bgToken, notifyMode = false, pauseAfterMode = false) {
         return `
 import { exec } from 'child_process';
 import { promisify } from 'util';
@@ -811,6 +837,7 @@ class BackgroundClipboardMonitor {
         this.outputPath = path.join(process.cwd(), 'result');
         this.lastClipboardContent = '';
         this.isMonitoring = true;
+        this.isPaused = false;
         this.tagRestrictMode = ${tagMode};
         this.config = {
             profiles: {},
@@ -823,6 +850,7 @@ class BackgroundClipboardMonitor {
         this.trackerSessionId = '${sessionId || ''}';
         this.lastTrackedDir = process.cwd();
         this.notifyMode = ${notifyMode};
+        this.pauseAfterMode = ${pauseAfterMode};
         this.profileName = '${profileName || ''}';
         
         this.logFile = path.join(os.homedir(), '.clipboard-monitor', 'clipwait-bg-' + BG_TOKEN + '.log');
@@ -1141,6 +1169,10 @@ class BackgroundClipboardMonitor {
     }
     
     async checkClipboard() {
+        if (this.isPaused) {
+            return;
+        }
+        
         await this.checkDirectoryChange();
         
         const currentContent = await this.getClipboardContent();
@@ -1175,6 +1207,10 @@ class BackgroundClipboardMonitor {
                     const allCommandsFinished = await this.executeCommands(profile);
                     if (this.notifyMode && allCommandsFinished) {
                         this.sendCompletionSignal();
+                    }
+                    if (this.pauseAfterMode && allCommandsFinished) {
+                        this.isPaused = true;
+                        this.log('⏸️  Auto-paused after commands finished');
                     }
                 }
             }
@@ -1446,7 +1482,7 @@ monitor.start().catch(error => {
         });
     }
 
-    async startBackgroundMode(profileName, notifyMode = false) {
+    async startBackgroundMode(profileName, notifyMode = false, pauseAfterMode = false) {
         console.log('🚀 Starting ClipWait in background mode with terminal tracking...');
         
         // Capture terminal info before backgrounding
@@ -1467,6 +1503,9 @@ monitor.start().catch(error => {
         if (notifyMode) {
             console.log('🔔 Notification mode enabled: will send terminal signal when commands finish.');
         }
+        if (pauseAfterMode) {
+            console.log('⏸️  Auto-pause-after-commands mode enabled.');
+        }
         
         // Generate unique token for this background process
         const bgToken = `bg_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
@@ -1480,7 +1519,8 @@ monitor.start().catch(error => {
             info.tty,
             info.sessionId,
             bgToken,
-            notifyMode
+            notifyMode,
+            pauseAfterMode
         );
         
         // Write background script to temp file
@@ -1552,6 +1592,7 @@ monitor.start().catch(error => {
         let bgModeRequested = false;
         let statusMode = false;
         let notifyMode = false;
+        let pauseAfterMode = false;
         let argProfile = null;
         
         // Parse arguments in any order, track explicit flags
@@ -1559,6 +1600,7 @@ monitor.start().catch(error => {
         let explicitBg = false;
         let explicitTag = false;
         let explicitNotify = false;
+        let explicitPauseAfter = false;
         for (const arg of args) {
             if (arg === '--tag') {
                 tagMode = true;
@@ -1571,6 +1613,9 @@ monitor.start().catch(error => {
             } else if (arg === '--notify') {
                 notifyMode = true;
                 explicitNotify = true;
+            } else if (arg === '--pause-after') {
+                pauseAfterMode = true;
+                explicitPauseAfter = true;
             } else {
                 remainingArgs.push(arg);
             }
@@ -1590,6 +1635,7 @@ monitor.start().catch(error => {
                 if (!explicitBg && profile.defaultBg) bgModeRequested = true;
                 if (!explicitTag && profile.defaultTag) tagMode = true;
                 if (!explicitNotify && profile.defaultNotify) notifyMode = true;
+                if (!explicitPauseAfter && profile.defaultPauseAfter) pauseAfterMode = true;
             }
         }
         
@@ -1602,6 +1648,11 @@ monitor.start().catch(error => {
         if (bgModeRequested) {
             this.bgMode = true;
             console.log('🔍 Background Mode enabled.');
+        }
+
+        if (pauseAfterMode) {
+            this.pauseAfterMode = true;
+            console.log('⏸️  Auto-Pause After Commands mode enabled: monitoring will pause after all commands finish.');
         }
         
         // If background mode is enabled and no profile specified, open manager
@@ -1618,7 +1669,7 @@ monitor.start().catch(error => {
                 return;
             }
             
-            await this.startBackgroundMode(argProfile, notifyMode);
+            await this.startBackgroundMode(argProfile, notifyMode, pauseAfterMode);
             this.rl.close();
             return;
         }
