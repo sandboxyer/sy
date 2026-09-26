@@ -2214,7 +2214,10 @@ main
      * Keybindings (log view):
      *   ↑/↓ or j/k     Scroll log by one line
      *   PgUp/PgDn      Scroll log by one page
-     *   Home/End or g/G Jump to top / jump to bottom (enables follow)
+     *   Mouse wheel    Smooth infinite scroll up/down through the log
+     *   Home / g       Jump to the very top of the log
+     *   End  / G       Jump to the very end of the log (enables follow)
+     *   %              Prompt for a percentage (0-100) and jump there instantly
      *   f              Toggle follow (auto-scroll to newest)
      *   q / Esc / b    Return to process list
      *   Ctrl+C         Quit the dashboard
@@ -2241,6 +2244,9 @@ main
         const showCursor = () => write(`${ESC}[?25h`);
         const enterAltScreen = () => write(`${ESC}[?1049h`);
         const exitAltScreen = () => write(`${ESC}[?1049l`);
+        // SGR mouse tracking (1000 = button/wheel events, 1006 = SGR extended coords)
+        const enableMouse = () => write(`${ESC}[?1000h${ESC}[?1006h`);
+        const disableMouse = () => write(`${ESC}[?1000l${ESC}[?1006l`);
 
         const truncVisible = (str, len) => {
             if (len <= 0) return '';
@@ -2287,6 +2293,7 @@ main
             logLines: [],
             logScroll: 0,
             logFollow: true,
+            percentInput: null,
             lastLogSize: -1,
             isRunning: true,
             refreshTimer: null
@@ -2549,10 +2556,18 @@ main
             }
 
             lines.push(`${ESC}[90m${'─'.repeat(Math.max(1, width))}${ESC}[0m`);
-            const range = total > 0 ? `${start + 1}-${end}/${total}` : `0/0`;
-            const follow = state.logFollow ? `${ESC}[32mFOLLOW${ESC}[0m` : `${ESC}[33mPAUSED${ESC}[0m`;
-            const footer = ` ↑/↓ scroll   PgUp/PgDn page   Home/End   f ${state.logFollow ? 'pause' : 'follow'}   q/Esc back    [${range}] ${follow}`;
-            lines.push(truncVisible(footer, width));
+            if (state.percentInput !== null) {
+                const prompt = ` Jump to % of log (0-100): ${state.percentInput}█   [Enter = apply   Esc = cancel]`;
+                lines.push(truncVisible(`${ESC}[1;33m${prompt}${ESC}[0m`, width));
+            } else {
+                const range = total > 0 ? `${start + 1}-${end}/${total}` : `0/0`;
+                const follow = state.logFollow ? `${ESC}[32mFOLLOW${ESC}[0m` : `${ESC}[33mPAUSED${ESC}[0m`;
+                const pctShown = total > 0 && maxScroll > 0
+                    ? Math.round((state.logScroll / maxScroll) * 100)
+                    : (state.logFollow ? 100 : 0);
+                const footer = ` ↑/↓ wheel scroll   PgUp/PgDn   Home/End(top/end)   % jump-to-%   f ${state.logFollow ? 'pause' : 'follow'}   q/Esc back   [${range}] ${pctShown}% ${follow}`;
+                lines.push(truncVisible(footer, width));
+            }
 
             return lines;
         };
@@ -2669,8 +2684,48 @@ main
                     shutdown();
                 }
             } else if (state.mode === 'log') {
+                // Percent-jump input mode takes precedence over all other keys
+                if (state.percentInput !== null) {
+                    if (data === ESC || data === 'q' || data === 'Q') {
+                        state.percentInput = null;
+                        render();
+                        return;
+                    }
+                    if (data === '\r' || data === '\n') {
+                        const val = parseFloat(state.percentInput);
+                        if (!isNaN(val)) {
+                            const pct = Math.max(0, Math.min(100, val));
+                            const totalLines = state.logLines.length;
+                            const { height } = getSize();
+                            const footerLines = 2;
+                            const headerLines = 3;
+                            const visibleRows = Math.max(1, height - headerLines - footerLines);
+                            const maxScroll = Math.max(0, totalLines - visibleRows);
+                            state.logFollow = (pct >= 100);
+                            state.logScroll = Math.round((pct / 100) * maxScroll);
+                        }
+                        state.percentInput = null;
+                        render();
+                        return;
+                    }
+                    if (data === '\x7F' || data === '\b') {
+                        state.percentInput = state.percentInput.slice(0, -1);
+                        render();
+                        return;
+                    }
+                    if (/^[0-9.]$/.test(data)) {
+                        state.percentInput += data;
+                        render();
+                        return;
+                    }
+                    return;
+                }
+
                 if (data === 'q' || data === 'Q' || data === 'b' || data === 'B' || data === ESC) {
                     exitLogView();
+                } else if (data === '%') {
+                    state.percentInput = '';
+                    render();
                 } else if (data === `${ESC}[A` || data === `${ESC}[OA` || data === 'k') {
                     state.logFollow = false;
                     state.logScroll = Math.max(0, state.logScroll - 1);
@@ -2701,6 +2756,26 @@ main
             }
         };
 
+        // Mouse wheel handling (SGR extended mouse protocol)
+        // cb = button code: 64 = wheel up, 65 = wheel down (plus 0 = left, 1 = middle, 2 = right)
+        const handleMouse = (cb, _x, _y, _kind) => {
+            if (!state.isRunning) return;
+            if (state.percentInput !== null) return; // don't hijack the input prompt
+            // Wheel events only (SGR bit 6 set)
+            if ((cb & 64) !== 64) return;
+            const down = (cb & 1) === 1; // 64=up, 65=down
+            const step = 3;
+            if (state.mode === 'log') {
+                state.logFollow = false;
+                state.logScroll += down ? step : -step;
+                if (state.logScroll < 0) state.logScroll = 0;
+                render();
+            } else if (state.mode === 'list') {
+                moveSelection(down ? step : -step);
+                render();
+            }
+        };
+
         // Input buffering to handle split escape sequences from some terminals
         const KNOWN_SEQS = [
             `${ESC}[A`, `${ESC}[B`, `${ESC}[C`, `${ESC}[D`,
@@ -2721,6 +2796,28 @@ main
 
         const onData = (chunk) => {
             inputBuffer += chunk;
+
+            // Extract & dispatch any complete SGR mouse sequences first.
+            // SGR format: ESC [ < cb ; x ; y (M|m)
+            const mouseRe = /\x1B\[<(\d+);(\d+);(\d+)([Mm])/;
+            let safety = 0;
+            while (safety++ < 64) {
+                const m = inputBuffer.match(mouseRe);
+                if (!m) break;
+                const idx = inputBuffer.indexOf(m[0]);
+                inputBuffer = inputBuffer.slice(0, idx) + inputBuffer.slice(idx + m[0].length);
+                handleMouse(parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10), m[4]);
+            }
+
+            if (inputBuffer === '') return;
+
+            // Partial mouse sequence pending: wait briefly for the rest
+            if (/^\x1B\[<\d*(?:;\d*){0,2}$/.test(inputBuffer)) {
+                if (inputTimer) clearTimeout(inputTimer);
+                inputTimer = setTimeout(flushInput, 40);
+                return;
+            }
+
             // Not an escape sequence: flush immediately
             if (!inputBuffer.startsWith(ESC)) {
                 flushInput();
@@ -2772,6 +2869,7 @@ main
             try { process.removeListener('SIGTERM', shutdown); } catch (_) {}
             try { process.removeListener('uncaughtException', onUncaught); } catch (_) {}
 
+            try { disableMouse(); } catch (_) {}
             showCursor();
             exitAltScreen();
             console.log('📊 Monitoring stopped.');
@@ -2780,6 +2878,7 @@ main
 
         const onUncaught = (err) => {
             // Always restore the terminal on unexpected errors
+            try { disableMouse(); } catch (_) {}
             try { showCursor(); } catch (_) {}
             try { exitAltScreen(); } catch (_) {}
             console.error('SyPM monit crashed:', err && err.stack ? err.stack : err);
@@ -2788,6 +2887,7 @@ main
 
         // ---------- Start ----------
         enterAltScreen();
+        enableMouse();
         hideCursor();
 
         try {
