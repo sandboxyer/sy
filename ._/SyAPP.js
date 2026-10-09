@@ -19376,11 +19376,54 @@ class SelfBuilder extends SyAPP_Func {
           // func runs inline. In EDIT mode, the ○/◉ dot prefix still
           // opens the pinned editor where `filePath`, `code`, `saveMode`
           // and `dropdown` can be tweaked.
+          //
+          // ─────────────────────────────────────────────────────────
+          // ROBUST NESTED SAVE (recursive Emb fix)
+          // ─────────────────────────────────────────────────────────
+          // After this.Emb() runs, we read the widget's OWN storage
+          // entry back and mirror the produced source (filePath/code)
+          // into the item's own fields. This is the piece that makes
+          // Emb chains save correctly at EVERY nesting depth:
+          //
+          //   • When a nested Emb's Self Build finishes, it writes the
+          //     produced func into the widget's storage entry under
+          //     this builder instance (owner === '__selfbuilder__').
+          //   • Without this sync, the item's own `filePath`/`code`
+          //     fields stay at their initial (empty) values forever,
+          //     so a later export of the OUTER Emb emits an empty
+          //     `await this.Emb(id, { name: ... })` call — the nested
+          //     func's produced source is silently LOST.
+          //   • By pulling the storage back into the item immediately
+          //     after every render, the produced path/code is baked
+          //     into the outer source on the next Finish & Return, so
+          //     the nested func survives arbitrarily deep recursion,
+          //     process restarts, and every subsequent edit cycle.
+          //
+          // The sync is one-directional (widget storage → item) and
+          // only fires when the widget actually holds a real source
+          // (`source === 'file'` with a filePath, or `source === 'code'`
+          // with a code string). Empty widgets leave the item alone,
+          // so a user's manual `filePath` edit via the pinned editor
+          // is never clobbered.
           const cfg = { name: it.name }
           if (it.filePath) cfg.filePath = it.filePath
           if (it.code) cfg.code = it.code
           if (it.dropdown && Object.keys(it.dropdown).length) cfg.dropdown = it.dropdown
           await this.Emb(id, cfg)
+
+          try {
+            const embStorageKey = `emb_${it.name}`
+            const st = this.Storages.Get(id, embStorageKey)
+            if (st && typeof st === 'object') {
+              if (st.source === 'file' && st.filePath) {
+                if (it.filePath !== st.filePath) it.filePath = st.filePath
+                if (it.code !== '') it.code = ''
+              } else if (st.source === 'code' && st.code) {
+                if (it.code !== st.code) it.code = st.code
+                if (it.filePath !== '') it.filePath = ''
+              }
+            }
+          } catch (_) { /* sync is best-effort — never break render */ }
           break
         }
         case 'route':
