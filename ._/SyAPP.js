@@ -12789,6 +12789,1041 @@ function levenshteinDistance(str1, str2) {
       return this.Storages.Get(id, storageKey);
     };
 
+    // --------------------------- Flow Method ---------------------------
+
+    /**
+     * Create a Flow (node-graph editor) launcher for this func.
+     *
+     * Clicking the launcher opens a full-screen, DECOUPLED terminal flow
+     * editor in an alternate screen buffer — mirroring exactly how
+     * this.TextEditor() works. The editor:
+     *   • Uses raw TTY mode + SGR mouse tracking (isolated from the HUD).
+     *   • Renders nodes, ports, connection lines, a context menu, and a
+     *     live status bar.
+     *   • Supports mouse drag (move nodes), port-to-port connection
+     *     dragging, right-click context menus, keyboard navigation, pan.
+     *   • Persists its FULL state (nodes, edges, camera, selection)
+     *     back into the user's storage on exit, so progress survives
+     *     exiting and re-entering — exactly like the text editor keeps
+     *     its content between opens.
+     *
+     * The state is stored under `flow_<name>` and is also returned from
+     * this.Flow() so it can be inspected in code.
+     *
+     * @param {string} id - User/build ID
+     * @param {string} name - Unique name for this Flow instance
+     * @param {Object} [config] - Flow configuration
+     * @param {string} [config.label] - Label shown on the button
+     * @param {string} [config.buttonText] - Custom button text (default '⛶ <label>')
+     * @param {boolean} [config.pinned] - Pin the button to the bottom area
+     * @param {boolean} [config.pinnedTop] - Pin the button to the top area
+     * @returns {Promise<Object>} The current Flow state object
+     */
+    this.Flow = async (id, name, config = {}) => {
+      if (!this.Builds.has(id)) {
+        if (this.Log) console.log(`this.Flow() Error - userBuild not found | BuildID: ${id}`);
+        return null;
+      }
+
+      const storageKey = `flow_${name}`;
+      let state = this.Storages.Get(id, storageKey);
+      if (!state || typeof state !== 'object') {
+        // Default boot layout — mirrors the reference init() seed.
+        state = {
+          cam: { x: 0, y: 0 },
+          nextId: 4,
+          nodes: [
+            { id: 1, x: 0,  y: 0,  w: 9,  h: 3, label: 'Start'   },
+            { id: 2, x: 30, y: 0,  w: 12, h: 3, label: 'Process' },
+            { id: 3, x: 15, y: 12, w: 7,  h: 3, label: 'End'     }
+          ],
+          edges: [
+            { from: 1, to: 2, fromPort: 'e', toPort: 'w' },
+            { from: 2, to: 3, fromPort: 's', toPort: 'e' },
+            { from: 1, to: 3, fromPort: 's', toPort: 'w' }
+          ],
+          selected: 0,
+          selectedEdge: -1
+        };
+        this.Storages.Set(id, storageKey, state);
+      }
+
+      const build = this.Builds.get(id);
+      const triggerProp = `__flow_open_${name}`;
+      const currentProps = (build.Session && build.Session.ActualProps) || {};
+
+      // If the trigger prop is present the user just clicked the button,
+      // so open the editor. This mirrors this.TextEditor(): the trigger
+      // flows back through LoadScreen on the next Build pass, where the
+      // terminal is guaranteed to have been released by cleanupMenuState.
+      if (currentProps[triggerProp]) {
+        delete currentProps[triggerProp];
+        try {
+          await this._openFlowEditor(id, name, config);
+        } catch (err) {
+          if (this.Log) console.error('Flow editor error:', err);
+        }
+      }
+
+      const buttonCfg = {
+        name: config.buttonText || `⛶ ${config.label || name}`,
+        props: { [triggerProp]: true }
+      };
+      if (config.pinned !== undefined) buttonCfg.pinned = config.pinned;
+      if (config.pinnedTop !== undefined) buttonCfg.pinnedTop = config.pinnedTop;
+      this.Button(id, buttonCfg);
+
+      return this.Storages.Get(id, storageKey);
+    };
+
+    /**
+     * Internal: run the full-screen Flow editor.
+     *
+     * This is the reference test.cjs implementation, verbatim, wrapped
+     * into a Promise so it integrates with SyAPP the same way
+     * _openTextEditor / _openCellsEditor do. Differences from the
+     * standalone reference:
+     *
+     *   • State comes from / goes to `this.Storages` under
+     *     `flow_<name>` — so exiting and re-entering preserves progress.
+     *   • Terminal enter/exit is symmetric with the text editor: alt
+     *     screen, raw mode, mouse tracking, line-wrap toggle are all
+     *     restored on the way out so the parent HUD menu can rebuild.
+     *   • Ctrl+C and `q` return to SyAPP instead of killing the process.
+     *   • All HUD listeners are detached up front so nothing races us
+     *     for raw stdin bytes while the editor is running.
+     *
+     * @private
+     */
+    this._openFlowEditor = async (id, name, config = {}) => {
+      const storageKey = `flow_${name}`;
+      const self = this;
+
+      return new Promise((resolve) => {
+        // -------- Save terminal state --------
+        let wasRaw = false;
+        try { wasRaw = !!stdin.isRaw; } catch (_) {}
+
+        const hud = this._syappInstance && this._syappInstance.HUD;
+        const mouseWasEnabled = !!(hud && hud.isMouseEnabled);
+
+        // Detach HUD-owned stdin listeners + disable HUD mouse tracking
+        if (mouseWasEnabled && hud) {
+          try { stdout.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l'); } catch (_) {}
+          try { stdin.removeListener('data', hud.handleMouseData); } catch (_) {}
+          hud.isMouseEnabled = false;
+        }
+        try { stdin.removeAllListeners('keypress'); } catch (_) {}
+
+        // -------- Enter alternate screen, hide cursor, disable wrap --------
+        try {
+          stdout.write('\x1b[?1049h');
+          stdout.write('\x1b[?25l');
+          stdout.write('\x1b[?7l');
+        } catch (_) {}
+        // -------- Enable mouse tracking (SGR, click + drag + release) --------
+        try {
+          stdout.write('\x1b[?1000h\x1b[?1002h\x1b[?1006h');
+        } catch (_) {}
+        try { stdout.write('\x1b[2J'); } catch (_) {}
+
+        // -------- ANSI palette (unchanged from reference) --------
+        const RESET   = '\x1b[0m';
+        const CYAN    = '\x1b[36m';
+        const GREEN   = '\x1b[32m';
+        const YELLOW  = '\x1b[33m';
+        const MAGENTA = '\x1b[35m';
+        const RED     = '\x1b[31m';
+        const REV     = '\x1b[7m';
+        const DIM     = '\x1b[90m';
+
+        // -------- Screen dimensions --------
+        let CW = stdout.columns || 80;
+        let CH = Math.max(8, (stdout.rows || 24) - 2);
+
+        // -------- Load live state from storage --------
+        const persisted = self.Storages.Get(id, storageKey) || {
+          cam: { x: 0, y: 0 },
+          nextId: 1,
+          nodes: [],
+          edges: [],
+          selected: 0,
+          selectedEdge: -1
+        };
+
+        const cam = persisted.cam && typeof persisted.cam === 'object'
+          ? { x: Number(persisted.cam.x) || 0, y: Number(persisted.cam.y) || 0 }
+          : { x: 0, y: 0 };
+        let nextId = Number(persisted.nextId) || 1;
+        const nodes = Array.isArray(persisted.nodes) ? persisted.nodes : [];
+        const edges = Array.isArray(persisted.edges) ? persisted.edges : [];
+        let selected     = typeof persisted.selected === 'number' ? persisted.selected : 0;
+        let selectedEdge = typeof persisted.selectedEdge === 'number' ? persisted.selectedEdge : -1;
+
+        let drag      = null;
+        let panning   = null;
+        let portDrag  = null;
+        let menu      = null;
+        let editing   = null;
+
+        let mouseSX = -1, mouseSY = -1;
+        let mouseWX = 0,  mouseWY = 0;
+        let hoverNode = null;
+
+        // -------- Helpers (verbatim from reference) --------
+        const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+        const nodeById = id2 => nodes.find(n => n.id === id2);
+
+        function worldToScreen(wx, wy) { return { x: wx - cam.x, y: wy - cam.y }; }
+        function screenToWorld(sx, sy) { return { x: sx + cam.x, y: sy + cam.y }; }
+
+        function portPos(n, p) {
+          const cx = n.x + Math.floor(n.w / 2);
+          const cy = n.y + Math.floor(n.h / 2);
+          switch (p) {
+            case 'n': return { x: cx, y: n.y };
+            case 's': return { x: cx, y: n.y + n.h - 1 };
+            case 'w': return { x: n.x, y: cy };
+            case 'e': return { x: n.x + n.w - 1, y: cy };
+          }
+        }
+        function dirVec(p) {
+          switch (p) {
+            case 'n': return { x: 0, y: -1 };
+            case 's': return { x: 0, y: 1 };
+            case 'w': return { x: -1, y: 0 };
+            case 'e': return { x: 1, y: 0 };
+          }
+        }
+        function portAt(wx, wy, restrictToNode) {
+          if (!restrictToNode) return null;
+          for (const p of ['n', 'e', 's', 'w']) {
+            const pp = portPos(restrictToNode, p);
+            if (wx === pp.x && wy === pp.y) return { node: restrictToNode, port: p };
+          }
+          return null;
+        }
+        function nearestPort(n, wx, wy) {
+          let best = 'e', bestD = Infinity;
+          for (const p of ['n', 'e', 's', 'w']) {
+            const pp = portPos(n, p);
+            const d = Math.abs(pp.x - wx) + Math.abs(pp.y - wy);
+            if (d < bestD) { bestD = d; best = p; }
+          }
+          return best;
+        }
+        function nodeAt(wx, wy) {
+          for (let i = nodes.length - 1; i >= 0; i--) {
+            const n = nodes[i];
+            if (wx >= n.x && wx < n.x + n.w && wy >= n.y && wy < n.y + n.h) return n;
+          }
+          return null;
+        }
+
+        function makeNode(wx, wy, label) {
+          label = label || ('Node ' + nextId);
+          const w = Math.max(label.length + 4, 12);
+          const n = { id: nextId++, x: wx, y: wy, w, h: 3, label };
+          nodes.push(n);
+          return n;
+        }
+        function addNodeAt(wx, wy) {
+          const label = 'Node ' + nextId;
+          const w = Math.max(label.length + 4, 12);
+          const n = makeNode(wx - Math.floor(w / 2), wy - 1, label);
+          selected = nodes.indexOf(n);
+          selectedEdge = -1;
+        }
+        function deleteNode(n) {
+          const idx = nodes.indexOf(n);
+          if (idx < 0) return;
+          for (let i = edges.length - 1; i >= 0; i--) {
+            if (edges[i].from === n.id || edges[i].to === n.id) edges.splice(i, 1);
+          }
+          nodes.splice(idx, 1);
+          selected = Math.max(0, Math.min(selected, nodes.length - 1));
+          selectedEdge = -1;
+        }
+        function addEdge(fromId, toId, fromPort, toPort) {
+          if (fromId === toId) return;
+          if (edges.some(e => e.from === fromId && e.to === toId)) return;
+          edges.push({ from: fromId, to: toId, fromPort, toPort });
+        }
+
+        function makeCanvas(w, h) {
+          const g = new Array(h);
+          for (let y = 0; y < h; y++) g[y] = new Array(w).fill(' ');
+          return g;
+        }
+        function put(g, x, y, ch, color) {
+          if (y < 0 || y >= g.length) return;
+          const row = g[y];
+          if (x < 0 || x >= row.length) return;
+          row[x] = color ? color + ch + RESET : ch;
+        }
+        function drawGrid(g) {
+          const step = 5;
+          const startX = Math.ceil(cam.x / step) * step;
+          const startY = Math.ceil(cam.y / step) * step;
+          for (let wy = startY; wy < cam.y + CH; wy += step) {
+            for (let wx = startX; wx < cam.x + CW; wx += step) {
+              const sx = wx - cam.x;
+              const sy = wy - cam.y;
+              if (sx < 0 || sy < 0 || sx >= CW || sy >= CH) continue;
+              if (g[sy][sx] === ' ') g[sy][sx] = DIM + '·' + RESET;
+            }
+          }
+        }
+        function drawBox(g, n, isSelected, isSource, isTarget, showPorts) {
+          const x = n.x - cam.x;
+          const y = n.y - cam.y;
+          const right  = x + n.w - 1;
+          const bottom = y + n.h - 1;
+
+          for (let j = y + 1; j < bottom; j++) {
+            for (let i = x + 1; i < right; i++) {
+              put(g, i, j, ' ');
+            }
+          }
+
+          let tl = '┌', tr = '┐', bl = '└', br = '┘', hz = '─', vt = '│', color = null;
+          if (isSelected) { tl = '╔'; tr = '╗'; bl = '╚'; br = '╝'; hz = '═'; vt = '║'; color = GREEN; }
+          if (isSource)   { tl = '╔'; tr = '╗'; bl = '╚'; br = '╝'; hz = '═'; vt = '║'; color = YELLOW; }
+          if (isTarget && !isSource) color = MAGENTA;
+
+          put(g, x, y, tl, color);
+          put(g, right, y, tr, color);
+          put(g, x, bottom, bl, color);
+          put(g, right, bottom, br, color);
+          for (let i = x + 1; i < right; i++) {
+            put(g, i, y, hz, color);
+            put(g, i, bottom, hz, color);
+          }
+          for (let j = y + 1; j < bottom; j++) {
+            put(g, x, j, vt, color);
+            put(g, right, j, vt, color);
+          }
+
+          const label = editing && editing.node === n ? (editing.buf + '_') : n.label;
+          const lx = x + Math.max(1, Math.floor((n.w - label.length) / 2));
+          for (let i = 0; i < label.length; i++) {
+            put(g, lx + i, y + 1, label[i], editing && editing.node === n ? CYAN : color);
+          }
+
+          if (showPorts) {
+            const cx = x + Math.floor(n.w / 2);
+            const cy = y + Math.floor(n.h / 2);
+            const pcol = YELLOW;
+            put(g, cx, y, '┬', pcol);
+            put(g, cx, bottom, '┴', pcol);
+            put(g, x, cy, '├', pcol);
+            put(g, right, cy, '┤', pcol);
+          }
+        }
+
+        function dedupe(pts) {
+          const out = [pts[0]];
+          for (let i = 1; i < pts.length; i++) {
+            const p = pts[i], q = out[out.length - 1];
+            if (p.x !== q.x || p.y !== q.y) out.push(p);
+          }
+          return out;
+        }
+        function hasReversal(path) {
+          for (let i = 2; i < path.length - 1; i++) {
+            const a = path[i - 1], b = path[i], c = path[i + 1];
+            const dx1 = Math.sign(b.x - a.x), dy1 = Math.sign(b.y - a.y);
+            const dx2 = Math.sign(c.x - b.x), dy2 = Math.sign(c.y - b.y);
+            if (dx1 === -dx2 && dy1 === -dy2 && (dx1 || dy1)) return true;
+          }
+          return false;
+        }
+        function routeFromPorts(p1, d1, p2, d2) {
+          const ext = 2;
+          const a1 = { x: p1.x + d1.x * ext, y: p1.y + d1.y * ext };
+          const b1 = { x: p2.x + d2.x * ext, y: p2.y + d2.y * ext };
+          if (a1.x === b1.x || a1.y === b1.y) {
+            return dedupe([p1, a1, b1, p2]);
+          }
+          const pathA = [p1, a1, { x: a1.x, y: b1.y }, b1, p2];
+          const pathB = [p1, a1, { x: b1.x, y: a1.y }, b1, p2];
+          const badA = hasReversal(pathA);
+          const badB = hasReversal(pathB);
+          if (badA && !badB) return dedupe(pathB);
+          return dedupe(pathA);
+        }
+        function routeToMouse(p1, d1, mx, my) {
+          const ext = 2;
+          const a1 = { x: p1.x + d1.x * ext, y: p1.y + d1.y * ext };
+          const pts = [p1, a1];
+          if (a1.x === mx || a1.y === my) {
+            pts.push({ x: mx, y: my });
+          } else if (d1.x !== 0) {
+            pts.push({ x: mx, y: a1.y });
+            pts.push({ x: mx, y: my });
+          } else {
+            pts.push({ x: a1.x, y: my });
+            pts.push({ x: mx, y: my });
+          }
+          return dedupe(pts);
+        }
+        function centerOf(n) {
+          return { x: Math.floor(n.x + n.w / 2), y: Math.floor(n.y + n.h / 2) };
+        }
+        function anchorPoints(a, b) {
+          const ac = centerOf(a), bc = centerOf(b);
+          const dx = bc.x - ac.x, dy = bc.y - ac.y;
+          let p1, p2, horizontal;
+          if (Math.abs(dx) >= Math.abs(dy)) {
+            horizontal = true;
+            if (dx >= 0) {
+              p1 = { x: a.x + a.w - 1, y: clamp(ac.y, a.y, a.y + a.h - 1) };
+              p2 = { x: b.x,           y: clamp(bc.y, b.y, b.y + b.h - 1) };
+            } else {
+              p1 = { x: a.x,           y: clamp(ac.y, a.y, a.y + a.h - 1) };
+              p2 = { x: b.x + b.w - 1, y: clamp(bc.y, b.y, b.y + b.h - 1) };
+            }
+          } else {
+            horizontal = false;
+            if (dy >= 0) {
+              p1 = { x: clamp(ac.x, a.x, a.x + a.w - 1), y: a.y + a.h - 1 };
+              p2 = { x: clamp(bc.x, b.x, b.x + b.w - 1), y: b.y };
+            } else {
+              p1 = { x: clamp(ac.x, a.x, a.x + a.w - 1), y: a.y };
+              p2 = { x: clamp(bc.x, b.x, b.x + b.w - 1), y: b.y + b.h - 1 };
+            }
+          }
+          return [p1, p2, horizontal];
+        }
+        function autoRoute(a, b) {
+          const [p1, p2, horizontal] = anchorPoints(a, b);
+          if (horizontal) {
+            const mx = Math.round((p1.x + p2.x) / 2);
+            return dedupe([p1, { x: mx, y: p1.y }, { x: mx, y: p2.y }, p2]);
+          } else {
+            const my = Math.round((p1.y + p2.y) / 2);
+            return dedupe([p1, { x: p1.x, y: my }, { x: p2.x, y: my }, p2]);
+          }
+        }
+        function edgePolyline(e) {
+          const a = nodeById(e.from);
+          const b = nodeById(e.to);
+          if (!a || !b) return null;
+          if (e.fromPort && e.toPort) {
+            return routeFromPorts(
+              portPos(a, e.fromPort), dirVec(e.fromPort),
+              portPos(b, e.toPort),   dirVec(e.toPort)
+            );
+          }
+          return autoRoute(a, b);
+        }
+        function edgeAt(wx, wy) {
+          for (let i = edges.length - 1; i >= 0; i--) {
+            const pts = edgePolyline(edges[i]);
+            if (!pts) continue;
+            for (let j = 0; j < pts.length - 1; j++) {
+              const p = pts[j], q = pts[j + 1];
+              if (p.y === q.y) {
+                if (Math.abs(wy - p.y) <= 1) {
+                  const x0 = Math.min(p.x, q.x) - 1;
+                  const x1 = Math.max(p.x, q.x) + 1;
+                  if (wx >= x0 && wx <= x1) return i;
+                }
+              } else if (p.x === q.x) {
+                if (Math.abs(wx - p.x) <= 1) {
+                  const y0 = Math.min(p.y, q.y) - 1;
+                  const y1 = Math.max(p.y, q.y) + 1;
+                  if (wy >= y0 && wy <= y1) return i;
+                }
+              }
+            }
+          }
+          return -1;
+        }
+        function drawPolyline(g, pts, color) {
+          const spts = pts.map(p => worldToScreen(p.x, p.y));
+
+          for (let i = 0; i < spts.length - 1; i++) {
+            const a = spts[i], b = spts[i + 1];
+            if (a.y === b.y) {
+              const x0 = Math.min(a.x, b.x), x1 = Math.max(a.x, b.x);
+              for (let x = x0; x <= x1; x++) put(g, x, a.y, '─', color);
+            } else if (a.x === b.x) {
+              const y0 = Math.min(a.y, b.y), y1 = Math.max(a.y, b.y);
+              for (let y = y0; y <= y1; y++) put(g, a.x, y, '│', color);
+            }
+          }
+          for (let i = 1; i < spts.length - 1; i++) {
+            const p = spts[i - 1], c = spts[i], n = spts[i + 1];
+            if (p.x === c.x) {
+              const dy = c.y - p.y, dx = n.x - c.x;
+              if (dy > 0 && dx > 0) put(g, c.x, c.y, '└', color);
+              else if (dy > 0 && dx < 0) put(g, c.x, c.y, '┘', color);
+              else if (dy < 0 && dx > 0) put(g, c.x, c.y, '┌', color);
+              else if (dy < 0 && dx < 0) put(g, c.x, c.y, '┐', color);
+            } else {
+              const dx = c.x - p.x, dy = n.y - c.y;
+              if (dx > 0 && dy > 0) put(g, c.x, c.y, '┐', color);
+              else if (dx > 0 && dy < 0) put(g, c.x, c.y, '┘', color);
+              else if (dx < 0 && dy > 0) put(g, c.x, c.y, '┌', color);
+              else if (dx < 0 && dy < 0) put(g, c.x, c.y, '└', color);
+            }
+          }
+          if (spts.length >= 2) {
+            const last = spts[spts.length - 1], prev = spts[spts.length - 2];
+            let ax = last.x, ay = last.y, arrow = '▶';
+            if (last.x > prev.x)      { ax = last.x - 1; arrow = '▶'; }
+            else if (last.x < prev.x) { ax = last.x + 1; arrow = '◀'; }
+            else if (last.y > prev.y) { ay = last.y - 1; arrow = '▼'; }
+            else if (last.y < prev.y) { ay = last.y + 1; arrow = '▲'; }
+            put(g, ax, ay, arrow, color);
+          }
+        }
+
+        function menuBox() {
+          if (!menu) return null;
+          const w = Math.max(...menu.items.map(it => it.label.length)) + 4;
+          const h = menu.items.length + 2;
+          let x = menu.sx, y = menu.sy;
+          if (x + w > CW) x = Math.max(0, CW - w);
+          if (y + h > CH) y = Math.max(0, CH - h);
+          return { x, y, w, h };
+        }
+        function menuContains(sx, sy) {
+          const b = menuBox();
+          if (!b) return false;
+          return sx >= b.x && sx < b.x + b.w && sy >= b.y && sy < b.y + b.h;
+        }
+        function menuHitTest(sx, sy) {
+          const b = menuBox();
+          if (!b) return -1;
+          if (sx <= b.x || sx >= b.x + b.w - 1) return -1;
+          const relY = sy - b.y - 1;
+          if (relY < 0 || relY >= menu.items.length) return -1;
+          return relY;
+        }
+        function drawMenu(g) {
+          const b = menuBox();
+          if (!b) return;
+
+          const BORDER = '\x1b[97m';
+          put(g, b.x, b.y, '┌', BORDER);
+          put(g, b.x + b.w - 1, b.y, '┐', BORDER);
+          put(g, b.x, b.y + b.h - 1, '└', BORDER);
+          put(g, b.x + b.w - 1, b.y + b.h - 1, '┘', BORDER);
+          for (let i = b.x + 1; i < b.x + b.w - 1; i++) {
+            put(g, i, b.y, '─', BORDER);
+            put(g, i, b.y + b.h - 1, '─', BORDER);
+          }
+          for (let j = b.y + 1; j < b.y + b.h - 1; j++) {
+            put(g, b.x, j, '│', BORDER);
+            put(g, b.x + b.w - 1, j, '│', BORDER);
+          }
+
+          menu.items.forEach((it, i) => {
+            const y = b.y + 1 + i;
+            const sel = i === menu.sel;
+            const inner = b.w - 2;
+            let text = ' ' + it.label;
+            if (text.length < inner) text += ' '.repeat(inner - text.length);
+            else text = text.slice(0, inner);
+            for (let k = 0; k < inner; k++) {
+              put(g, b.x + 1 + k, y, text[k], sel ? REV : null);
+            }
+          });
+        }
+
+        function statusLeft() {
+          return (
+            ' CAM (' + cam.x + ',' + cam.y + ')' +
+            '   MOUSE (' + mouseWX + ',' + mouseWY + ')' +
+            '   N:' + nodes.length + ' E:' + edges.length +
+            (selectedEdge >= 0 ? '   [edge selected]' : '')
+          );
+        }
+        function statusRight() {
+          return ' R-click: menu   L-drag: move/port   Arrows: pan   x: delete   q: quit ';
+        }
+
+        function render() {
+          if (done) return;
+          const g = makeCanvas(CW, CH);
+
+          drawGrid(g);
+
+          for (let i = 0; i < edges.length; i++) {
+            const e = edges[i];
+            const pts = edgePolyline(e);
+            if (!pts) continue;
+            drawPolyline(g, pts, i === selectedEdge ? RED : CYAN);
+          }
+
+          if (portDrag) {
+            const src = portDrag.source;
+            const p1 = portPos(src, portDrag.sourcePort);
+            const d1 = dirVec(portDrag.sourcePort);
+            let pts;
+            if (portDrag.target && portDrag.targetPort) {
+              pts = routeFromPorts(
+                p1, d1,
+                portPos(portDrag.target, portDrag.targetPort),
+                dirVec(portDrag.targetPort)
+              );
+            } else {
+              pts = routeToMouse(p1, d1, mouseWX, mouseWY);
+            }
+            drawPolyline(g, pts, MAGENTA);
+          }
+
+          const portNodes = new Set();
+          if (hoverNode) portNodes.add(hoverNode);
+          if (portDrag) {
+            portNodes.add(portDrag.source);
+            if (portDrag.target) portNodes.add(portDrag.target);
+          }
+
+          nodes.forEach((n, i) => {
+            const isSrc = portDrag && portDrag.source === n;
+            const isTgt = portDrag && portDrag.target === n;
+            drawBox(g, n, i === selected || isSrc, isSrc, isTgt, portNodes.has(n));
+          });
+
+          drawMenu(g);
+
+          let out = '\x1b[H';
+          for (let y = 0; y < CH; y++) out += g[y].join('') + '\r\n';
+
+          let line1 = statusLeft();
+          let line2 = editing
+            ? ' EDIT: ' + editing.buf + '_   [Enter: save  Esc: cancel]'
+            : statusRight();
+
+          if (line1.length > CW) line1 = line1.slice(0, CW);
+          else line1 = line1 + ' '.repeat(CW - line1.length);
+          if (line2.length > CW) line2 = line2.slice(0, CW);
+          else line2 = line2 + ' '.repeat(CW - line2.length);
+
+          out += REV + line1 + RESET + '\r\n';
+          out += line2;
+
+          try { stdout.write(out); } catch (_) {}
+        }
+
+        function openMenu(sx, sy, wx, wy, targetNode, targetEdgeIdx) {
+          const items = [];
+
+          items.push({
+            label: 'Create node here',
+            action: () => { addNodeAt(wx, wy); }
+          });
+
+          if (targetNode) {
+            items.push({
+              label: 'Rename node',
+              action: () => { editing = { node: targetNode, buf: targetNode.label }; }
+            });
+            items.push({
+              label: 'Connect from here',
+              action: () => {
+                portDrag = {
+                  source: targetNode,
+                  sourcePort: nearestPort(targetNode, wx, wy),
+                  target: null, targetPort: null
+                };
+              }
+            });
+            items.push({
+              label: 'Delete node',
+              action: () => { deleteNode(targetNode); }
+            });
+          } else if (targetEdgeIdx >= 0) {
+            items.push({
+              label: 'Delete connection',
+              action: () => {
+                edges.splice(targetEdgeIdx, 1);
+                selectedEdge = -1;
+              }
+            });
+            items.push({
+              label: 'Reverse connection',
+              action: () => {
+                const e = edges[targetEdgeIdx];
+                if (!e) return;
+                const tmpFrom = e.from, tmpTo = e.to;
+                const tmpFp = e.fromPort, tmpTp = e.toPort;
+                e.from = tmpTo; e.to = tmpFrom;
+                e.fromPort = tmpTp; e.toPort = tmpFp;
+              }
+            });
+          } else {
+            items.push({
+              label: 'Center view here',
+              action: () => {
+                cam.x = wx - Math.floor(CW / 2);
+                cam.y = wy - Math.floor(CH / 2);
+              }
+            });
+          }
+
+          menu = { sx, sy, items, sel: 0, wx, wy };
+        }
+
+        function onMouseDown(button, sx, sy) {
+          const w = screenToWorld(sx, sy);
+          const wx = w.x, wy = w.y;
+
+          if (menu) {
+            const hit = menuHitTest(sx, sy);
+            if (hit >= 0) {
+              const it = menu.items[hit];
+              menu = null;
+              it.action();
+              render();
+              return;
+            }
+            if (!menuContains(sx, sy)) {
+              menu = null;
+            } else {
+              return;
+            }
+          }
+
+          if (button === 0) {
+            const n = nodeAt(wx, wy);
+            if (n) {
+              const prt = portAt(wx, wy, n);
+              if (prt) {
+                portDrag = { source: prt.node, sourcePort: prt.port, target: null, targetPort: null };
+                selectedEdge = -1;
+                render();
+                return;
+              }
+              selected = nodes.indexOf(n);
+              selectedEdge = -1;
+              drag = { node: n, offWX: wx - n.x, offWY: wy - n.y };
+              render();
+              return;
+            }
+
+            const eIdx = edgeAt(wx, wy);
+            if (eIdx >= 0) {
+              selectedEdge = eIdx;
+              selected = -1;
+              render();
+              return;
+            }
+
+            selectedEdge = -1;
+            selected = -1;
+            panning = { startSX: sx, startSY: sy, startCamX: cam.x, startCamY: cam.y };
+            render();
+            return;
+          }
+
+          if (button === 2) {
+            const n = nodeAt(wx, wy);
+            const eIdx = n ? -1 : edgeAt(wx, wy);
+            if (n) {
+              selected = nodes.indexOf(n);
+              selectedEdge = -1;
+            } else if (eIdx >= 0) {
+              selectedEdge = eIdx;
+              selected = -1;
+            }
+            openMenu(sx, sy, wx, wy, n, eIdx);
+            render();
+            return;
+          }
+        }
+
+        function onMouseMove(sx, sy) {
+          mouseSX = sx; mouseSY = sy;
+          const w = screenToWorld(sx, sy);
+          mouseWX = w.x; mouseWY = w.y;
+
+          if (drag) {
+            drag.node.x = mouseWX - drag.offWX;
+            drag.node.y = mouseWY - drag.offWY;
+            render();
+            return;
+          }
+          if (portDrag) {
+            let prt = null;
+            const hovered = nodeAt(mouseWX, mouseWY);
+            if (hovered && hovered !== portDrag.source) {
+              prt = portAt(mouseWX, mouseWY, hovered);
+            }
+            if (prt) {
+              portDrag.target = prt.node;
+              portDrag.targetPort = prt.port;
+            } else if (hovered && hovered !== portDrag.source) {
+              portDrag.target = hovered;
+              portDrag.targetPort = nearestPort(hovered, mouseWX, mouseWY);
+            } else {
+              portDrag.target = null;
+              portDrag.targetPort = null;
+            }
+            render();
+            return;
+          }
+          if (panning) {
+            cam.x = panning.startCamX - (sx - panning.startSX);
+            cam.y = panning.startCamY - (sy - panning.startSY);
+            render();
+            return;
+          }
+
+          const newHover = nodeAt(mouseWX, mouseWY);
+          let needsRedraw = newHover !== hoverNode;
+          hoverNode = newHover;
+
+          if (menu) {
+            const hit = menuHitTest(sx, sy);
+            if (hit >= 0 && hit !== menu.sel) { menu.sel = hit; needsRedraw = true; }
+          }
+
+          if (needsRedraw) render();
+        }
+
+        function onMouseUp(button, sx, sy) {
+          if (drag) { drag = null; render(); return; }
+          if (portDrag) {
+            if (portDrag.target && portDrag.targetPort) {
+              addEdge(portDrag.source.id, portDrag.target.id, portDrag.sourcePort, portDrag.targetPort);
+            }
+            portDrag = null;
+            render();
+            return;
+          }
+          if (panning) { panning = null; return; }
+        }
+
+        function handleKey(name, shift) {
+          if (editing) {
+            if (name === 'enter') {
+              editing.node.label = editing.buf || 'Node';
+              editing.node.w = Math.max(editing.buf.length + 4, 12);
+              editing = null;
+              render();
+              return;
+            }
+            if (name === 'escape') { editing = null; render(); return; }
+            if (name === 'backspace') { editing.buf = editing.buf.slice(0, -1); render(); return; }
+            return;
+          }
+
+          if (menu) {
+            if (name === 'up')    { menu.sel = (menu.sel - 1 + menu.items.length) % menu.items.length; render(); return; }
+            if (name === 'down')  { menu.sel = (menu.sel + 1) % menu.items.length; render(); return; }
+            if (name === 'enter') { const it = menu.items[menu.sel]; menu = null; it.action(); render(); return; }
+            if (name === 'escape'){ menu = null; render(); return; }
+            return;
+          }
+
+          const panStep = shift ? 5 : 1;
+          switch (name) {
+            case 'up':    cam.y -= panStep; break;
+            case 'down':  cam.y += panStep; break;
+            case 'left':  cam.x -= panStep; break;
+            case 'right': cam.x += panStep; break;
+
+            case 'k': { const n = nodes[selected]; if (n) n.y -= 1; break; }
+            case 'j': { const n = nodes[selected]; if (n) n.y += 1; break; }
+            case 'h': { const n = nodes[selected]; if (n) n.x -= 1; break; }
+            case 'l': { const n = nodes[selected]; if (n) n.x += 1; break; }
+
+            case 'tab':
+              if (nodes.length) {
+                selected = (selected + (shift ? -1 : 1) + nodes.length) % nodes.length;
+                selectedEdge = -1;
+              }
+              break;
+
+            case 'a':
+              addNodeAt(cam.x + Math.floor(CW / 2), cam.y + Math.floor(CH / 2));
+              break;
+
+            case 'x': case 'delete':
+              if (selectedEdge >= 0) {
+                edges.splice(selectedEdge, 1);
+                selectedEdge = -1;
+              } else if (nodes[selected]) {
+                deleteNode(nodes[selected]);
+              }
+              break;
+
+            case 'escape':
+              selectedEdge = -1;
+              selected = -1;
+              break;
+
+            case 'home':
+              if (nodes[selected]) {
+                const n = nodes[selected];
+                cam.x = n.x - Math.floor(CW / 2);
+                cam.y = n.y - Math.floor(CH / 2);
+              }
+              break;
+
+            case 'q': finish(); return;
+          }
+          render();
+        }
+
+        function handleCSI(params, final) {
+          if (final === 'A') handleKey('up');
+          else if (final === 'B') handleKey('down');
+          else if (final === 'C') handleKey('right');
+          else if (final === 'D') handleKey('left');
+          else if (final === 'H') handleKey('home');
+          else if (final === 'F') handleKey('end');
+          else if (final === 'Z') handleKey('tab', true);
+          else if (final === '~') {
+            const p = parseInt(params, 10);
+            if (p === 3) handleKey('delete');
+          }
+        }
+
+        let inputBuf = '';
+        let escTimer = null;
+
+        function processInput() {
+          while (inputBuf.length > 0) {
+
+            if (inputBuf.startsWith('\x1b[<')) {
+              const m = inputBuf.match(/^\x1b\[<(\d+);(\d+);(\d+)([Mm])/);
+              if (!m) return;
+              const cb = parseInt(m[1], 10);
+              const cx = parseInt(m[2], 10) - 1;
+              const cy = parseInt(m[3], 10) - 1;
+              const isPress = m[4] === 'M';
+              if (cb & 64) { /* scroll ignored */ }
+              else if (cb & 32) onMouseMove(cx, cy);
+              else if (isPress) onMouseDown(cb & 3, cx, cy);
+              else              onMouseUp(cb & 3, cx, cy);
+              inputBuf = inputBuf.slice(m[0].length);
+              continue;
+            }
+
+            if (inputBuf.startsWith('\x1b[')) {
+              const m = inputBuf.match(/^\x1b\[([0-9;]*)([A-Za-z~])/);
+              if (!m) return;
+              handleCSI(m[1], m[2]);
+              inputBuf = inputBuf.slice(m[0].length);
+              continue;
+            }
+
+            if (inputBuf[0] === '\x1b') {
+              if (inputBuf.length === 1) {
+                escTimer = setTimeout(() => {
+                  escTimer = null;
+                  if (inputBuf === '\x1b') {
+                    inputBuf = '';
+                    handleKey('escape');
+                  }
+                }, 25);
+                return;
+              }
+              inputBuf = inputBuf.slice(1);
+              handleKey('escape');
+              continue;
+            }
+
+            const ch = inputBuf[0];
+            const code = ch.charCodeAt(0);
+
+            // Ctrl+C exits back to SyAPP (state saved by finish()).
+            if (code === 3) { finish(); return; }
+
+            if (editing) {
+              if (ch === '\r' || ch === '\n') handleKey('enter');
+              else if (ch === '\x7f' || ch === '\b') handleKey('backspace');
+              else if (code >= 32 && code < 127) {
+                if (editing.buf.length < 40) editing.buf += ch;
+                render();
+              }
+              inputBuf = inputBuf.slice(1);
+              continue;
+            }
+
+            if (ch === '\r' || ch === '\n')        handleKey('enter');
+            else if (ch === '\t')                  handleKey('tab');
+            else if (ch === '\x7f' || ch === '\b') handleKey('backspace');
+            else if (code >= 32)                   handleKey(ch);
+
+            inputBuf = inputBuf.slice(1);
+          }
+        }
+
+        // -------- Input listener --------
+        function dataHandler(chunk) {
+          inputBuf += chunk.toString('latin1');
+          if (escTimer) { clearTimeout(escTimer); escTimer = null; }
+          processInput();
+        }
+
+        // -------- Resize listener --------
+        function resizeHandler() {
+          CW = stdout.columns || 80;
+          CH = Math.max(8, (stdout.rows || 24) - 2);
+          render();
+        }
+
+        // -------- FINISH: persist state + restore terminal --------
+        let done = false;
+        function finish() {
+          if (done) return;
+          done = true;
+
+          // 1. Persist the FULL editor state back to storage so re-entering
+          //    this.Flow() restores exactly where the user left off.
+          try {
+            self.Storages.Set(id, storageKey, {
+              cam: { x: cam.x, y: cam.y },
+              nextId,
+              nodes,
+              edges,
+              selected,
+              selectedEdge
+            });
+          } catch (_) { /* best-effort persistence */ }
+
+          // 2. Detach our listeners FIRST so nothing races cleanup.
+          try { stdin.removeListener('data', dataHandler); } catch (_) {}
+          try { stdout.removeListener('resize', resizeHandler); } catch (_) {}
+          if (escTimer) { try { clearTimeout(escTimer); } catch (_) {} escTimer = null; }
+
+          // 3. Disable mouse tracking, re-enable wrap, leave alt screen.
+          try { stdout.write('\x1b[?1000l\x1b[?1002l\x1b[?1006l'); } catch (_) {}
+          try { stdout.write('\x1b[?7h'); } catch (_) {}
+          try { stdout.write('\x1b[?25l'); } catch (_) {}
+          try { stdout.write('\x1b[?1049l'); } catch (_) {}
+
+          // 4. Restore raw mode to exactly what it was on entry.
+          try { if (stdin.isRaw !== wasRaw) stdin.setRawMode(wasRaw); } catch (_) {}
+
+          // 5. Show cursor + clear screen so the HUD rebuild starts clean.
+          try { stdout.write('\x1b[?25h\x1b[2J\x1b[H'); } catch (_) {}
+
+          resolve();
+        }
+
+        // -------- Attach input --------
+        try {
+          stdin.setRawMode(true);
+          stdin.resume();
+          stdin.on('data', dataHandler);
+        } catch (e) {
+          finish();
+          return;
+        }
+        try { stdout.on('resize', resizeHandler); } catch (_) {}
+
+        // -------- First paint --------
+        render();
+      });
+    };
+
     // --------------------------- Grid Method ---------------------------
 
     /**
@@ -17055,6 +18090,14 @@ function _genFuncJS(state, syappRelPath) {
           L.push(`${indent}this.TextButton(id, ${JSON.stringify(it.name)}, ${JSON.stringify(cfg)})`)
           break
         }
+        case 'flow': {
+          const cfg = {}
+          if (it.label) cfg.label = it.label
+          if (it.pinned) cfg.pinned = true
+          if (it.pinnedTop) cfg.pinnedTop = true
+          L.push(`${indent}await this.Flow(id, ${JSON.stringify(it.name)}, ${JSON.stringify(cfg)})`)
+          break
+        }
         case 'page': {
           const pageCfg = {}
           if (it.pinButton) pageCfg.pinButton = true
@@ -17268,6 +18311,7 @@ const _SB_METHOD_TO_ITEMTYPE = {
   Field: 'field',
   TextEditor: 'texteditor',
   TextButton: 'textbutton',
+  Flow: 'flow',
   Page: 'page',
   PinnedTop: 'pinnedTop',
   PinnedBottom: 'pinnedBottom',
@@ -17329,6 +18373,17 @@ function _sbMakeItemForMethod(methodName, id) {
         initialValue: '',
         lines: 4,
         editable: false,
+        pinned: false,
+        pinnedTop: false
+      }
+    case 'flow':
+      // Node-graph flow editor launcher. Clicking the button opens the
+      // full-screen decoupled flow editor — the same editor that the
+      // runtime this.Flow() provides, with full state persistence.
+      return {
+        ...base,
+        name: 'flow_' + id,
+        label: 'Flow',
         pinned: false,
         pinnedTop: false
       }
@@ -19211,6 +20266,16 @@ class SelfBuilder extends SyAPP_Func {
             pinnedTop: it.pinnedTop
           })
           break
+        case 'flow':
+          // Renders the real Flow launcher. In both edit and view modes
+          // clicking the button opens the full-screen decoupled flow
+          // editor (state persisted under `flow_<name>`).
+          await this.Flow(id, it.name, {
+            label: it.label,
+            pinned: it.pinned,
+            pinnedTop: it.pinnedTop
+          })
+          break
         case 'page':
           if (this.Editing) {
             const hasItems = Array.isArray(it.items) && it.items.length > 0
@@ -19661,6 +20726,13 @@ class SelfBuilder extends SyAPP_Func {
         mkProp('initialValue', 'Initial', 'string')
         mkProp('lines', 'Rows', 'number')
         mkToggle('editable', 'Editable')
+        mkToggle('pinned', 'Pinned Btm')
+        mkToggle('pinnedTop', 'Pinned Top')
+        break
+
+      case 'flow':
+        mkProp('name', 'Name', 'string')
+        mkProp('label', 'Label', 'string')
         mkToggle('pinned', 'Pinned Btm')
         mkToggle('pinnedTop', 'Pinned Top')
         break
@@ -20294,6 +21366,23 @@ function _sbCallToItem(call, sessionVar) {
         initialValue: typeof cfg.initialValue === 'string' ? cfg.initialValue : '',
         lines: typeof cfg.lines === 'number' ? cfg.lines : 4,
         editable: !!cfg.editable,
+        pinned: !!cfg.pinned,
+        pinnedTop: !!cfg.pinnedTop
+      }
+    }
+    case 'Flow': {
+      // Node-graph editor launcher. Round-trips through the parser so a
+      // produced source containing `await this.Flow(id, '<name>', {...})`
+      // re-opens in the SelfBuilder as a proper Flow item — not a raw
+      // code block — which keeps the widget re-editable end to end.
+      const name = _sbParseValue(rest[0])
+      if (typeof name !== 'string') return null
+      const cfg = rest[1] !== undefined ? _sbObjArg(rest[1]) : {}
+      if (cfg === null) return null
+      return {
+        type: 'flow',
+        name,
+        label: typeof cfg.label === 'string' ? cfg.label : '',
         pinned: !!cfg.pinned,
         pinnedTop: !!cfg.pinnedTop
       }
