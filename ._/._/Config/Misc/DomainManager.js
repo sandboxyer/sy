@@ -649,34 +649,27 @@ class GoDaddyManager extends SyAPP.Func() {
     const running  = !!(proc && (proc.status === 'Running' || proc.status === 'Restarting'))
     const isDaemon = !!(proc && proc.daemon === 'Yes')
 
-    // ── Status Panel ─────────────────────────────────────────────
-    let statusTxt = `🛡 Let's Encrypt Certificates\n\n`
-    statusTxt += `Certbot:   ${certbot ? '✅ Found\n           ' + certbot : '❌ Not Installed'}\n`
-    statusTxt += `API Token: ${token ? '✅ Configured' : '❌ Not Configured'}\n\n`
-    statusTxt += `Auto-Renew Daemon: ${autoOn ? '🟢 ON' : '🔴 OFF'}\n`
-    if (autoOn) {
-      if (running) {
-        statusTxt += `Status: 🟢 ${proc.status} (PID: ${proc.pid})\n`
-        statusTxt += `Mode:   ${isDaemon ? '✅ System Daemon' : '⚠ Managed Only'}`
-      } else {
-        statusTxt += `Status: ⚠ Daemon is NOT running — click Reconcile`
-      }
+    // ── Unified Status Panel (Only one this.Text used) ───────────
+    let autoStatus = autoOn ? '🟢 ON' : '🔴 OFF'
+    if (autoOn && running) {
+      autoStatus += ` (${proc.status} PID ${proc.pid} ${isDaemon ? '✅ SysDaemon' : '⚠ Managed'})`
+    } else if (autoOn && !running) {
+      autoStatus += ' (⚠ Daemon not running!)'
     }
 
-    this.TextButton(id, 'le_status_box', {
-      label: 'Status Overview',
-      initialValue: statusTxt,
-      lines: 8,
-      editable: false
-    })
+    let topText = `🛡 Let's Encrypt Manager\n`
+    topText += `───────────────���────────────\n`
+    topText += `Certbot:   ${certbot ? '✅ Installed' : '❌ Missing'}\n`
+    topText += `API Token: ${token ? '✅ Configured' : '❌ Missing'}\n`
+    topText += `Auto-Renew: ${autoStatus}\n`
+    
+    this.Text(id, topText)
 
+    // ── Configuration Actions ────────────────────────────────────
     if (!certbot) {
       this.Button(id, { name: '📦 Install Certbot Now', props: { gd_le_install: 1 } })
     }
 
-    this.Button(id, { name: ' ' })
-
-    // ── Configuration Actions ────────────────────────────────────
     this.Buttons(id, [
       { name: autoOn ? '🛑 Turn OFF Auto-Renew' : '▶ Turn ON Auto-Renew', props: { gd_le_auto_toggle: 1 } },
       { name: '↻ Reconcile Daemon Now', props: { gd_le_reconcile: 1 } }
@@ -717,10 +710,10 @@ class GoDaddyManager extends SyAPP.Func() {
         else if (st.status === 'ok')     statusStr = '✅ Generated OK'
       }
 
-      // Full-width domain status button
+      // Full-width domain status button (acts as a section header)
       this.Button(id, { name: `🌐 ${d.domain}  —  ${statusStr}`, props: {} })
       
-      // Full, clean action buttons for this domain
+      // Action buttons for this domain
       this.Buttons(id, [
         { name: hasCert ? '🔄 Regenerate Cert' : '🔒 Generate Cert', props: { gd_le_gen: d.domain } },
         ...(hasCert ? [{ name: '🗑 Delete Cert', props: { gd_le_delete: d.domain } }] : [])
