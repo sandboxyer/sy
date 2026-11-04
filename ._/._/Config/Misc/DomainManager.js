@@ -649,50 +649,60 @@ class GoDaddyManager extends SyAPP.Func() {
     const running  = !!(proc && (proc.status === 'Running' || proc.status === 'Restarting'))
     const isDaemon = !!(proc && proc.daemon === 'Yes')
 
-    this.Text(id, "🛡 Let's Encrypt Certificates")
-    this.Text(id, ' ')
-
     // ── Status Panel ─────────────────────────────────────────────
-    this.Text(id, `Certbot:  ${certbot ? '✅ ' + certbot : '❌ not installed'}`)
-    this.Text(id, `API Token: ${token ? '✅ configured' : '❌ not configured'}`)
-    
+    let statusTxt = `🛡 Let's Encrypt Certificates\n\n`
+    statusTxt += `Certbot:   ${certbot ? '✅ Found\n           ' + certbot : '❌ Not Installed'}\n`
+    statusTxt += `API Token: ${token ? '✅ Configured' : '❌ Not Configured'}\n\n`
+    statusTxt += `Auto-Renew Daemon: ${autoOn ? '🟢 ON' : '🔴 OFF'}\n`
+    if (autoOn) {
+      if (running) {
+        statusTxt += `Status: 🟢 ${proc.status} (PID: ${proc.pid})\n`
+        statusTxt += `Mode:   ${isDaemon ? '✅ System Daemon' : '⚠ Managed Only'}`
+      } else {
+        statusTxt += `Status: ⚠ Daemon is NOT running — click Reconcile`
+      }
+    }
+
+    this.TextButton(id, 'le_status_box', {
+      label: 'Status Overview',
+      initialValue: statusTxt,
+      lines: 8,
+      editable: false
+    })
+
     if (!certbot) {
       this.Button(id, { name: '📦 Install Certbot Now', props: { gd_le_install: 1 } })
     }
 
-    this.Text(id, ' ')
-    this.Text(id, `Auto-Renew Daemon: ${autoOn ? '🟢 ON' : '🔴 OFF'}`)
-    if (autoOn) {
-      if (running) {
-        this.Text(id, `  Status: 🟢 ${proc.status} (PID: ${proc.pid}) ${isDaemon ? '· System Daemon ✅' : '· Managed Only ⚠'}`)
-      } else {
-        this.Text(id, '  Status: ⚠ Daemon is NOT running — click Reconcile')
-      }
-    }
+    this.Button(id, { name: ' ' })
+
+    // ── Configuration Actions ────────────────────────────────────
     this.Buttons(id, [
       { name: autoOn ? '🛑 Turn OFF Auto-Renew' : '▶ Turn ON Auto-Renew', props: { gd_le_auto_toggle: 1 } },
-      { name: '↻ Reconcile Now', props: { gd_le_reconcile: 1 } }
+      { name: '↻ Reconcile Daemon Now', props: { gd_le_reconcile: 1 } }
     ])
 
-    this.Text(id, ' ')
     this.Field(id, 'le_email_field', {
       label: 'LE Email (for expiry notices)',
       initialValue: email,
       onChange: (v) => this._setEmail(id, v)
     })
 
-    this.Text(id, ' ')
-    this.Text(id, `📋 Managed Domains (${(this.Storages.Get(id, 'gd_domains_cache') || []).length}):`)
-    this.Text(id, ' ')
+    this.Button(id, { name: ' ' })
 
+    // ── Domain List with Full Buttons ────────────────────────────
     const domains = this.Storages.Get(id, 'gd_domains_cache') || []
+    
     if (domains.length === 0) {
-      this.Text(id, '  No domains loaded yet.')
-      this.Button(id, { name: '🌐 Go to Domains List', props: { gd_nav: 'domains' } })
+      this.Buttons(id, [
+        { name: '📋 No domains loaded yet', props: {} },
+        { name: '🌐 Go to Domains List', props: { gd_nav: 'domains' } }
+      ])
       return
     }
 
-    // ── Domain List with Full Buttons ────────────────────────────
+    this.Button(id, { name: `📋 Managed Domains (${domains.length})`, props: {} })
+
     for (const d of domains) {
       const hasCert = this._leHasCert(d.domain)
       const st      = this._leStatus(id, d.domain)
@@ -703,18 +713,20 @@ class GoDaddyManager extends SyAPP.Func() {
       
       if (st) {
         if (st.status === 'generating') statusStr = '⏳ Generating...'
-        else if (st.status === 'error')  statusStr = `❌ Error: ${String(st.error).slice(0, 50)}...`
+        else if (st.status === 'error')  statusStr = `❌ Error: ${String(st.error).slice(0, 40)}...`
         else if (st.status === 'ok')     statusStr = '✅ Generated OK'
       }
 
-      this.Text(id, `[ ${d.domain} ]  —  ${statusStr}`)
+      // Full-width domain status button
+      this.Button(id, { name: `🌐 ${d.domain}  —  ${statusStr}`, props: {} })
       
-      // FULL, clean buttons for each domain
+      // Full, clean action buttons for this domain
       this.Buttons(id, [
         { name: hasCert ? '🔄 Regenerate Cert' : '🔒 Generate Cert', props: { gd_le_gen: d.domain } },
         ...(hasCert ? [{ name: '🗑 Delete Cert', props: { gd_le_delete: d.domain } }] : [])
       ])
-      this.Text(id, ' ')
+      
+      this.Button(id, { name: ' ' })
     }
   }
 
