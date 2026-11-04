@@ -18,8 +18,12 @@ const RECORD_TYPES = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS', 'SRV', 'SOA', 'CA
 const LE_PROCESS_NAME = 'sypm_certbot_renew'
 const LE_DIR          = path.join(os.homedir(), '.sypm', 'letsencrypt')
 const LE_RENEWER      = path.join(LE_DIR, 'renewer.mjs')
-const LE_AUTH_HOOK    = path.join(LE_DIR, 'auth-hook.cjs')
-const LE_CLEANUP_HOOK = path.join(LE_DIR, 'cleanup-hook.cjs')
+
+// Snap restriction: certbot-snap CANNOT execute files inside $HOME.
+// We must place the auth hooks in a system directory that snap can read.
+const LE_HOOK_DIR     = '/etc/letsencrypt/sypm'
+const LE_AUTH_HOOK    = path.join(LE_HOOK_DIR, 'auth-hook.cjs')
+const LE_CLEANUP_HOOK = path.join(LE_HOOK_DIR, 'cleanup-hook.cjs')
 const LE_LIVE         = '/etc/letsencrypt/live'
 const LE_INTERVAL_MS  = 12 * 60 * 60 * 1000
 
@@ -169,7 +173,8 @@ class GoDaddyManager extends SyAPP.Func() {
 
   _leWriteHookScripts() {
     try {
-      if (!fs.existsSync(LE_DIR)) fs.mkdirSync(LE_DIR, { recursive: true })
+      // Must use sudo to write into /etc/letsencrypt/sypm/ for snap compatibility
+      execSync('sudo -n mkdir -p ' + this._leShellQuote(LE_HOOK_DIR))
 
       const common =
         "const https = require('node:https')\n" +
@@ -252,8 +257,19 @@ class GoDaddyManager extends SyAPP.Func() {
         "}\n" +
         "main().catch(e => { console.error('[cleanup] err', e.message); process.exit(0) })\n"
 
-      fs.writeFileSync(LE_AUTH_HOOK, auth, 'utf-8')
-      fs.writeFileSync(LE_CLEANUP_HOOK, cleanup, 'utf-8')
+      // Write to temporary files first, then sudo-copy to system dir
+      const tmpAuth = path.join(LE_DIR, 'auth-tmp.cjs')
+      const tmpCleanup = path.join(LE_DIR, 'cleanup-tmp.cjs')
+      fs.writeFileSync(tmpAuth, auth, 'utf-8')
+      fs.writeFileSync(tmpCleanup, cleanup, 'utf-8')
+
+      execSync('sudo -n cp ' + this._leShellQuote(tmpAuth) + ' ' + this._leShellQuote(LE_AUTH_HOOK))
+      execSync('sudo -n cp ' + this._leShellQuote(tmpCleanup) + ' ' + this._leShellQuote(LE_CLEANUP_HOOK))
+      execSync('sudo -n chmod 755 ' + this._leShellQuote(LE_AUTH_HOOK) + ' ' + this._leShellQuote(LE_CLEANUP_HOOK))
+      
+      // Clean up tmps
+      try { fs.unlinkSync(tmpAuth); fs.unlinkSync(tmpCleanup) } catch (_) {}
+
       return true
     } catch (_) { return false }
   }
@@ -297,7 +313,7 @@ class GoDaddyManager extends SyAPP.Func() {
     const token = this._token(id)
     if (!token) throw new Error('GoDaddy token not configured')
 
-    if (!this._leWriteHookScripts()) throw new Error('could not write hook scripts')
+    if (!this._leWriteHookScripts()) throw new Error('could not write hook scripts to /etc/letsencrypt/sypm (sudo required)')
 
     // Persist the token so that certbot's renewal config — which stores
     // the hook command but no env vars — can invoke the hooks at renewal
@@ -313,12 +329,17 @@ class GoDaddyManager extends SyAPP.Func() {
       throw new Error('could not persist renewal token (sudo required): ' + e.message)
     }
 
+    // Use the ABSOLUTE path of the Node.js running this SyAPP process.
+    // System certbot often lacks /usr/bin/node in PATH (e.g. if node is
+    // installed via nvm/volta). process.execPath is always the truth.
     const nodeBin = this._leShellQuote(process.execPath)
+    
     const cmd =
       'sudo -n ' + this._leShellQuote(certbot) + ' certonly' +
       ' --manual --preferred-challenges dns' +
       ' --manual-auth-hook ' + this._leShellQuote(nodeBin + ' ' + LE_AUTH_HOOK) +
       ' --manual-cleanup-hook ' + this._leShellQuote(nodeBin + ' ' + LE_CLEANUP_HOOK) +
+      ' --disable-hook-validation' +
       ' --non-interactive --agree-tos --force-renewal' +
       ' -m ' + this._leShellQuote(email) +
       ' -d ' + this._leShellQuote(domain)
@@ -620,64 +641,80 @@ class GoDaddyManager extends SyAPP.Func() {
   }
 
   _renderCerts(id) {
-    const email   = this._leEmail(id)
-    const token   = this._token(id)
-    const certbot = this._leCertbotPath()
-    const proc    = this._leProc()
-    const autoOn  = this._leAutoRenew(id)
-    const running = !!(proc && (proc.status === 'Running' || proc.status === 'Restarting'))
+    const email    = this._leEmail(id)
+    const token    = this._token(id)
+    const certbot  = this._leCertbotPath()
+    const proc     = this._leProc()
+    const autoOn   = this._leAutoRenew(id)
+    const running  = !!(proc && (proc.status === 'Running' || proc.status === 'Restarting'))
     const isDaemon = !!(proc && proc.daemon === 'Yes')
 
     this.Text(id, "🛡 Let's Encrypt Certificates")
-    this.Text(id, `certbot: ${certbot ? '✅ ' + certbot : '❌ not installed'}`)
-    this.Text(id, `token:   ${token ? '✅ configured' : '❌ not configured'}`)
     this.Text(id, ' ')
 
+    // ── Status Panel ─────────────────────────────────────────────
+    this.Text(id, `Certbot:  ${certbot ? '✅ ' + certbot : '❌ not installed'}`)
+    this.Text(id, `API Token: ${token ? '✅ configured' : '❌ not configured'}`)
+    
+    if (!certbot) {
+      this.Button(id, { name: '📦 Install Certbot Now', props: { gd_le_install: 1 } })
+    }
+
+    this.Text(id, ' ')
+    this.Text(id, `Auto-Renew Daemon: ${autoOn ? '🟢 ON' : '🔴 OFF'}`)
+    if (autoOn) {
+      if (running) {
+        this.Text(id, `  Status: 🟢 ${proc.status} (PID: ${proc.pid}) ${isDaemon ? '· System Daemon ✅' : '· Managed Only ⚠'}`)
+      } else {
+        this.Text(id, '  Status: ⚠ Daemon is NOT running — click Reconcile')
+      }
+    }
+    this.Buttons(id, [
+      { name: autoOn ? '🛑 Turn OFF Auto-Renew' : '▶ Turn ON Auto-Renew', props: { gd_le_auto_toggle: 1 } },
+      { name: '↻ Reconcile Now', props: { gd_le_reconcile: 1 } }
+    ])
+
+    this.Text(id, ' ')
     this.Field(id, 'le_email_field', {
-      label: 'LE Email',
+      label: 'LE Email (for expiry notices)',
       initialValue: email,
       onChange: (v) => this._setEmail(id, v)
     })
 
-    if (!certbot) {
-      this.Button(id, { name: '📦 Install certbot', props: { gd_le_install: 1 } })
-    }
-
     this.Text(id, ' ')
-    this.Text(id, `♻ Auto-renew daemon: ${autoOn ? '🟢 ON' : '🔴 OFF'}`)
-    if (autoOn) {
-      if (running) {
-        this.Text(id, `  🟢 ${proc.status}  ·  pid ${proc.pid}  ·  daemon ${isDaemon ? '✅' : '⚠ (autoRestart only)'}`)
-      } else {
-        this.Text(id, '  ⚠ lock is ON but the daemon is NOT running — click Reconcile')
-      }
-    }
-    this.Buttons(id, [
-      { name: autoOn ? '🛑 Turn OFF auto-renew' : '▶ Turn ON auto-renew', props: { gd_le_auto_toggle: 1 } },
-      { name: '↻ Reconcile now', props: { gd_le_reconcile: 1 } }
-    ])
-
+    this.Text(id, `📋 Managed Domains (${(this.Storages.Get(id, 'gd_domains_cache') || []).length}):`)
     this.Text(id, ' ')
+
     const domains = this.Storages.Get(id, 'gd_domains_cache') || []
-    this.Text(id, `📋 Domains: ${domains.length}`)
-
     if (domains.length === 0) {
-      this.Text(id, ' ')
-      this.Text(id, 'Load domains first:')
-      this.Button(id, { name: '🌐 Go to Domains', props: { gd_nav: 'domains' } })
+      this.Text(id, '  No domains loaded yet.')
+      this.Button(id, { name: '🌐 Go to Domains List', props: { gd_nav: 'domains' } })
       return
     }
 
+    // ── Domain List with Full Buttons ────────────────────────────
     for (const d of domains) {
       const hasCert = this._leHasCert(d.domain)
-      const st = this._leStatus(id, d.domain)
-      const badge = hasCert ? '🔒' : '○'
-      const stTag = st ? ` [${st.status}${st.error ? ': ' + String(st.error).slice(0, 80) : ''}]` : ''
-      this.Text(id, `── ${badge} ${d.domain}${stTag}`)
+      const st      = this._leStatus(id, d.domain)
+      
+      // Determine domain status string
+      let statusStr = '○ No Certificate'
+      if (hasCert) statusStr = '🔒 Certified'
+      
+      if (st) {
+        if (st.status === 'generating') statusStr = '⏳ Generating...'
+        else if (st.status === 'error')  statusStr = `❌ Error: ${String(st.error).slice(0, 50)}...`
+        else if (st.status === 'ok')     statusStr = '✅ Generated OK'
+      }
+
+      this.Text(id, `[ ${d.domain} ]  —  ${statusStr}`)
+      
+      // FULL, clean buttons for each domain
       this.Buttons(id, [
-        { name: '🔒 Generate cert', props: { gd_le_gen: d.domain } },
-        ...(hasCert ? [{ name: '🗑 Delete cert', props: { gd_le_delete: d.domain } }] : [])
+        { name: hasCert ? '🔄 Regenerate Cert' : '🔒 Generate Cert', props: { gd_le_gen: d.domain } },
+        ...(hasCert ? [{ name: '🗑 Delete Cert', props: { gd_le_delete: d.domain } }] : [])
       ])
+      this.Text(id, ' ')
     }
   }
 
