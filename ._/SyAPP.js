@@ -20668,6 +20668,7 @@ function levenshteinDistance(str1, str2) {
         editDownText:    `${nsKey}_editDownText`,
         editBothText:    `${nsKey}_editBothText`,
         resetDropdown:   `${nsKey}_resetDropdown`,
+        togglePathMode:  `${nsKey}_togglePathMode`,
         // NEW: background-run-mode props
         toggleRunMode:   `${nsKey}_togglerunmode`,
         restartBg:       `${nsKey}_restartbg`
@@ -20810,6 +20811,13 @@ function levenshteinDistance(str1, str2) {
             up_emoji: cfg.dropdown.up_emoji,
             down_emoji: cfg.dropdown.down_emoji
           },
+          // Path representation for PATH save mode:
+          //   'global'   → absolute path (current/default behaviour)
+          //   'relative' → path relative to the host file's directory
+          // The widget ALWAYS resolves internally to an absolute path;
+          // this setting controls only what the generated snippet and
+          // the host-file write-back show.
+          pathMode: (cfg.pathMode === 'global' || cfg.pathMode === 'relative') ? cfg.pathMode : 'global',
           autoApplyArgToDropdown: false
         };
 
@@ -20836,6 +20844,12 @@ function levenshteinDistance(str1, str2) {
             if (disk.dropdown && typeof disk.dropdown === 'object') {
               boot.dropdown = { ...boot.dropdown, ...disk.dropdown };
             }
+            // Restore path mode (global / relative) so the widget
+            // re-opens in the same path representation the user last
+            // chose.
+            if (disk.pathMode === 'global' || disk.pathMode === 'relative') {
+              boot.pathMode = disk.pathMode;
+            }
           }
         }
 
@@ -20859,6 +20873,20 @@ function levenshteinDistance(str1, str2) {
               boot.code = healed.code || null;
               boot.saveMode = 'inline';
             }
+          } catch (_) {}
+        }
+
+        // Resolve a relative filePath (from cfg, scan, or a copied
+        // snippet) against the host file's directory, and switch the
+        // widget to RELATIVE path mode. The widget always operates on
+        // ABSOLUTE paths internally — the relative representation is
+        // purely a snippet / display concern — so this keeps file
+        // resolution identical while letting the snippet show
+        // `../../file.js` instead of `/abs/path/file.js`.
+        if (boot.filePath && !path.isAbsolute(boot.filePath) && outerFilePath) {
+          try {
+            boot.filePath = path.resolve(path.dirname(outerFilePath), boot.filePath);
+            boot.pathMode = 'relative';
           } catch (_) {}
         }
 
@@ -21163,7 +21191,7 @@ function levenshteinDistance(str1, str2) {
 
         if (__pathHost && state.filePath) {
           try {
-            const snippet = this._embSnippetPath(state, cfg);
+            const snippet = this._embSnippetPath(state, cfg, __pathHost);
             const existing = fs.existsSync(__pathHost)
               ? fs.readFileSync(__pathHost, 'utf8')
               : '';
@@ -21238,6 +21266,38 @@ function levenshteinDistance(str1, str2) {
         }
       }
 
+      // ---------------- PATH MODE TOGGLE (global ↔ relative) ----------------
+      // Cycles the filePath representation used in the generated snippet:
+      //   • global   → absolute path (e.g. /home/new/sy/._/._/Sy.js)
+      //   • relative → path relative to the host file's directory
+      //                (e.g. ../../Sy.js)
+      // The choice is persisted to the disk mirror and, when the host
+      // file is known, immediately rewritten into the host file's
+      // `this.Emb(...)` call so it survives a fresh launch.
+      if (curProps[P.togglePathMode]) {
+        delete curProps[P.togglePathMode];
+        state.pathMode = (state.pathMode === 'relative') ? 'global' : 'relative';
+        this.Storages.Set(id, storageKey, state);
+        if (outerFilePath) {
+          try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {}
+        }
+        const __toggleHost = cfg.sourceFile ||
+          ((outerFilePath && fs.existsSync(outerFilePath)) ? outerFilePath : null);
+        if (__toggleHost && state.filePath) {
+          try {
+            const snippet = this._embSnippetPath(state, cfg, __toggleHost);
+            const existing = fs.readFileSync(__toggleHost, 'utf8');
+            const replaced = this._embReplaceExistingCall(existing, cfg.name, snippet);
+            if (replaced !== null) {
+              fs.writeFileSync(__toggleHost, replaced);
+              this.Alert(id,
+                `📝 Path mode: ${state.pathMode}`,
+                { duration: 2500 });
+            }
+          } catch (_) {}
+        }
+      }
+
       // ---------------- Enter Func ----------------
       // Navigate INTO the embedded func as a normal screen.
       //
@@ -21299,7 +21359,7 @@ function levenshteinDistance(str1, str2) {
         if (!hostFile) return false;
         try {
           const snippet = (state.saveMode === 'path')
-            ? this._embSnippetPath(state, cfg)
+            ? this._embSnippetPath(state, cfg, hostFile)
             : this._embSnippetInline(state, cfg);
           const existing = fs.readFileSync(hostFile, 'utf8');
           const replaced = this._embReplaceExistingCall(existing, cfg.name, snippet);
@@ -22021,7 +22081,7 @@ function levenshteinDistance(str1, str2) {
           try {
             const snippet = state.saveMode === 'inline'
               ? this._embSnippetInline(state, cfg)
-              : this._embSnippetPath(state, cfg);
+              : this._embSnippetPath(state, cfg, hostFile);
             const existing = fs.existsSync(hostFile)
               ? fs.readFileSync(hostFile, 'utf8')
               : '';
@@ -22434,6 +22494,34 @@ function levenshteinDistance(str1, str2) {
             props: { [P.saveAsPath]: true }
           }
         ]);
+
+        // When PATH mode is active, expose a second toggle that cycles
+        // the path representation between GLOBAL (absolute) and
+        // RELATIVE (`../../file.js`). The preview shows the exact
+        // string that will be written into the host file's snippet.
+        if (__pathSelected) {
+          const __pathMode = state.pathMode === 'relative' ? 'relative' : 'global';
+          let __preview = state.filePath || '(not set)';
+          if (__pathMode === 'relative' && state.filePath && outerFilePath) {
+            try {
+              const absHost = path.isAbsolute(outerFilePath)
+                ? outerFilePath
+                : path.resolve(process.cwd(), outerFilePath);
+              const absTarget = path.isAbsolute(state.filePath)
+                ? state.filePath
+                : path.resolve(process.cwd(), state.filePath);
+              let rel = path.relative(path.dirname(absHost), absTarget);
+              if (rel && !rel.startsWith('.')) rel = './' + rel;
+              if (rel) __preview = rel;
+            } catch (_) {}
+          }
+          this.Button(id, {
+            name: __pathMode === 'relative'
+              ? ColorText.bgGreen(ColorText.black(` ✓ Relative: ${_fit(__preview, 40)} `))
+              : ColorText.bgGreen(ColorText.black(` ✓ Global: ${_fit(__preview, 40)} `)),
+            props: { [P.togglePathMode]: true }
+          });
+        }
 
         // ---------------- Run mode row ----------------
         // 'bg' (default)     → separate --server process, Enter Func
@@ -24066,12 +24154,53 @@ function levenshteinDistance(str1, str2) {
      * Build the source snippet for the PATH save mode.
      * @private
      */
-    this._embSnippetPath = (state, cfg) => {
+    this._embSnippetPath = (state, cfg, hostFile = null) => {
+      // Choose the filePath representation based on state.pathMode.
+      //
+      //   'global'   → absolute path (unchanged default behaviour)
+      //   'relative' → path relative to the host file's directory,
+      //                e.g. '../../Sy.js', only when the host file is
+      //                known and state.filePath is a real path. Falls
+      //                back to the absolute path otherwise.
+      //
+      // state.filePath is ALWAYS absolute internally — the relative
+      // form appears only in the snippet, so file resolution stays
+      // identical whichever mode the user picks.
+      let displayPath = state.filePath || './path/to/func.js';
+      if (state.pathMode === 'relative' && state.filePath && hostFile) {
+        try {
+          const absHost = path.isAbsolute(hostFile)
+            ? hostFile
+            : path.resolve(process.cwd(), hostFile);
+          const absTarget = path.isAbsolute(state.filePath)
+            ? state.filePath
+            : path.resolve(process.cwd(), state.filePath);
+          let rel = path.relative(path.dirname(absHost), absTarget);
+          if (rel && !rel.startsWith('.')) rel = './' + rel;
+          if (rel) displayPath = rel;
+        } catch (_) {}
+      }
+
+      // Build the snippet line by line, keeping every emitted property
+      // line comma-terminated. The `filePath` line ALWAYS ends with a
+      // comma (whether or not `pathMode` is emitted next) so a
+      // relative-mode snippet like:
+      //
+      //     filePath: "../../Sy.js",
+      //     pathMode: 'relative',
+      //
+      // stays syntactically valid. The final `})` closes the call.
       const lines = [
         `await this.Emb(id, {`,
         `  name: ${JSON.stringify(cfg.name)},`,
-        `  filePath: ${JSON.stringify(state.filePath || './path/to/func.js')}`
+        `  filePath: ${JSON.stringify(displayPath)},`
       ];
+      // Emit pathMode explicitly when relative, so re-parsing the
+      // snippet preserves the user's choice even when the recorded
+      // path is later edited to an absolute one.
+      if (state.pathMode === 'relative') {
+        lines.push(`  pathMode: 'relative',`);
+      }
       if (Array.isArray(state.args) && state.args.length > 0) {
         lines.push(`  args: ${JSON.stringify(state.args)},`);
       }
@@ -29901,6 +30030,12 @@ function _embDiskSave(outerFilePath, embName, storageEntry) {
       dropdown: (storageEntry && storageEntry.dropdown && typeof storageEntry.dropdown === 'object')
         ? storageEntry.dropdown
         : null,
+      // Persist the filePath representation (global vs relative) so a
+      // hard restart re-opens the widget in the same mode the user
+      // last chose.
+      pathMode: (storageEntry && (storageEntry.pathMode === 'global' || storageEntry.pathMode === 'relative'))
+        ? storageEntry.pathMode
+        : 'global',
       updatedAt: Date.now()
     };
     fs.writeFileSync(f, JSON.stringify(payload, null, 2), 'utf8');
@@ -30367,6 +30502,7 @@ function _genFuncJS(state, syappRelPath) {
             }
           }
           cfg.saveMode = mode
+          if (it.pathMode === 'relative') cfg.pathMode = 'relative'
           if (Array.isArray(it.args) && it.args.length > 0) cfg.args = it.args
           if (it.dropdown && Object.keys(it.dropdown).length) cfg.dropdown = it.dropdown
           L.push(`${indent}await this.Emb(id, ${JSON.stringify(cfg)})`)
@@ -30645,6 +30781,7 @@ function _sbMakeItemForMethod(methodName, id) {
         filePath: '',
         code: '',
         saveMode: 'inline',
+        pathMode: 'global',
         dropdown: {}
       }
     }
@@ -31100,7 +31237,7 @@ class SelfBuilder extends SyAPP_Func {
                 ? ownerFunc._embSnippetInline(snippetState, snippetCfg)
                 : ''
               : ownerFunc && typeof ownerFunc._embSnippetPath === 'function'
-                ? ownerFunc._embSnippetPath(snippetState, snippetCfg)
+                ? ownerFunc._embSnippetPath(snippetState, snippetCfg, hostFile)
                 : '';
 
             if (snippet && ownerFunc && typeof ownerFunc._embReplaceExistingCall === 'function') {
@@ -33433,6 +33570,7 @@ class SelfBuilder extends SyAPP_Func {
           const cfg = { name: it.name }
           if (it.filePath) cfg.filePath = it.filePath
           if (it.code) cfg.code = it.code
+          if (it.pathMode === 'relative') cfg.pathMode = 'relative'
           if (Array.isArray(it.args) && it.args.length > 0) cfg.args = it.args.slice()
           if (it.dropdown && Object.keys(it.dropdown).length) cfg.dropdown = it.dropdown
           await this.Emb(id, cfg)
@@ -33456,6 +33594,11 @@ class SelfBuilder extends SyAPP_Func {
               if (Array.isArray(st.args) && !this._embArgsEqual(st.args, it.args || [])) {
                 it.args = st.args.slice()
               }
+              // Sync pathMode so the SelfBuilder export / re-parse
+              // round-trip preserves the user's global ↔ relative
+              // choice.
+              if (st.pathMode === 'relative') it.pathMode = 'relative';
+              else if (st.pathMode === 'global') it.pathMode = 'global';
               // Sync the widget's dropdown text/emoji back to the item
               // (non-default values only), so _genFuncJS emits them when
               // the SelfBuilder exports / saves. Without this, edits made
@@ -34640,6 +34783,13 @@ function _sbCallToItem(call, sessionVar) {
         filePath: typeof cfg.filePath === 'string' ? cfg.filePath : '',
         code: typeof cfg.code === 'string' ? cfg.code : '',
         saveMode: inferredMode,
+        // Path representation — inferred from the explicit cfg.pathMode
+        // when present, otherwise from whether cfg.filePath is relative.
+        pathMode: (cfg.pathMode === 'global' || cfg.pathMode === 'relative')
+          ? cfg.pathMode
+          : (typeof cfg.filePath === 'string' && cfg.filePath && !path.isAbsolute(cfg.filePath)
+              ? 'relative'
+              : 'global'),
         dropdown: (cfg.dropdown && typeof cfg.dropdown === 'object' && !Array.isArray(cfg.dropdown))
           ? cfg.dropdown
           : {},
