@@ -36306,6 +36306,137 @@ function _syappCreateEsmMirror(absolutePath) {
   return mirrorFile;
 }
 
+/**
+ * Create a temporary mirror of a user's `.js` file with the SyAPP import
+ * FORCED to point at the CURRENTLY-RUNNING SyAPP.js module
+ * (`import.meta.url`).
+ *
+ * This is the "super handler" for SyAPP imports. Whenever the user's
+ * file has a broken SyAPP import specifier, no SyAPP import at all, or
+ * an import that resolves to a DIFFERENT SyAPP.js copy, this mirror
+ * makes the file loadable by anchoring `SyAPP` to the exact module that
+ * is currently executing this CLI.
+ *
+ * Detected import shapes — the SPECIFIER is rewritten, the import
+ * CLAUSE is preserved (so named bindings still work):
+ *
+ *   import SyAPP from '...'
+ *   import SyAPP, { X } from '...'
+ *   import { SyAPP } from '...'
+ *   import { X, SyAPP, Y as Z } from '...'
+ *   import * as SyAPP from '...'
+ *
+ * If no SyAPP import is present, a `import SyAPP from '<url>';` line is
+ * injected at the top of the file — but ONLY when the source actually
+ * references `SyAPP` as a class (i.e. `extends SyAPP` or
+ * `SyAPP.Func()`). A file that merely mentions "SyAPP" in a comment or
+ * string is left untouched, avoiding spurious imports in unrelated
+ * scripts.
+ *
+ * Relative imports of OTHER modules are rewritten against the ORIGINAL
+ * directory (same as `_syappCreateEsmMirror`), so the mirrored file
+ * resolves its sibling imports correctly from the temp directory.
+ *
+ * The mirror is always written with a `.mjs` extension and a sibling
+ * `package.json` marking the tree as ESM, so Node treats it as a module
+ * regardless of the original file's location or its surrounding
+ * package.json scope.
+ *
+ * @param {string} absolutePath - Absolute path to the source .js file.
+ * @param {string} syappModuleUrl - file:// URL of the currently-running
+ *                                  SyAPP.js (i.e. `import.meta.url`).
+ * @returns {string} Absolute path to the mirrored .mjs file.
+ * @private
+ */
+function _syappCreateSyappImportMirror(absolutePath, syappModuleUrl) {
+  const source = fs.readFileSync(absolutePath, 'utf8');
+  const srcDir = path.dirname(absolutePath);
+  const mirrorRoot = path.join(os.tmpdir(), 'syapp_cli_syapp_mirror');
+  if (!fs.existsSync(mirrorRoot)) fs.mkdirSync(mirrorRoot, { recursive: true });
+
+  // Mark the mirror tree as ESM so any bare `.js` file inside is treated
+  // as a module by Node (belt-and-braces — we also write `.mjs` below).
+  const pkgPath = path.join(mirrorRoot, 'package.json');
+  if (!fs.existsSync(pkgPath)) {
+    fs.writeFileSync(pkgPath, JSON.stringify({ type: 'module' }, null, 2), 'utf8');
+  }
+
+  // One subdirectory per source file, keyed by a hash of the absolute
+  // path AND the runtime SyAPP URL — a stale mirror can never be reused
+  // against a different runtime.
+  const hash = createHash('sha1')
+    .update(absolutePath + '::' + syappModuleUrl)
+    .digest('hex')
+    .slice(0, 16);
+  const mirrorDir = path.join(mirrorRoot, hash);
+  if (!fs.existsSync(mirrorDir)) fs.mkdirSync(mirrorDir, { recursive: true });
+
+  const baseName = path.basename(absolutePath).replace(/\.(js|mjs|cjs)$/i, '.mjs');
+  const mirrorFile = path.join(mirrorDir, baseName);
+
+  // ------------------------------------------------------------------
+  // Step 1 — Rewrite relative imports of OTHER modules so they resolve
+  //          from the ORIGINAL source directory (the mirror lives in
+  //          os.tmpdir() and would otherwise resolve them there).
+  // ------------------------------------------------------------------
+  const rewriteSpecifier = (spec) => {
+    if (!spec) return spec;
+    if (!spec.startsWith('./') && !spec.startsWith('../')) return spec;
+    const absTarget = path.resolve(srcDir, spec);
+    return url.pathToFileURL(absTarget).href;
+  };
+
+  let mirrorSource = source
+    .replace(/(\bfrom\s+)(['"])([^'"]+)\2/g, (m, kw, q, spec) => {
+      return kw + q + rewriteSpecifier(spec) + q;
+    })
+    .replace(/(\bimport\s+)(['"])([^'"]+)\2/g, (m, kw, q, spec) => {
+      return kw + q + rewriteSpecifier(spec) + q;
+    });
+
+  // ------------------------------------------------------------------
+  // Step 2 — Find and REWRITE the SyAPP import to point at the
+  //          currently-running SyAPP.js.
+  //
+  // The regex is line-anchored (multi-line flag) so indented imports
+  // and multi-line import clauses are matched. Word boundaries on
+  // `SyAPP` prevent matching `SyAPPFunc`, `SyAPPX`, etc. — but allow
+  // `SyAPP.js` in a STRING to be matched ONLY when the surrounding
+  // clause is a real SyAPP import (the trailing `from` requirement
+  // guarantees that).
+  //
+  // The specifier may be single-quoted, double-quoted, or backticked.
+  // After replacement, the import clause (e.g. `SyAPP, { X }`) and any
+  // trailing `;` / whitespace are preserved untouched.
+  // ------------------------------------------------------------------
+  let foundSyappImport = false;
+  const syappImportRe = /(^[ \t]*import\s+(?:(?!\bfrom\b)[\s\S])*?\bSyAPP\b[\s\S]*?\bfrom\s+)(['"])([^'"]+)\2/gm;
+  mirrorSource = mirrorSource.replace(syappImportRe, (m, pre, q, _spec) => {
+    foundSyappImport = true;
+    return pre + q + syappModuleUrl + q;
+  });
+
+  // ------------------------------------------------------------------
+  // Step 3 — If no SyAPP import was found, inject one at the top of the
+  //          file, but ONLY when the source actually uses SyAPP as a
+  //          class reference. This covers the "I forgot to import SyAPP
+  //          but I wrote `extends SyAPP.Func()`" case, while leaving
+  //          unrelated scripts that merely mention "SyAPP" in a
+  //          comment or string untouched.
+  // ------------------------------------------------------------------
+  if (!foundSyappImport) {
+    const usesSyappAsClass =
+      /\bextends\s+SyAPP\b/.test(mirrorSource) ||
+      /\bSyAPP\s*\.\s*Func\b/.test(mirrorSource);
+    if (usesSyappAsClass) {
+      mirrorSource = `import SyAPP from ${JSON.stringify(syappModuleUrl)};\n` + mirrorSource;
+    }
+  }
+
+  fs.writeFileSync(mirrorFile, mirrorSource, 'utf8');
+  return mirrorFile;
+}
+
 // If this file is run directly, execute the CLI with HTTP disabled by default.
 //
 // Usage:
@@ -37000,29 +37131,71 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       // imports (relative and bare), its full module graph, and any
       // SyAPP_Func subclasses it declares.
       //
-      // ESM SCOPE FALLBACK — a `.js` file that sits OUTSIDE a package.json
-      // that declares `"type": "module"` is treated by Node as CommonJS.
-      // If that file uses ESM syntax (`import` / `export` / `import.meta`
-      // / top-level await) — which is exactly what every Self Build
-      // output file does — the direct import fails with one of:
+      // ------------------------------------------------------------------
+      // THREE-STAGE IMPORT — with a SUPER HANDLER for SyAPP imports.
       //
-      //   SyntaxError: Cannot use import statement outside a module
-      //   SyntaxError: Unexpected token 'export'
-      //   SyntaxError: Cannot use 'import.meta' outside a module
-      //   SyntaxError: await is only valid in async functions
+      // Stage 1: plain direct import.
+      //   Fast path. Works for every well-formed file whose SyAPP import
+      //   resolves correctly.
       //
-      // For those SPECIFIC errors we transparently mirror the file into a
-      // temp `.mjs` (with a generated `package.json` marking the mirror
-      // tree as ESM) and retry the import. This lets
-      // `node SyAPP.js MyApp.js` just work, regardless of where MyApp.js
-      // lives on disk. Any other import error (a real syntax error in the
-      // source, a missing dependency, an explicit throw, etc.) is
-      // surfaced unchanged — the mirror step would not help those and
-      // would only obscure the real message.
-      let importedModule;
+      // Stage 2: ESM-scope mirror.
+      //   Fixes "Cannot use import statement outside a module" for .js
+      //   files living outside a package.json `"type": "module"` scope.
+      //   Existing behaviour, unchanged.
+      //
+      // Stage 3: SyAPP-import mirror (the SUPER HANDLER).
+      //   Rewrites (or injects) the file's SyAPP import to point at the
+      //   CURRENTLY-RUNNING SyAPP.js (`import.meta.url`) and re-imports.
+      //   Handles:
+      //     • broken / non-existent SyAPP import specifier,
+      //     • missing SyAPP import entirely (file uses `SyAPP.Func()`
+      //       without importing `SyAPP` — would normally throw
+      //       "SyAPP is not defined" on instantiation),
+      //     • SyAPP imported from a STALE local copy that does not
+      //       match the runtime's exported surface.
+      // ------------------------------------------------------------------
+
+      // Pick the first valid SyAPP_Func class from an imported module.
+      const pickExportedFunc = (mod) => {
+        const candidates = [];
+        if (mod) {
+          if (mod.default !== undefined && mod.default !== null) {
+            candidates.push({ name: 'default', value: mod.default });
+          }
+          for (const key of Object.keys(mod)) {
+            if (key === 'default') continue;
+            candidates.push({ name: key, value: mod[key] });
+          }
+        }
+        for (const cand of candidates) {
+          let value = cand.value;
+          if (value && typeof value !== 'function' && typeof value === 'object') {
+            const nestedKeys = ['default', 'MainFunc', 'Func', 'SyAPP_Func'];
+            for (const nk of nestedKeys) {
+              const nested = value[nk];
+              if (isSyAPPFuncClass(nested)) {
+                value = nested;
+                break;
+              }
+            }
+          }
+          if (isSyAPPFuncClass(value)) {
+            return { func: value, name: cand.name };
+          }
+        }
+        return null;
+      };
+
+      let importedModule = null;
+      let picked = null;
+      let lastImportError = null;
+
+      // ---- Stage 1: direct import ----
       try {
         importedModule = await import(fileUrl);
+        picked = pickExportedFunc(importedModule);
       } catch (importErr) {
+        lastImportError = importErr;
         const errMsg = String((importErr && importErr.message) || '');
         const isEsmScopeError =
           /Cannot use import statement outside a module/i.test(errMsg) ||
@@ -37031,84 +37204,75 @@ if (import.meta.url === `file://${process.argv[1]}`) {
           /await is only valid in async functions/i.test(errMsg);
 
         if (isEsmScopeError && absolutePath.toLowerCase().endsWith('.js')) {
+          // ---- Stage 2: ESM-scope mirror ----
           try {
             const mirrorPath = _syappCreateEsmMirror(absolutePath);
             const mirrorUrl = url.pathToFileURL(mirrorPath).href;
             importedModule = await import(mirrorUrl);
-            console.log(ColorText.dim(
-              `ℹ️  Loaded "${targetFile}" via ESM mirror — file was outside the package.json module scope`
-            ));
-          } catch (mirrorErr) {
-            console.error(ColorText.brightRed(`❌ SyAPP runner: failed to import "${targetFile}":`));
-            console.error(importErr);
-            console.error(ColorText.brightRed(`❌ ESM mirror retry also failed:`));
-            console.error(mirrorErr);
-            process.exit(1);
-          }
-        } else {
-          console.error(ColorText.brightRed(`❌ SyAPP runner: failed to import "${targetFile}":`));
-          console.error(importErr);
-          process.exit(1);
-        }
-      }
-
-      // ------------------------------------------------------------------
-      // Collect all exported functions and pick the first one that looks
-      // like a SyAPP_Func.
-      //
-      // Priority:
-      //   1. default export
-      //   2. any named export
-      //   3. nested keys inside a plain-object default export
-      // ------------------------------------------------------------------
-      const candidates = [];
-
-      if (importedModule) {
-        if (importedModule.default !== undefined && importedModule.default !== null) {
-          candidates.push({ name: 'default', value: importedModule.default });
-        }
-        for (const key of Object.keys(importedModule)) {
-          if (key === 'default') continue;
-          candidates.push({ name: key, value: importedModule[key] });
-        }
-      }
-
-      let ExportedFunc = null;
-      let ExportedFuncName = null;
-
-      for (const cand of candidates) {
-        let value = cand.value;
-
-        // Descend into plain-object exports looking for common nested keys.
-        if (value && typeof value !== 'function' && typeof value === 'object') {
-          const nestedKeys = ['default', 'MainFunc', 'Func', 'SyAPP_Func'];
-          for (const nk of nestedKeys) {
-            const nested = value[nk];
-            if (isSyAPPFuncClass(nested)) {
-              value = nested;
-              break;
+            picked = pickExportedFunc(importedModule);
+            if (picked) {
+              console.log(ColorText.dim(
+                `ℹ️  Loaded "${targetFile}" via ESM mirror — file was outside the package.json module scope`
+              ));
             }
+          } catch (mirrorErr) {
+            lastImportError = mirrorErr;
           }
-        }
-
-        if (isSyAPPFuncClass(value)) {
-          ExportedFunc = value;
-          ExportedFuncName = cand.name;
-          break;
         }
       }
 
-      if (typeof ExportedFunc !== 'function') {
-        console.error(ColorText.brightRed(
-          `❌ SyAPP runner: "${targetFile}" does not export a class extending SyAPP_Func.\n` +
-          `   Expected one of:\n` +
-          `     export default class MyFunc extends SyAPP_Func { ... }\n` +
-          `     export default class MyFunc extends SyAPP.Func() { ... }\n` +
-          `     export class MainFunc extends SyAPP_Func { ... }\n` +
-          `     export class Func extends SyAPP_Func { ... }`
-        ));
+      // ---- Stage 3: SyAPP-import mirror (SUPER HANDLER) ----
+      //
+      // Triggered when:
+      //   • Stage 1 / 2 threw, OR
+      //   • Stage 1 / 2 imported successfully but no valid SyAPP_Func
+      //     class was found (e.g. the file uses SyAPP.Func() without
+      //     importing SyAPP, so the class instantiation fails with
+      //     "SyAPP is not defined" and the duck-type check rejects it).
+      if (!picked) {
+        try {
+          const syappRuntimeUrl = import.meta.url;
+          const syappMirrorPath = _syappCreateSyappImportMirror(absolutePath, syappRuntimeUrl);
+          const syappMirrorUrl = url.pathToFileURL(syappMirrorPath).href;
+          const syappMirrorModule = await import(syappMirrorUrl);
+          const mirrorPicked = pickExportedFunc(syappMirrorModule);
+          if (mirrorPicked) {
+            picked = mirrorPicked;
+            console.log(ColorText.dim(
+              `ℹ️  Loaded "${targetFile}" via SyAPP-import mirror — SyAPP import anchored to the running SyAPP.js`
+            ));
+          }
+        } catch (superErr) {
+          // Prefer the Stage 1 / 2 error when one exists: the mirror
+          // error is often a generic "Cannot find module" for a path
+          // that was already broken before we touched it, which would
+          // hide the real reason the first import failed.
+          if (!lastImportError) {
+            lastImportError = superErr;
+          }
+        }
+      }
+
+      // ---- Final failure ----
+      if (!picked) {
+        if (lastImportError) {
+          console.error(ColorText.brightRed(`❌ SyAPP runner: failed to import "${targetFile}":`));
+          console.error(lastImportError);
+        } else {
+          console.error(ColorText.brightRed(
+            `❌ SyAPP runner: "${targetFile}" does not export a class extending SyAPP_Func.\n` +
+            `   Expected one of:\n` +
+            `     export default class MyFunc extends SyAPP_Func { ... }\n` +
+            `     export default class MyFunc extends SyAPP.Func() { ... }\n` +
+            `     export class MainFunc extends SyAPP_Func { ... }\n` +
+            `     export class Func extends SyAPP_Func { ... }`
+          ));
+        }
         process.exit(1);
       }
+
+      const ExportedFunc = picked.func;
+      const ExportedFuncName = picked.name;
 
       // Boot SyAPP with the user-provided class as the main function.
       // SyAPP's constructor will:
