@@ -61,6 +61,21 @@ function openTextEditor(initialText = '', titleText = 'USER REQUEST') {
     return new Promise((resolve) => {
         const originalRawMode = !!process.stdin.isRaw;
 
+        // Defensive: remove any pre-existing 'data' listeners before
+        // attaching the editor's own key handler. This prevents a
+        // stale browser/menu listener from firing alongside the
+        // editor handler on every keystroke - which was causing the
+        // editor to bug out completely when opened from the
+        // `node Struct.js last` prompt resume path (the browser's
+        // onKeypress was still attached there, so typing in the
+        // editor also triggered browser actions like navigation,
+        // toggling files, and even exiting the process). The caller
+        // is responsible for re-attaching its own listener after the
+        // editor resolves - exactly as it already does.
+        for (const listener of process.stdin.listeners('data')) {
+            process.stdin.removeListener('data', listener);
+        }
+
         let lines = String(initialText == null ? '' : initialText).split('\n');
         if (lines.length === 0) lines = [''];
 
