@@ -20803,8 +20803,7 @@ function levenshteinDistance(str1, str2) {
           args: Array.isArray(cfg.args) ? cfg.args.slice() : [],
           // Persistent dropdown text/emoji state. Initialized from the
           // call-site config so the widget renders with the caller's
-          // values on the first pass, and overwritten by the disk
-          // record (if any) so user edits survive a process restart.
+          // values on the first pass.
           dropdown: {
             up_buttontext: cfg.dropdown.up_buttontext,
             down_buttontext: cfg.dropdown.down_buttontext,
@@ -20818,75 +20817,44 @@ function levenshteinDistance(str1, str2) {
           // this setting controls only what the generated snippet and
           // the host-file write-back show.
           pathMode: (cfg.pathMode === 'global' || cfg.pathMode === 'relative') ? cfg.pathMode : 'global',
+          // NEW: run mode (bg vs normal), sourced EXCLUSIVELY from the
+          // call-site config so the widget is 100% driven by the file.
+          runMode: (cfg.runMode === 'normal' || cfg.runMode === 'bg') ? cfg.runMode : 'bg',
           autoApplyArgToDropdown: false
         };
 
-        // Step 1 — disk record keyed by (outer file, owner func, widget
-        // name). The namespaced key guarantees that an embedded func's
-        // own Emb() never collides with the OUTER func's Emb() record.
-        if (!boot.filePath && !boot.code && outerFilePath) {
-          const disk = _embDiskLoad(outerFilePath, diskKey);
-          if (disk && (disk.filePath || disk.code)) {
-            boot.source = disk.source || (disk.filePath ? 'file' : 'code');
-            boot.filePath = disk.filePath || null;
-            boot.code = disk.code || null;
-            boot.saveMode = (disk.saveMode === 'inline' || disk.saveMode === 'path')
-              ? disk.saveMode
-              : 'inline';
-            if (Array.isArray(disk.args)) boot.args = disk.args.slice();
-            // NEW: restore persisted runMode (falls back to 'bg' when
-            // the disk record predates this feature).
-            if (disk.runMode === 'normal' || disk.runMode === 'bg') {
-              boot.runMode = disk.runMode;
-            }
-            // Restore custom dropdown text/emoji from disk so a widget
-            // whose label was edited keeps its label across restarts.
-            if (disk.dropdown && typeof disk.dropdown === 'object') {
-              boot.dropdown = { ...boot.dropdown, ...disk.dropdown };
-            }
-            // Restore path mode (global / relative) so the widget
-            // re-opens in the same path representation the user last
-            // chose.
-            if (disk.pathMode === 'global' || disk.pathMode === 'relative') {
-              boot.pathMode = disk.pathMode;
-            }
-          }
-        }
-
-        // Step 2 — self-heal by scanning the running file for an
-        // existing this.Emb(...) call already carrying a filePath.
+        // ------------------------------------------------------------------
+        // CONFIG IS THE SINGLE SOURCE OF TRUTH.
         //
-        // IMPORTANT: this scan is now restricted to the OUTER func
-        // (isOuterFunc) only. The scan matches by `name:` string, so it
-        // cannot tell apart an Emb declared in the outer file from an
-        // Emb declared inside a dynamically imported embedded func. An
-        // embedded func whose Emb shares the same `name` would otherwise
-        // recover the OUTER func's Emb record — the exact recursive
-        // Enter-Func loop this guard prevents.
-        if (!boot.filePath && !boot.code && outerFilePath && isOuterFunc) {
-          try {
-            const src = fs.readFileSync(outerFilePath, 'utf8');
-            const healed = _embScanRunningFileForWidget(src, cfg.name);
-            if (healed && (healed.filePath || healed.code)) {
-              boot.source = healed.filePath ? 'file' : 'code';
-              boot.filePath = healed.filePath || null;
-              boot.code = healed.code || null;
-              boot.saveMode = 'inline';
-            }
-          } catch (_) {}
-        }
-
-        // Resolve a relative filePath (from cfg, scan, or a copied
-        // snippet) against the host file's directory, and switch the
-        // widget to RELATIVE path mode. The widget always operates on
-        // ABSOLUTE paths internally — the relative representation is
-        // purely a snippet / display concern — so this keeps file
-        // resolution identical while letting the snippet show
-        // `../../file.js` instead of `/abs/path/file.js`.
+        // Every field of `boot` is initialised from the call-site config
+        // (cfg) above. The previous implementation ALSO tried to recover
+        // additional state from:
+        //   (a) the per-(outer-file, widget-name) disk mirror, and
+        //   (b) a self-heal scan of the running file's source,
+        // which silently overrode the explicit config when a stale entry
+        // existed on disk from a previous run with a different `name`.
+        // That produced the "recovers the config of a past name" symptom.
+        //
+        // Those recovery paths are now DISABLED. The widget's state is
+        // a pure projection of the current file's `this.Emb(...)` call.
+        // If the user changes `runMode` / `args` / `dropdown` / etc.,
+        // the widget reflects the new value immediately on the next
+        // render — because the file IS the value.
+        //
+        // A relative filePath is resolved against the host file's
+        // directory so the widget always operates on ABSOLUTE paths
+        // internally. The snippet still shows the relative form
+        // (pathMode === 'relative'), so nothing about the on-disk
+        // representation changes.
+        // ------------------------------------------------------------------
         if (boot.filePath && !path.isAbsolute(boot.filePath) && outerFilePath) {
           try {
             boot.filePath = path.resolve(path.dirname(outerFilePath), boot.filePath);
-            boot.pathMode = 'relative';
+            // Keep pathMode 'relative' only when it was NOT explicitly
+            // set to 'global' in the config — the explicit config wins.
+            if (cfg.pathMode !== 'global') {
+              boot.pathMode = 'relative';
+            }
           } catch (_) {}
         }
 
@@ -20944,8 +20912,12 @@ function levenshteinDistance(str1, str2) {
         this.Storages.Set(id, storageKey, state);
       }
 
-      // Persist any successfully-recovered entry to disk so the NEXT
-      // boot does not have to re-scan the outer file. Best-effort.
+      // NOTE: the disk mirror is no longer consulted for state recovery
+      // (see the "CONFIG IS THE SINGLE SOURCE OF TRUTH" block above),
+      // but we still mirror writes to it so the SelfBuilder's
+      // Finish & Return path can resolve the produced func's file path
+      // after a process restart. The mirror is WRITE-ONLY as far as
+      // this.Emb() bootstrap is concerned.
       if (outerFilePath && (state.filePath || state.code)) {
         _embDiskSave(outerFilePath, diskKey, state);
       }
@@ -21148,6 +21120,12 @@ function levenshteinDistance(str1, str2) {
                 `await this.Emb(id, {`,
                 `  name: ${JSON.stringify(cfg.name)}`
               ];
+              // Preserve the user's run mode choice (if non-default)
+              // even after Clear, so a fresh setup starts with the
+              // same background/inline preference.
+              if (state.runMode === 'normal') {
+                freshLines.push(`  runMode: 'normal',`);
+              }
               const ddOut = {};
               if (state.dropdown && typeof state.dropdown === 'object') {
                 for (const k of ['up_buttontext', 'down_buttontext', 'up_emoji', 'down_emoji']) {
@@ -21515,6 +21493,28 @@ function levenshteinDistance(str1, str2) {
         state.runMode = nextMode;
         this.Storages.Set(id, storageKey, state);
         if (outerFilePath) { try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {} }
+
+        // NEW: rewrite the host file's this.Emb(...) call IMMEDIATELY
+        // so the new runMode is reflected in the file itself — not
+        // just in memory / the disk mirror. This mirrors the existing
+        // behaviour of every other config toggle (saveAsPath,
+        // saveAsInline, togglePathMode). Without this, the widget's
+        // dropdown shows the change but re-parsing the file reverts
+        // to the default 'bg' mode.
+        try {
+          const __runModeHost = cfg.sourceFile ||
+            ((outerFilePath && fs.existsSync(outerFilePath)) ? outerFilePath : null);
+          if (__runModeHost && (state.filePath || state.code)) {
+            const snippet = (state.saveMode === 'path')
+              ? this._embSnippetPath(state, cfg, __runModeHost)
+              : this._embSnippetInline(state, cfg);
+            const existing = fs.readFileSync(__runModeHost, 'utf8');
+            const replaced = this._embReplaceExistingCall(existing, cfg.name, snippet);
+            if (replaced !== null) {
+              fs.writeFileSync(__runModeHost, replaced);
+            }
+          }
+        } catch (_) {}
 
         this.Alert(id,
           nextMode === 'bg'
@@ -23453,7 +23453,31 @@ function levenshteinDistance(str1, str2) {
 
       // The replacement text (with `await ` stripped, since the call
       // site's own context supplies awaits).
-      const plain = String(newSnippet).replace(/^\s*await\s+/, '');
+      let plain = String(newSnippet).replace(/^\s*await\s+/, '');
+
+      // -----------------------------------------------------------
+      // PRESERVE THE CALLER'S FIRST-ARGUMENT VARIABLE NAME.
+      //
+      // The generated snippet always uses `id` as the first argument.
+      // If the original call site used a DIFFERENT variable name
+      // (e.g. `await this.Emb(myid, {...})`), splicing the new snippet
+      // in verbatim would silently rename the call site's variable to
+      // `id` — which may not exist in the surrounding scope and would
+      // break the user's code.
+      //
+      // We extract the original first argument and substitute it back
+      // into the snippet before performing the replacement. Only a
+      // simple identifier is substituted (the common case); anything
+      // more complex (method calls, ternaries, etc.) is preserved
+      // as-is to avoid mangling.
+      // -----------------------------------------------------------
+      const applyIdVar = (snippet, originalBody) => {
+        const firstArg = (_sbSplitArgs(originalBody || '')[0] || '').trim();
+        if (!firstArg) return snippet;
+        if (!/^[A-Za-z_$][\w$]*$/.test(firstArg)) return snippet;
+        if (firstArg === 'id') return snippet;
+        return snippet.replace(/^(\s*this\.Emb\(\s*)id(\s*,)/, `$1${firstArg}$2`);
+      };
 
       // -----------------------------------------------------------
       // Case 1: direct top-level match. Splice directly.
@@ -23469,6 +23493,8 @@ function levenshteinDistance(str1, str2) {
       // for those unusual files.
       // -----------------------------------------------------------
       if (found.hops.length === 0) {
+        const originalBody = src.slice(found.targetBodyStart, found.targetBodyEnd);
+        plain = applyIdVar(plain, originalBody);
         const result = src.slice(0, found.targetCallStart) + plain + src.slice(found.targetCallEnd);
         if (!this._embSourceLooksBalanced(src) || this._embSourceLooksBalanced(result)) {
           return result;
@@ -23510,13 +23536,25 @@ function levenshteinDistance(str1, str2) {
           if (cIdx < 0) continue;
           const body = innermostUnescaped.slice(oIdx + 1, cIdx);
           if (this._embBodyHasName(body, embName)) {
-            return { start: m.index, end: cIdx + 1 };
+            return { start: m.index, end: cIdx + 1, bodyStart: oIdx + 1, bodyEnd: cIdx };
           }
         }
         return null;
       })();
 
       if (!targetInInner) return null;
+
+      // NEW: preserve the caller's first-argument variable name in
+      // the nested case too. The original body slice comes from the
+      // same coordinates as `innermostUnescaped` (the target call's
+      // arg span).
+      {
+        const originalInnerBody = innermostUnescaped.slice(
+          targetInInner.bodyStart,
+          targetInInner.bodyEnd
+        );
+        plain = applyIdVar(plain, originalInnerBody);
+      }
 
       const innerReplaced =
         innermostUnescaped.slice(0, targetInInner.start) +
@@ -24204,6 +24242,13 @@ function levenshteinDistance(str1, str2) {
       if (Array.isArray(state.args) && state.args.length > 0) {
         lines.push(`  args: ${JSON.stringify(state.args)},`);
       }
+      // NEW: persist the run mode (bg vs same process) when it differs
+      // from the default 'bg'. This is what makes the widget's
+      // "Same process" toggle survive a re-parse (Self Build export,
+      // page reload, manual file inspection, etc.).
+      if (state.runMode === 'normal') {
+        lines.push(`  runMode: 'normal',`);
+      }
       // Emit only non-default dropdown text/emoji, so an untouched
       // widget's source stays byte-for-byte identical.
       const ddOut = {};
@@ -24274,6 +24319,9 @@ function levenshteinDistance(str1, str2) {
         if (Array.isArray(state.args) && state.args.length > 0) {
           lines.push(`  args: ${JSON.stringify(state.args)},`);
         }
+        if (state.runMode === 'normal') {
+          lines.push(`  runMode: 'normal',`);
+        }
         const ddOut = {};
         if (state.dropdown && typeof state.dropdown === 'object') {
           for (const k of ['up_buttontext', 'down_buttontext', 'up_emoji', 'down_emoji']) {
@@ -24323,6 +24371,9 @@ function levenshteinDistance(str1, str2) {
       }
       if (Array.isArray(state.args) && state.args.length > 0) {
         lines.push(`  args: ${JSON.stringify(state.args)},`);
+      }
+      if (state.runMode === 'normal') {
+        lines.push(`  runMode: 'normal',`);
       }
       const ddOut = {};
       if (state.dropdown && typeof state.dropdown === 'object') {
@@ -30503,6 +30554,7 @@ function _genFuncJS(state, syappRelPath) {
           }
           cfg.saveMode = mode
           if (it.pathMode === 'relative') cfg.pathMode = 'relative'
+          if (it.runMode === 'normal') cfg.runMode = 'normal'
           if (Array.isArray(it.args) && it.args.length > 0) cfg.args = it.args
           if (it.dropdown && Object.keys(it.dropdown).length) cfg.dropdown = it.dropdown
           L.push(`${indent}await this.Emb(id, ${JSON.stringify(cfg)})`)
@@ -30782,6 +30834,7 @@ function _sbMakeItemForMethod(methodName, id) {
         code: '',
         saveMode: 'inline',
         pathMode: 'global',
+        runMode: 'bg',
         dropdown: {}
       }
     }
@@ -33571,6 +33624,7 @@ class SelfBuilder extends SyAPP_Func {
           if (it.filePath) cfg.filePath = it.filePath
           if (it.code) cfg.code = it.code
           if (it.pathMode === 'relative') cfg.pathMode = 'relative'
+          if (it.runMode === 'normal') cfg.runMode = 'normal'
           if (Array.isArray(it.args) && it.args.length > 0) cfg.args = it.args.slice()
           if (it.dropdown && Object.keys(it.dropdown).length) cfg.dropdown = it.dropdown
           await this.Emb(id, cfg)
@@ -33599,6 +33653,10 @@ class SelfBuilder extends SyAPP_Func {
               // choice.
               if (st.pathMode === 'relative') it.pathMode = 'relative';
               else if (st.pathMode === 'global') it.pathMode = 'global';
+              // Sync the run mode so the SelfBuilder export / re-parse
+              // round-trip preserves the user's bg ↔ same-process
+              // choice.
+              if (st.runMode === 'normal' || st.runMode === 'bg') it.runMode = st.runMode;
               // Sync the widget's dropdown text/emoji back to the item
               // (non-default values only), so _genFuncJS emits them when
               // the SelfBuilder exports / saves. Without this, edits made
@@ -34790,6 +34848,9 @@ function _sbCallToItem(call, sessionVar) {
           : (typeof cfg.filePath === 'string' && cfg.filePath && !path.isAbsolute(cfg.filePath)
               ? 'relative'
               : 'global'),
+        // Run mode (bg process vs same process). Defaults to 'bg'
+        // when the source does not carry an explicit value.
+        runMode: (cfg.runMode === 'normal') ? 'normal' : 'bg',
         dropdown: (cfg.dropdown && typeof cfg.dropdown === 'object' && !Array.isArray(cfg.dropdown))
           ? cfg.dropdown
           : {},
