@@ -36696,7 +36696,191 @@ function _packExtractConfigObjectFromSnippet(snippet) {
  * @returns {Promise<{ src: string, converted: number }>}
  * @private
  */
-async function _packInlineEmbInSource(src, hostFile, tempFunc, visiting) {
+/**
+ * Strip JavaScript comments from a source string, leaving every other
+ * byte untouched.
+ *
+ * Handles every way to create a comment in JavaScript:
+ *   • `//` line comments
+ *   • `/* ... *\/` block comments (including multi-line)
+ *   • `<!--` HTML-like open comments
+ *   • `-->` HTML-like close comments (only at start of line)
+ *
+ * Content inside string literals, template literals and regular
+ * expression literals is preserved verbatim.
+ *
+ * Lines that become empty (whitespace only) BECAUSE of comment removal
+ * are dropped entirely, so no empty lines are left in the place of
+ * removed comments. Blank lines that were already blank are kept.
+ *
+ * @param {string} src
+ * @returns {string}
+ * @private
+ */
+function _stripJSComments(src) {
+  if (typeof src !== 'string' || src.length === 0) return src;
+
+  const out = [];
+  let line = [];
+  let lineHadComment = false;
+  let i = 0;
+  const n = src.length;
+
+  let state = 'normal';
+
+  const REGEX_KEYWORDS = new Set([
+    'return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete',
+    'void', 'throw', 'case', 'do', 'else', 'yield', 'await', 'default'
+  ]);
+
+  const flushLine = () => {
+    const lineStr = line.join('');
+    if (lineStr.trim() === '' && lineHadComment) {
+      // Entire line came from a removed comment — skip it so no empty
+      // line is left in its place.
+    } else {
+      out.push(lineStr);
+    }
+    line = [];
+    lineHadComment = false;
+  };
+
+  // Whether a `/` at the current position can begin a regex literal,
+  // based on the last significant token on the current line (or start
+  // of line — regex allowed).
+  const canPrecedeRegexHere = () => {
+    let j = line.length - 1;
+    while (j >= 0 && /\s/.test(line[j])) j--;
+    if (j < 0) return true;
+    const lastChar = line[j];
+    if (/[\w$]/.test(lastChar)) {
+      let start = j;
+      while (start > 0 && /[\w$]/.test(line[start - 1])) start--;
+      const word = line.slice(start, j + 1).join('');
+      return REGEX_KEYWORDS.has(word);
+    }
+    return '([{,;:=!&|?+-*%<>^~'.includes(lastChar);
+  };
+
+  while (i < n) {
+    const c = src[i];
+    const next = src[i + 1];
+
+    if (state === 'line-comment') {
+      if (c === '\n') { state = 'normal'; flushLine(); i++; continue; }
+      lineHadComment = true;
+      i++;
+      continue;
+    }
+
+    if (state === 'block-comment') {
+      if (c === '*' && next === '/') { state = 'normal'; lineHadComment = true; i += 2; continue; }
+      if (c === '\n') { lineHadComment = true; flushLine(); i++; continue; }
+      lineHadComment = true;
+      i++;
+      continue;
+    }
+
+    if (state === 'single') {
+      line.push(c);
+      if (c === '\\') { if (i + 1 < n) { line.push(src[i + 1]); i += 2; continue; } }
+      if (c === "'") state = 'normal';
+      i++;
+      continue;
+    }
+
+    if (state === 'double') {
+      line.push(c);
+      if (c === '\\') { if (i + 1 < n) { line.push(src[i + 1]); i += 2; continue; } }
+      if (c === '"') state = 'normal';
+      i++;
+      continue;
+    }
+
+    if (state === 'template') {
+      line.push(c);
+      if (c === '\\') { if (i + 1 < n) { line.push(src[i + 1]); i += 2; continue; } }
+      if (c === '`') state = 'normal';
+      i++;
+      continue;
+    }
+
+    if (state === 'regex') {
+      // Regex literals cannot span a newline — abort and preserve the
+      // line as-is when we hit one (avoids eating real code on a
+      // heuristic false positive).
+      if (c === '\n') { state = 'normal'; flushLine(); i++; continue; }
+      line.push(c);
+      if (c === '\\') { if (i + 1 < n) { line.push(src[i + 1]); i += 2; continue; } }
+      if (c === '/') { state = 'regex-flags'; }
+      i++;
+      continue;
+    }
+
+    if (state === 'regex-flags') {
+      if (/[a-z]/i.test(c)) { line.push(c); i++; continue; }
+      state = 'normal';
+    }
+
+    if (c === '\n') { flushLine(); i++; continue; }
+
+    if (c === '/' && next === '/') {
+      state = 'line-comment';
+      lineHadComment = true;
+      i += 2;
+      continue;
+    }
+
+    if (c === '/' && next === '*') {
+      state = 'block-comment';
+      lineHadComment = true;
+      // Token separator so `a/* */b` cannot merge into `ab`.
+      line.push(' ');
+      i += 2;
+      continue;
+    }
+
+    if (c === '<' && next === '!' && src[i + 2] === '-' && src[i + 3] === '-') {
+      state = 'line-comment';
+      lineHadComment = true;
+      i += 4;
+      continue;
+    }
+
+    if (c === '-' && next === '-' && src[i + 2] === '>') {
+      const before = line.join('');
+      if (before.trim() === '') {
+        state = 'line-comment';
+        lineHadComment = true;
+        i += 3;
+        continue;
+      }
+    }
+
+    if (c === '/') {
+      if (canPrecedeRegexHere()) {
+        state = 'regex';
+        line.push('/');
+        i++;
+        continue;
+      }
+    }
+
+    if (c === "'") { state = 'single'; line.push(c); i++; continue; }
+    if (c === '"') { state = 'double'; line.push(c); i++; continue; }
+    if (c === '`') { state = 'template'; line.push(c); i++; continue; }
+
+    line.push(c);
+    i++;
+  }
+
+  if (line.length > 0 || lineHadComment) flushLine();
+
+  const hadTrailingNewline = src.endsWith('\n');
+  return out.join('\n') + (hadTrailingNewline ? '\n' : '');
+}
+
+async function _packInlineEmbInSource(src, hostFile, tempFunc, visiting, stripComments) {
   if (typeof src !== 'string' || !src) return { src, converted: 0 };
 
   // Find every direct this.Emb(...) call in this file.
@@ -36780,8 +36964,12 @@ async function _packInlineEmbInSource(src, hostFile, tempFunc, visiting) {
     // --- Inline-mode call: recurse into its code field only ---
     if (!isPathMode && hasCode) {
       const unescaped = tempFunc._embUnescapeOneLayer(rawCode);
-      const nested = await _packInlineEmbInSource(unescaped, hostFile, tempFunc, visiting);
-      if (nested.src === unescaped) continue; // nothing changed
+      const nested = await _packInlineEmbInSource(unescaped, hostFile, tempFunc, visiting, stripComments);
+      // Strip comments from the nested inline code (template-literal-safe,
+      // so already-processed nested emb templates are untouched but the
+      // current level's comments are removed).
+      const nestedStripped = stripComments ? _stripJSComments(nested.src) : nested.src;
+      if (nestedStripped === unescaped) continue; // nothing changed
 
       // Build the new config object via the widget's own snippet
       // builder, so escaping / pathMode / runMode / args / dropdown
@@ -36789,7 +36977,7 @@ async function _packInlineEmbInSource(src, hostFile, tempFunc, visiting) {
       const snippetState = {
         source: 'code',
         filePath: embFilePath || null,
-        code: nested.src,
+        code: nestedStripped,
         saveMode: 'inline',
         pathMode: embPathMode,
         runMode: embRunMode,
@@ -36836,16 +37024,22 @@ async function _packInlineEmbInSource(src, hostFile, tempFunc, visiting) {
       try {
         // Recursively inline any nested path-mode Emb calls in the
         // embedded file's source BEFORE extracting the class.
-        const nested = await _packInlineEmbInSource(processedEmbedded, absPath, tempFunc, visiting);
+        const nested = await _packInlineEmbInSource(processedEmbedded, absPath, tempFunc, visiting, stripComments);
         processedEmbedded = nested.src;
       } finally {
         visiting.delete(absPath);
       }
 
       // Extract the inline class using the widget's OWN extractor.
+      // When comment stripping is on, strip comments from the
+      // extracted class so the embedded source placed into the
+      // inline `code:` template literal is comment-free. Nested
+      // emb templates (already processed recursively) are preserved
+      // because the stripper treats template literals as opaque.
       let inlineClass;
       try {
         inlineClass = tempFunc._embExtractInlineClass(processedEmbedded);
+        if (stripComments) inlineClass = _stripJSComments(inlineClass);
       } catch (_) {
         continue;
       }
@@ -36896,7 +37090,7 @@ async function _packInlineEmbInSource(src, hostFile, tempFunc, visiting) {
  * @returns {Promise<{ changed: boolean, converted: number }>}
  * @private
  */
-async function _packInlineEmbInFile(filePath, tempFunc, overrides) {
+async function _packInlineEmbInFile(filePath, tempFunc, overrides, stripComments) {
   const abs = path.resolve(filePath);
   if (!fs.existsSync(abs)) return { changed: false, converted: 0 };
   if (!/\.(js|mjs|cjs)$/i.test(abs)) return { changed: false, converted: 0 };
@@ -36909,11 +37103,17 @@ async function _packInlineEmbInFile(filePath, tempFunc, overrides) {
   }
 
   const visiting = new Set([abs]);
-  const result = await _packInlineEmbInSource(src, abs, tempFunc, visiting);
-  if (result.converted === 0) return { changed: false, converted: 0 };
+  const result = await _packInlineEmbInSource(src, abs, tempFunc, visiting, stripComments);
+
+  // Apply the final per-file comment strip. Emb-template content is
+  // already comment-free (from the recursive processing), so this
+  // safely removes only the module's own outer comments.
+  const finalSrc = stripComments ? _stripJSComments(result.src) : result.src;
+
+  if (finalSrc === src) return { changed: false, converted: 0 };
 
   // STORE IN MEMORY ONLY — never touch the file on disk.
-  overrides.set(abs, result.src);
+  overrides.set(abs, finalSrc);
   return { changed: true, converted: result.converted };
 }
 
@@ -36931,7 +37131,7 @@ async function _packInlineEmbInFile(filePath, tempFunc, overrides) {
  * @returns {Promise<{ converted: number, filesTouched: number, overrides: Map<string, string> }>}
  * @private
  */
-async function _packInlineAllEmbs(entryFilePath) {
+async function _packInlineAllEmbs(entryFilePath, stripComments) {
   const tempFunc = new SyAPP_Func('__pack_temp__');
   const visited = new Set();
   const overrides = new Map();
@@ -36962,7 +37162,7 @@ async function _packInlineAllEmbs(entryFilePath) {
     for (const file of files) {
       visited.add(file);
       try {
-        const result = await _packInlineEmbInFile(file, tempFunc, overrides);
+        const result = await _packInlineEmbInFile(file, tempFunc, overrides, stripComments);
         if (result.changed) {
           changedThisPass++;
           filesTouched++;
@@ -37006,6 +37206,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     let _bgMode = false
     let _manageMode = false
     let _packMode = false
+    let _noCommentStrip = false  // --comment present: skip comment removal
     let _nameFlag = false        // --name present
     let _customName = null       // explicit --name <value>
     const _plainArgs = []
@@ -37042,6 +37243,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         _manageMode = true
       } else if (a === '--pack') {
         _packMode = true
+      } else if (a === '--comment') {
+        _noCommentStrip = true
       } else if (a === '--name') {
         // NEW: --name support for --bg.
         //
@@ -37165,9 +37368,10 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         // with the sources unchanged — this step can never make a
         // previously-working pack fail.
         // ------------------------------------------------------------------
+        const stripComments = !_noCommentStrip;
         let overrides = new Map();
         try {
-          const inlined = await _packInlineAllEmbs(absFile);
+          const inlined = await _packInlineAllEmbs(absFile, stripComments);
           overrides = inlined.overrides;
           if (inlined.converted > 0) {
             console.log(ColorText.brightGreen(
@@ -37195,7 +37399,26 @@ if (import.meta.url === `file://${process.argv[1]}`) {
           sourceOverrides: overrides
         });
         bundler.processModule(bundler.entryFile);
-        const bundled = bundler.generateBundle();
+        let bundled = bundler.generateBundle();
+
+        // ------------------------------------------------------------------
+        // FINAL COMMENT-STRIP PASS — runs after every other step.
+        //
+        // Module contents are already comment-free (from the per-file
+        // strip performed inside _packInlineEmbInFile), and embedded
+        // this.Emb() code was already stripped recursively. This final
+        // pass removes the auto-generated wrapper comments (the bundle
+        // header, `// Module: …` blocks, `// Original imports:` blocks,
+        // `// External (ignored) imports` etc.) so the written file is
+        // fully comment-free.
+        //
+        // Skipped when the `--comment` flag is present on the command
+        // line, so `node SyAPP.js --pack --comment file.js` behaves
+        // exactly like the pre-change pack flow.
+        // ------------------------------------------------------------------
+        if (stripComments) {
+          bundled = _stripJSComments(bundled);
+        }
 
         fs.writeFileSync(outPath, bundled, 'utf8');
         console.log(ColorText.brightGreen(
