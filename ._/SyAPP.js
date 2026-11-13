@@ -30,6 +30,25 @@ class ModuleBundler {
     this.debug           = options.debug === true;
 
     /**
+     * Optional IN-MEMORY source overrides.
+     *
+     * A `Map<string, string>` keyed by ABSOLUTE resolved file path. When
+     * present, `processModule()` reads a module's content from this map
+     * (when the file is a key) instead of from disk. Files not present
+     * fall through to `readFileSync()` as before.
+     *
+     * This is what allows the `--pack` flow to inline `this.Emb()` calls
+     * IN MEMORY ONLY — the original files on disk are never modified,
+     * but the generated bundle correctly contains the transformed
+     * (inline-mode) source of every reachable module.
+     *
+     * @type {Map<string, string>}
+     */
+    this.sourceOverrides = (options.sourceOverrides instanceof Map)
+      ? options.sourceOverrides
+      : new Map();
+
+    /**
      * Module specifiers / resolved paths / basenames to treat as EXTERNAL.
      *
      * Imports matching any entry in this list are:
@@ -557,7 +576,15 @@ class ModuleBundler {
       return info;
     }
 
-    const originalContent = readFileSync(filePath, 'utf8');
+    // ----------------------------------------------------------------
+    // Read from the IN-MEMORY override map when this file was rewritten
+    // by the `--pack` inline-Emb step. Files not in the map fall through
+    // to the normal disk read, so every non-transformed module keeps
+    // its existing behaviour untouched.
+    // ----------------------------------------------------------------
+    const originalContent = this.sourceOverrides.has(filePath)
+      ? this.sourceOverrides.get(filePath)
+      : readFileSync(filePath, 'utf8');
     const imports         = this.parseImports(originalContent).map(imp => ({
       ...imp,
       // Annotate each import with its ignore status once, so downstream
@@ -36498,6 +36525,461 @@ function _syappCreateSyappImportMirror(absolutePath, syappModuleUrl) {
   return mirrorFile;
 }
 
+// ============================================================
+// PACK — inline conversion of this.Emb() calls
+// ============================================================
+// The `--pack` flow converts every path-mode `this.Emb(...)` call in
+// the entry file's import graph (plus every embedded file reachable
+// through those calls, recursively) into inline mode, so the produced
+// bundle is fully self-contained.
+//
+// The conversion builds the new config object using EXACTLY the same
+// snippet-generation flow the Emb widget's "Save as Inline" button
+// uses:
+//
+//   1. Read the referenced file (`fs.readFileSync(filePath, 'utf8')`).
+//   2. `this._embExtractInlineClass(raw)` — strip the SyAPP import and
+//      `export` keywords, keep everything else.
+//   3. `this._embSnippetInline(state, cfg)` — build the snippet using
+//      the widget's own escaping rules
+//      (`.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${')`).
+//
+// IMPORTANT — SURGICAL REPLACEMENT, NOT FULL CALL REGENERATION.
+//
+// The new snippet produced by `_embSnippetInline` always starts with
+// `await this.Emb(id, { ... })`. Splicing that WHOLE snippet in place
+// of the original call would:
+//   • change the first-argument variable name (uid → id, session → id,
+//     …), breaking any call site that uses a non-standard session var;
+//   • force an `await` onto call sites that did not have one;
+//   • overwrite the exact call shape the user wrote.
+//
+// Instead, this module:
+//   1. runs `_embSnippetInline` to obtain the CORRECT config-object
+//      body (with the correct escaping, pathMode/runMode/args/dropdown
+//      emission rules, etc.);
+//   2. extracts the `{ ... }` object from that snippet;
+//   3. replaces ONLY the original call's `{ ... }` body with that
+//      object, leaving the original `this.Emb(<original-first-arg>, `
+//      prefix and the trailing `)` / `await` state entirely untouched.
+//
+// IMPORTANT — ORIGINAL FILES ARE NEVER MODIFIED.
+//
+// Every transformation happens IN MEMORY. The converted source of each
+// module is stored in a `sourceOverrides` Map that is passed into the
+// `ModuleBundler`. The bundler reads from that map for transformed
+// modules and falls through to `readFileSync()` for every other module.
+// The resulting bundle therefore contains the transformed content, but
+// the `.js` files on disk remain byte-for-byte identical to what they
+// were before `--pack` ran.
+// ============================================================
+
+/**
+ * Locate the FIRST `{ ... }` balanced-brace region inside `s`, starting
+ * at or after `fromIdx`. Skips strings, template literals, and
+ * comments.
+ * @private
+ */
+function _packFindObjectLiteral(s, fromIdx) {
+  if (typeof s !== 'string') return null;
+  let inStr = null;
+  let inTemplate = false;
+  let inLine = false;
+  let inBlock = false;
+  for (let i = fromIdx; i < s.length; i++) {
+    const c = s[i], nx = s[i + 1];
+    if (inLine) { if (c === '\n') inLine = false; continue; }
+    if (inBlock) { if (c === '*' && nx === '/') { inBlock = false; i++; } continue; }
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === inStr) inStr = null;
+      continue;
+    }
+    if (inTemplate) {
+      if (c === '\\') { i++; continue; }
+      if (c === '`') { inTemplate = false; continue; }
+      continue;
+    }
+    if (c === '"' || c === "'") { inStr = c; continue; }
+    if (c === '`') { inTemplate = true; continue; }
+    if (c === '/' && nx === '/') { inLine = true; i++; continue; }
+    if (c === '/' && nx === '*') { inBlock = true; i++; continue; }
+    if (c === '{') {
+      // Walk to matching '}' with the same skip rules.
+      let depth = 0;
+      let i2 = i;
+      let sStr = null, sTemplate = false, sLine = false, sBlock = false;
+      for (; i2 < s.length; i2++) {
+        const cc = s[i2], nn = s[i2 + 1];
+        if (sLine) { if (cc === '\n') sLine = false; continue; }
+        if (sBlock) { if (cc === '*' && nn === '/') { sBlock = false; i2++; } continue; }
+        if (sStr) {
+          if (cc === '\\') { i2++; continue; }
+          if (cc === sStr) sStr = null;
+          continue;
+        }
+        if (sTemplate) {
+          if (cc === '\\') { i2++; continue; }
+          if (cc === '`') { sTemplate = false; continue; }
+          continue;
+        }
+        if (cc === '"' || cc === "'") { sStr = cc; continue; }
+        if (cc === '`') { sTemplate = true; continue; }
+        if (cc === '/' && nn === '/') { sLine = true; i2++; continue; }
+        if (cc === '/' && nn === '*') { sBlock = true; i2++; continue; }
+        if (cc === '{') depth++;
+        else if (cc === '}') {
+          depth--;
+          if (depth === 0) {
+            return { start: i, end: i2 + 1, text: s.slice(i, i2 + 1) };
+          }
+        }
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Given a snippet produced by `_embSnippetInline` (whose shape is
+ * `await this.Emb(id, { ...config... })`), extract the config object
+ * body as a standalone `{ ... }` string.
+ * @private
+ */
+function _packExtractConfigObjectFromSnippet(snippet) {
+  if (typeof snippet !== 'string') return null;
+  const openIdx = snippet.indexOf('(');
+  if (openIdx < 0) return null;
+  // Skip past the first argument (which may be `id`, `uid`, etc.) to
+  // reach the config object that follows the first comma.
+  let depth = 0;
+  let firstCommaIdx = -1;
+  let inStr = null;
+  for (let i = openIdx + 1; i < snippet.length; i++) {
+    const c = snippet[i];
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === inStr) inStr = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') { inStr = c; continue; }
+    if (c === '(' || c === '[') depth++;
+    else if (c === ')' || c === ']') { if (depth === 0) break; depth--; }
+    else if (c === ',' && depth === 0) { firstCommaIdx = i; break; }
+  }
+  if (firstCommaIdx < 0) return null;
+  const obj = _packFindObjectLiteral(snippet, firstCommaIdx + 1);
+  if (!obj) return null;
+  return obj.text;
+}
+
+/**
+ * Walk a single source string, find every direct `this.Emb(...)` call,
+ * and produce a rewritten source where path-mode calls are converted
+ * to inline mode.
+ *
+ * Each replaced call preserves the ORIGINAL first argument and the
+ * ORIGINAL `await` state — only the config object `{ ... }` is swapped
+ * for the new inline-mode config body, so the call shape the user
+ * wrote is not disturbed.
+ *
+ * @param {string} src          - Source text of the host file.
+ * @param {string} hostFile     - Absolute path of the host file.
+ * @param {SyAPP_Func} tempFunc - Probe instance used for the helper
+ *                                methods (_embScanParenSimple,
+ *                                _embExtractInlineClass,
+ *                                _embSnippetInline,
+ *                                _embExtractRawCodeValue,
+ *                                _embUnescapeOneLayer).
+ * @param {Set<string>} visiting - Cycle guard for nested file reads.
+ * @returns {Promise<{ src: string, converted: number }>}
+ * @private
+ */
+async function _packInlineEmbInSource(src, hostFile, tempFunc, visiting) {
+  if (typeof src !== 'string' || !src) return { src, converted: 0 };
+
+  // Find every direct this.Emb(...) call in this file.
+  const calls = [];
+  const re = /this\.Emb\s*\(/g;
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    const openIdx = m.index + m[0].length - 1;
+    const closeIdx = tempFunc._embScanParenSimple(src, openIdx);
+    if (closeIdx < 0) continue;
+    calls.push({
+      start: m.index,
+      end: closeIdx + 1,
+      bodyStart: openIdx + 1,
+      bodyEnd: closeIdx,
+      raw: src.slice(m.index, closeIdx + 1),
+      body: src.slice(openIdx + 1, closeIdx)
+    });
+    re.lastIndex = closeIdx + 1;
+  }
+  if (calls.length === 0) return { src, converted: 0 };
+
+  // Process from END backwards so earlier offsets stay valid.
+  let out = src;
+  let converted = 0;
+
+  for (let i = calls.length - 1; i >= 0; i--) {
+    const call = calls[i];
+    const body = call.body;
+
+    // Extract this call's config fields using the same shape the
+    // widget reads from its own state.
+    const nameM = body.match(/(?:^|[{,\s])["']?name["']?\s*:\s*(["'`])((?:\\.|[^\\])*?)\1/);
+    const embName = nameM ? nameM[2] : 'default';
+
+    const fpM = body.match(/(?:^|[{,\s])["']?filePath["']?\s*:\s*(["'`])((?:\\.|[^\\])*?)\1/);
+    const embFilePath = fpM ? fpM[2] : null;
+
+    const smM = body.match(/(?:^|[{,\s])["']?saveMode["']?\s*:\s*(["'`])([^"'`]+)\1/);
+    const embSaveMode = smM ? smM[2] : null;
+
+    const rawCodeInfo = tempFunc._embExtractRawCodeValue(body);
+    const rawCode = rawCodeInfo ? rawCodeInfo.value : null;
+    const hasCode = rawCode !== null && String(rawCode).trim().length > 0;
+
+    const argsM = body.match(/(?:^|[{,\s])["']?args["']?\s*:\s*(\[[\s\S]*?\])/);
+    let embArgs = [];
+    if (argsM) {
+      try {
+        const parsed = JSON.parse(argsM[1]);
+        if (Array.isArray(parsed)) embArgs = parsed;
+      } catch (_) {}
+    }
+
+    const ddM = body.match(/(?:^|[{,\s])["']?dropdown["']?\s*:\s*(\{[\s\S]*?\})/);
+    let embDropdown = {};
+    if (ddM) {
+      try {
+        const parsed = JSON.parse(ddM[1]);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) embDropdown = parsed;
+      } catch (_) {}
+    }
+
+    const rmM = body.match(/(?:^|[{,\s])["']?runMode["']?\s*:\s*(["'`])([^"'`]+)\1/);
+    const embRunMode = (rmM && (rmM[2] === 'normal' || rmM[2] === 'bg')) ? rmM[2] : 'bg';
+
+    const pmM = body.match(/(?:^|[{,\s])["']?pathMode["']?\s*:\s*(["'`])([^"'`]+)\1/);
+    const embPathMode = (pmM && (pmM[2] === 'global' || pmM[2] === 'relative')) ? pmM[2] : 'global';
+
+    // --- Decide: is this call ALREADY inline? ---
+    // Following the exact rule the widget itself uses:
+    //   • saveMode === 'path'                                → path
+    //   • saveMode === 'inline'                              → inline
+    //   • otherwise, code present + no filePath              → inline
+    //   • otherwise, filePath present                        → path
+    const isPathMode = (
+      embSaveMode === 'path' ||
+      (embSaveMode !== 'inline' && embFilePath !== null && !hasCode)
+    );
+
+    // --- Inline-mode call: recurse into its code field only ---
+    if (!isPathMode && hasCode) {
+      const unescaped = tempFunc._embUnescapeOneLayer(rawCode);
+      const nested = await _packInlineEmbInSource(unescaped, hostFile, tempFunc, visiting);
+      if (nested.src === unescaped) continue; // nothing changed
+
+      // Build the new config object via the widget's own snippet
+      // builder, so escaping / pathMode / runMode / args / dropdown
+      // rules match path→inline switching exactly.
+      const snippetState = {
+        source: 'code',
+        filePath: embFilePath || null,
+        code: nested.src,
+        saveMode: 'inline',
+        pathMode: embPathMode,
+        runMode: embRunMode,
+        args: embArgs,
+        dropdown: embDropdown
+      };
+      const snippetCfg = { name: embName };
+      const snippet = tempFunc._embSnippetInline(snippetState, snippetCfg);
+      const newConfigObj = _packExtractConfigObjectFromSnippet(snippet);
+      if (!newConfigObj) continue;
+
+      // Surgical replacement: swap ONLY the original config object,
+      // keeping the original first argument and await state untouched.
+      const objInOriginal = _packFindObjectLiteral(call.raw, 0);
+      if (!objInOriginal) continue;
+      const newCallRaw =
+        call.raw.slice(0, objInOriginal.start) +
+        newConfigObj +
+        call.raw.slice(objInOriginal.end);
+
+      out = out.slice(0, call.start) + newCallRaw + out.slice(call.end);
+      converted++;
+      continue;
+    }
+
+    // --- Path-mode call: convert to inline ---
+    if (isPathMode && embFilePath) {
+      const absPath = path.isAbsolute(embFilePath)
+        ? embFilePath
+        : path.resolve(path.dirname(hostFile), embFilePath);
+
+      if (!fs.existsSync(absPath)) continue; // leave path-mode call as-is
+      if (visiting.has(absPath)) continue;   // cycle guard
+
+      let embeddedSrc;
+      try {
+        embeddedSrc = fs.readFileSync(absPath, 'utf8');
+      } catch (_) {
+        continue;
+      }
+
+      visiting.add(absPath);
+      let processedEmbedded = embeddedSrc;
+      try {
+        // Recursively inline any nested path-mode Emb calls in the
+        // embedded file's source BEFORE extracting the class.
+        const nested = await _packInlineEmbInSource(processedEmbedded, absPath, tempFunc, visiting);
+        processedEmbedded = nested.src;
+      } finally {
+        visiting.delete(absPath);
+      }
+
+      // Extract the inline class using the widget's OWN extractor.
+      let inlineClass;
+      try {
+        inlineClass = tempFunc._embExtractInlineClass(processedEmbedded);
+      } catch (_) {
+        continue;
+      }
+
+      // Build the snippet via the widget's OWN snippet builder so the
+      // escaping rules are byte-for-byte identical to the widget's
+      // "Save as Inline" flow.
+      const snippetState = {
+        source: 'file',
+        filePath: absPath,       // used only as the base-dir hint
+        code: inlineClass,
+        saveMode: 'inline',
+        pathMode: embPathMode,
+        runMode: embRunMode,
+        args: embArgs,
+        dropdown: embDropdown
+      };
+      const snippetCfg = { name: embName };
+      const snippet = tempFunc._embSnippetInline(snippetState, snippetCfg);
+      const newConfigObj = _packExtractConfigObjectFromSnippet(snippet);
+      if (!newConfigObj) continue;
+
+      // Surgical replacement: swap ONLY the original config object,
+      // keeping the original first argument and await state untouched.
+      const objInOriginal = _packFindObjectLiteral(call.raw, 0);
+      if (!objInOriginal) continue;
+      const newCallRaw =
+        call.raw.slice(0, objInOriginal.start) +
+        newConfigObj +
+        call.raw.slice(objInOriginal.end);
+
+      out = out.slice(0, call.start) + newCallRaw + out.slice(call.end);
+      converted++;
+    }
+  }
+
+  return { src: out, converted };
+}
+
+/**
+ * Compute the transformed source for one file WITHOUT writing anything
+ * to disk. The result is stashed in `overrides` (keyed by absolute
+ * path) so the bundler can use it as the file's content.
+ *
+ * @param {string} filePath
+ * @param {SyAPP_Func} tempFunc
+ * @param {Map<string, string>} overrides - In-memory source overrides.
+ * @returns {Promise<{ changed: boolean, converted: number }>}
+ * @private
+ */
+async function _packInlineEmbInFile(filePath, tempFunc, overrides) {
+  const abs = path.resolve(filePath);
+  if (!fs.existsSync(abs)) return { changed: false, converted: 0 };
+  if (!/\.(js|mjs|cjs)$/i.test(abs)) return { changed: false, converted: 0 };
+
+  let src;
+  try {
+    src = fs.readFileSync(abs, 'utf8');
+  } catch (_) {
+    return { changed: false, converted: 0 };
+  }
+
+  const visiting = new Set([abs]);
+  const result = await _packInlineEmbInSource(src, abs, tempFunc, visiting);
+  if (result.converted === 0) return { changed: false, converted: 0 };
+
+  // STORE IN MEMORY ONLY — never touch the file on disk.
+  overrides.set(abs, result.src);
+  return { changed: true, converted: result.converted };
+}
+
+/**
+ * Walk the import graph of `entryFilePath` and inline-convert every
+ * path-mode `this.Emb(...)` call in every reachable file.
+ *
+ * The converted sources are stored in the returned `overrides` map
+ * (keyed by absolute path) and NEVER written back to disk. The caller
+ * passes that map into the `ModuleBundler` so the resulting bundle
+ * contains the transformed code, while every `.js` file on disk keeps
+ * its original bytes.
+ *
+ * @param {string} entryFilePath
+ * @returns {Promise<{ converted: number, filesTouched: number, overrides: Map<string, string> }>}
+ * @private
+ */
+async function _packInlineAllEmbs(entryFilePath) {
+  const tempFunc = new SyAPP_Func('__pack_temp__');
+  const visited = new Set();
+  const overrides = new Map();
+  let totalConverted = 0;
+  let filesTouched = 0;
+
+  let passes = 0;
+  while (passes < 5) {
+    passes++;
+
+    const discovery = new ModuleBundler(entryFilePath, {
+      ignoreImports: ['SyAPP.js'],
+      syappRuntimeUrl: import.meta.url,
+      sourceOverrides: overrides
+    });
+    try {
+      discovery.processModule(discovery.entryFile);
+    } catch (_) {
+      break;
+    }
+
+    const files = Array.from(discovery.moduleRegistry.keys())
+      .filter(f => !discovery.isNativeModule(f) && !visited.has(f));
+
+    if (files.length === 0) break;
+
+    let changedThisPass = 0;
+    for (const file of files) {
+      visited.add(file);
+      try {
+        const result = await _packInlineEmbInFile(file, tempFunc, overrides);
+        if (result.changed) {
+          changedThisPass++;
+          filesTouched++;
+          totalConverted += result.converted;
+        }
+      } catch (_) {
+        // Skip files that cannot be processed — the bundler will see
+        // them unchanged and continue as before.
+      }
+    }
+
+    if (changedThisPass === 0) break;
+  }
+
+  return { converted: totalConverted, filesTouched, overrides };
+}
+
 // If this file is run directly, execute the CLI with HTTP disabled by default.
 //
 // Usage:
@@ -36658,7 +37140,63 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         : path.resolve(path.dirname(absFile), `${funcName}-pack.js`);
 
       try {
-        const bundled = SyAPP.Pack(absFile);
+        // ------------------------------------------------------------------
+        // STEP — Inline every path-mode this.Emb() call IN MEMORY.
+        //
+        // The conversion uses the SAME snippet-generation flow as the
+        // Emb widget's "Save as Inline" button:
+        //
+        //   • read the referenced file,
+        //   • extract the inline class,
+        //   • build the snippet via _embSnippetInline (identical escaping),
+        //   • swap ONLY the config object in the original call (the
+        //     first argument and await state are preserved verbatim).
+        //
+        // CRITICAL: the transformed sources are stored in an in-memory
+        // `overrides` map and passed into ModuleBundler. The original
+        // `.js` files on disk are NEVER touched — the only file that
+        // gets written is the final bundle at `outPath`.
+        //
+        // Applied recursively to every file reachable through the entry
+        // file's ESM imports, so the produced bundle is self-contained
+        // even at arbitrary embedding depth.
+        //
+        // If the conversion fails for any reason, the pack proceeds
+        // with the sources unchanged — this step can never make a
+        // previously-working pack fail.
+        // ------------------------------------------------------------------
+        let overrides = new Map();
+        try {
+          const inlined = await _packInlineAllEmbs(absFile);
+          overrides = inlined.overrides;
+          if (inlined.converted > 0) {
+            console.log(ColorText.brightGreen(
+              `✅ Inlined ${inlined.converted} this.Emb() call(s) across ${inlined.filesTouched} file(s) (in-memory only)`
+            ));
+          } else {
+            console.log(ColorText.dim(
+              `   No path-mode this.Emb() calls to inline`
+            ));
+          }
+        } catch (inlineErr) {
+          console.warn(ColorText.yellow(
+            `⚠ Emb inlining skipped: ${inlineErr && inlineErr.message ? inlineErr.message : inlineErr}`
+          ));
+          overrides = new Map();
+        }
+
+        // Feed the transformed sources into the bundler via the new
+        // `sourceOverrides` option. The bundler reads from that map
+        // first, falling back to disk for every module that was not
+        // transformed.
+        const bundler = new ModuleBundler(absFile, {
+          ignoreImports: ['SyAPP.js'],
+          syappRuntimeUrl: import.meta.url,
+          sourceOverrides: overrides
+        });
+        bundler.processModule(bundler.entryFile);
+        const bundled = bundler.generateBundle();
+
         fs.writeFileSync(outPath, bundled, 'utf8');
         console.log(ColorText.brightGreen(
           `✅ Packed ${path.basename(absFile)} → ${outPath}`
