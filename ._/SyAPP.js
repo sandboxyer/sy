@@ -2,7 +2,7 @@ import readline from 'readline';
 import { stdin, stdout } from 'process';
 import EventEmitter from 'events';
 import { readFileSync, existsSync } from 'fs';
-import { execSync, spawn } from 'child_process';
+import { execSync, spawn, spawnSync } from 'child_process';
 import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -437,8 +437,29 @@ class ModuleBundler {
       let match;
       while ((match = re.exec(out)) !== null) {
         const full = match[0];
+        // ------------------------------------------------------------------
+        // ENTRY FILE: normalise to a BUNDLE-SAFE main-script check.
+        //
+        // Previously this used `if (true)` — which forced the packed
+        // bundle to ALWAYS auto-run `new SyAPP(...)` on import, even
+        // when the bundle was loaded via `node SyAPP.js --config
+        // '<cfg>' <packfile>`. That caused a double-boot:
+        //   1. the bundle's `if (true) { new SyAPP(...) }` fires on
+        //      `await import(fileUrl)`, AND
+        //   2. the CLI's `_bootApp()` creates a second instance.
+        //
+        // Using `import.meta.url === \`file://\${process.argv[1]}\``
+        // preserves the original ESM semantics:
+        //   • `node <packfile>`                 → auto-run (correct)
+        //   • `node SyAPP.js <packfile>`        → no auto-run, CLI
+        //                                          handles boot (correct)
+        //   • `import('<packfile>')`            → no auto-run (correct)
+        //
+        // The string is written with escaped backticks so it survives
+        // being placed inside a JS template literal below.
+        // ------------------------------------------------------------------
         const repl = isEntry
-          ? `if (true) { // was: ${full.trim()}`
+          ? `if (import.meta.url === \`file://\${process.argv[1]}\`) { // was: ${full.trim()}`
           : `if (false) { // was: ${full.trim()}`;
         out = out.slice(0, match.index) + repl + out.slice(match.index + full.length);
         re.lastIndex = match.index + repl.length;
@@ -27726,6 +27747,742 @@ class AdminManager {
   }
 }
 
+// --------------------------- SyAPP Pack-Mode Helpers ---------------------------
+//
+// Constructor-level `pack: true` support.
+//
+// A `new SyAPP(MyFunc, { pack: true, ...rest })` call behaves exactly like:
+//
+//   1. node SyAPP.js --pack <mainfunc-file>
+//   2. node SyAPP.js --config '<serialized rest>' <packfile>
+//
+// The main func's SOURCE FILE is resolved in priority order:
+//
+//   (a) userConfig._mainSourceFile — set by the CLI when running
+//       `node SyAPP.js MyApp.js`.
+//
+//   (b) process.argv[1] — the file the user invoked directly
+//       (`node MyApp.js`).
+//
+//   (c) the caller's stack frame — last-resort fallback.
+//
+// Once a candidate file is picked, the class is located in one of
+// three ways:
+//
+//   1. DEFINED IN THAT FILE, WITH a `new SyAPP(...pack: true)` call
+//      → the class is isolated into a temp `.mjs` file (imports
+//        rewritten to absolute `file://` URLs so they still resolve
+//        from `os.tmpdir()`), the `new SyAPP(...)` block is dropped,
+//        and THAT temp file becomes the pack target.
+//
+//   2. DEFINED IN THAT FILE, WITHOUT a pack call
+//      → the file is packed as-is (existing `--pack` behaviour).
+//
+//   3. IMPORTED FROM ANOTHER FILE (e.g. `import Sy from './Sy.js'`)
+//      → the import statement is followed to its real path, and THAT
+//        resolved file is packed directly — no isolation needed
+//        because the importing file's `new SyAPP(...pack: true)`
+//        never runs inside the packed bundle.
+//
+// The final step drops the `pack: true` key from the config serialised
+// into `--config`, so the child process does NOT recurse into pack mode
+// itself. Every other config key (including `mainFuncName`) is forwarded
+// untouched, preserving the intended `new SyAPP(Sy, { mainFuncName: 'x' })`
+// naming.
+//
+// ----------------------------------------------------------------------
+// SILENT PACK MODE
+// ----------------------------------------------------------------------
+// Every step of the pack flow — the `--pack` subprocess, the child
+// CLI's own banner logs, and the helper's own warnings — is kept OUT
+// of the parent terminal. The full transcript is written to
+// `~/.syapp/pack.log` so it can be inspected at any time. Only a
+// short failure notice is printed to stderr when something goes
+// wrong.
+//
+// `_syappPackLog()` is the single sink for this transcript: everything
+// in `_syappRunPackMode` and `_syappRunPackChild` that used to call
+// `console.log` / `console.error` goes through it instead.
+// ----------------------------------------------------------------------
+// ---------------------------
+
+const _SYAPP_PACK_LOG_DIR = path.join(os.homedir(), '.syapp');
+const _SYAPP_PACK_LOG_FILE = path.join(_SYAPP_PACK_LOG_DIR, 'pack.log');
+
+/**
+ * Append a line to the pack log file. Never throws.
+ * @private
+ */
+function _syappPackLog(line) {
+  try {
+    if (!fs.existsSync(_SYAPP_PACK_LOG_DIR)) {
+      fs.mkdirSync(_SYAPP_PACK_LOG_DIR, { recursive: true });
+    }
+    const stamp = new Date().toISOString();
+    fs.appendFileSync(_SYAPP_PACK_LOG_FILE, `[${stamp}] ${line}\n`, 'utf8');
+  } catch (_) { /* logging must never break the flow */ }
+}
+
+/**
+ * Return the last `n` non-empty lines of the pack log file.
+ * @private
+ */
+function _syappPackLogTail(n = 20) {
+  try {
+    if (!fs.existsSync(_SYAPP_PACK_LOG_FILE)) return '';
+    const content = fs.readFileSync(_SYAPP_PACK_LOG_FILE, 'utf8');
+    const lines = content.split('\n').filter(l => l.trim().length > 0);
+    return lines.slice(-n).join('\n');
+  } catch (_) { return ''; }
+}
+
+/**
+ * Print a short failure notice to stderr (never stdout) and point the
+ * user at the full log for details.
+ * @private
+ */
+function _syappPackFailSummary(message) {
+  try {
+    process.stderr.write(
+      ColorText.brightRed(`❌ pack: ${message}`) +
+      ColorText.dim(`\n   Full log: ${_SYAPP_PACK_LOG_FILE}\n`)
+    );
+  } catch (_) { /* ignore */ }
+}
+
+/**
+ * Print a short success notice to stderr (never stdout).
+ * @private
+ */
+function _syappPackSuccessSummary() {
+  try {
+    process.stderr.write(
+      ColorText.brightGreen('✅ pack: instance started\n') +
+      ColorText.dim(`   Full log: ${_SYAPP_PACK_LOG_FILE}\n`)
+    );
+  } catch (_) { /* ignore */ }
+}
+
+/**
+ * Find the first file in the current call stack that is NOT the given
+ * excluded path. Used as a last-resort fallback when neither
+ * `_mainSourceFile` nor `process.argv[1]` identify the main func file.
+ * @private
+ */
+function _syappFindCallerPath(excludePath) {
+  try {
+    const stack = (new Error().stack || '').split('\n');
+    const exclude = path.resolve(excludePath || '');
+    for (const line of stack) {
+      const m = line.match(/\(?([\/][^():]+\.(?:js|mjs|cjs)):\d+:\d+\)?/);
+      if (!m) continue;
+      const candidate = path.resolve(m[1]);
+      if (candidate === exclude) continue;
+      if (!fs.existsSync(candidate)) continue;
+      return candidate;
+    }
+  } catch (_) { /* ignore */ }
+  return null;
+}
+
+/**
+ * Scan forward from `openIdx` (which must equal `openChar`) to the
+ * matching `closeChar`, skipping strings, template literals and
+ * comments. Returns the index of the closing char, or -1 on failure.
+ * @private
+ */
+function _syappScanBalanced(src, openIdx, openChar, closeChar) {
+  if (typeof src !== 'string' || src[openIdx] !== openChar) return -1;
+  let depth = 0, inStr = null, inTpl = false, inLine = false, inBlock = false;
+  for (let i = openIdx; i < src.length; i++) {
+    const c = src[i], nx = src[i + 1];
+    if (inLine) { if (c === '\n') inLine = false; continue; }
+    if (inBlock) { if (c === '*' && nx === '/') { inBlock = false; i++; } continue; }
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === inStr) inStr = null;
+      continue;
+    }
+    if (inTpl) {
+      if (c === '\\') { i++; continue; }
+      if (c === '`') { inTpl = false; continue; }
+      continue;
+    }
+    if (c === '"' || c === "'") { inStr = c; continue; }
+    if (c === '`') { inTpl = true; continue; }
+    if (c === '/' && nx === '/') { inLine = true; i++; continue; }
+    if (c === '/' && nx === '*') { inBlock = true; i++; continue; }
+    if (c === openChar) depth++;
+    else if (c === closeChar) {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Convenience wrapper for balanced `{ ... }` scanning.
+ * @private
+ */
+function _syappScanBalancedBrace(src, openIdx) {
+  return _syappScanBalanced(src, openIdx, '{', '}');
+}
+
+/**
+ * Compute the source-directory depth of `pos` inside `src`, ignoring
+ * braces inside strings/templates/comments.
+ * @private
+ */
+function _syappBraceDepthAt(src, pos) {
+  let depth = 0, inStr = null, inTpl = false, inLine = false, inBlock = false;
+  for (let i = 0; i < pos && i < src.length; i++) {
+    const c = src[i], nx = src[i + 1];
+    if (inLine) { if (c === '\n') inLine = false; continue; }
+    if (inBlock) { if (c === '*' && nx === '/') { inBlock = false; i++; } continue; }
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === inStr) inStr = null;
+      continue;
+    }
+    if (inTpl) {
+      if (c === '\\') { i++; continue; }
+      if (c === '`') { inTpl = false; continue; }
+      continue;
+    }
+    if (c === '"' || c === "'") { inStr = c; continue; }
+    if (c === '`') { inTpl = true; continue; }
+    if (c === '/' && nx === '/') { inLine = true; i++; continue; }
+    if (c === '/' && nx === '*') { inBlock = true; i++; continue; }
+    if (c === '{') depth++;
+    else if (c === '}') depth--;
+  }
+  return depth;
+}
+
+/**
+ * Return true when `src` contains `class <className> extends ...` at
+ * the top level (optionally `export`-prefixed).
+ * @private
+ */
+function _syappClassDefinedInSource(src, className) {
+  if (!src || !className) return false;
+  const escName = String(className).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(
+    `^[ \\t]*(?:export\\s+(?:default\\s+)?)?class\\s+${escName}\\s+extends\\s+`,
+    'm'
+  );
+  return re.test(src);
+}
+
+/**
+ * Return true when `src` contains at least one `new SyAPP(...)` call
+ * whose arguments include a `pack: true` property.
+ * @private
+ */
+function _syappSourceHasPackCall(src) {
+  if (typeof src !== 'string' || !src) return false;
+  const re = /new\s+SyAPP\s*\(/g;
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    const openIdx = m.index + m[0].length - 1;
+    const closeIdx = _syappScanBalanced(src, openIdx, '(', ')');
+    if (closeIdx < 0) { re.lastIndex = m.index + 1; continue; }
+    const args = src.slice(openIdx + 1, closeIdx);
+    if (/\bpack\s*:\s*true\b/.test(args)) return true;
+    re.lastIndex = closeIdx + 1;
+  }
+  return false;
+}
+
+/**
+ * Resolve an import specifier to an on-disk file, trying the usual
+ * extensions and `index.*` fallbacks. Returns null when the specifier
+ * is not a relative path or no candidate file exists.
+ * @private
+ */
+function _syappResolveImportPath(spec, srcDir) {
+  if (!spec || typeof spec !== 'string') return null;
+  if (!spec.startsWith('./') && !spec.startsWith('../') && !spec.startsWith('/')) {
+    return null; // bare package name — not a local file
+  }
+  const base = spec.startsWith('/') ? spec : path.resolve(srcDir, spec);
+  const candidates = [
+    base,
+    base + '.js',
+    base + '.mjs',
+    base + '.cjs',
+    path.join(base, 'index.js'),
+    path.join(base, 'index.mjs'),
+    path.join(base, 'index.cjs')
+  ];
+  for (const cand of candidates) {
+    try {
+      if (fs.existsSync(cand) && fs.statSync(cand).isFile()) return cand;
+    } catch (_) {}
+  }
+  return null;
+}
+
+/**
+ * Given a source file and a class name, scan every `import` statement
+ * and return the on-disk file that provides the class as a binding.
+ *
+ * Recognised shapes:
+ *   import X from './path'          (default)
+ *   import X, { Y } from './path'   (default + named)
+ *   import { X } from './path'      (named)
+ *   import { Y as X } from './path' (aliased)
+ *
+ * @private
+ */
+function _syappFindClassSourceFile(src, className, sourceFile) {
+  if (!src || !className) return null;
+  const srcDir = path.dirname(sourceFile);
+  const importRe = /^[ \t]*import\s+([\s\S]+?)\s+from\s+['"]([^'"]+)['"]/gm;
+  let m;
+  while ((m = importRe.exec(src)) !== null) {
+    const clause = m[1].trim();
+    const specifier = m[2];
+
+    // Default binding: `X` or `X, { ... }`
+    const defaultMatch = clause.match(/^([A-Za-z_$][\w$]*)\s*(?:,|$)/);
+    if (defaultMatch && defaultMatch[1] === className) {
+      const resolved = _syappResolveImportPath(specifier, srcDir);
+      if (resolved) return resolved;
+    }
+
+    // Named bindings: `{ X }`, `{ Y as X }`, `{ X, Z }`
+    const namedMatch = clause.match(/\{([^}]+)\}/);
+    if (namedMatch) {
+      const parts = namedMatch[1].split(',');
+      for (const part of parts) {
+        const trimmed = part.trim();
+        if (!trimmed) continue;
+        const asMatch = trimmed.match(/^([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$/);
+        if (asMatch) {
+          if (asMatch[2] === className) {
+            const resolved = _syappResolveImportPath(specifier, srcDir);
+            if (resolved) return resolved;
+          }
+        } else if (trimmed === className) {
+          const resolved = _syappResolveImportPath(specifier, srcDir);
+          if (resolved) return resolved;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Extract the main func class from `src` along with all imports and
+ * top-level `const|let|var|function` declarations, EXCLUDING any
+ * `new SyAPP(...)` call and any `if (...) { ... }` main-guard block
+ * that lives outside the class body.
+ *
+ * Relative import specifiers are rewritten to absolute `file://` URLs
+ * (anchored at `sourceFile`'s directory) so the isolated temp file can
+ * resolve them correctly from `os.tmpdir()`. Bare specifiers and
+ * already-absolute paths are left untouched.
+ *
+ * @param {string} src - Source of the invocation file
+ * @param {string} funcClassName - Class name of the main func
+ * @param {string} sourceFile - Absolute path of the invocation file
+ * @returns {string|null}
+ * @private
+ */
+function _syappIsolateMainFuncSource(src, funcClassName, sourceFile) {
+  if (!src || !funcClassName) return null;
+  const srcDir = path.dirname(sourceFile);
+
+  // -------------------- rewrite helper --------------------
+  const rewriteSpecifier = (spec) => {
+    if (!spec) return spec;
+    if (!spec.startsWith('./') && !spec.startsWith('../')) return spec;
+    try {
+      const abs = path.resolve(srcDir, spec);
+      return url.pathToFileURL(abs).href;
+    } catch (_) { return spec; }
+  };
+
+  // -------------------- imports --------------------
+  const imports = [];
+  const importRe = /^[ \t]*import\s+[\s\S]*?\bfrom\s+['"][^'"]+['"][^\n]*$/gm;
+  let m;
+  while ((m = importRe.exec(src)) !== null) {
+    const stmt = m[0].trim();
+    const rewritten = stmt.replace(
+      /(\bfrom\s+)(['"])([^'"]+)\2/g,
+      (_, kw, q, spec) => kw + q + rewriteSpecifier(spec) + q
+    );
+    if (!imports.includes(rewritten)) imports.push(rewritten);
+  }
+  const sideEffectRe = /^[ \t]*import\s+['"][^'"]+['"][^\n]*$/gm;
+  while ((m = sideEffectRe.exec(src)) !== null) {
+    const stmt = m[0].trim();
+    const rewritten = stmt.replace(
+      /(['"])([^'"]+)\1/g,
+      (_, q, spec) => q + rewriteSpecifier(spec) + q
+    );
+    if (!imports.includes(rewritten)) imports.push(rewritten);
+  }
+
+  // -------------------- main func class --------------------
+  const escName = funcClassName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const classRe = new RegExp(
+    `^[ \\t]*(?:export\\s+(?:default\\s+)?)?class\\s+${escName}\\s+extends\\s+[^{]+\\{`,
+    'm'
+  );
+  const classMatch = classRe.exec(src);
+  if (!classMatch) return null;
+
+  const classStart = classMatch.index;
+  const openBraceIdx = classMatch.index + classMatch[0].length - 1;
+  const closeBraceIdx = _syappScanBalancedBrace(src, openBraceIdx);
+  if (closeBraceIdx < 0) return null;
+
+  let classSrc = src.slice(classStart, closeBraceIdx + 1);
+  // Strip any existing export keyword so we can add one explicitly.
+  classSrc = classSrc.replace(/^(\s*)export\s+default\s+class\s+/, '$1class ');
+  classSrc = classSrc.replace(/^(\s*)export\s+class\s+/, '$1class ');
+
+  // -------------------- top-level const/let/var/function --------------------
+  const decls = [];
+  const declRe = /^[ \t]*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/gm;
+  while ((m = declRe.exec(src)) !== null) {
+    if (_syappBraceDepthAt(src, m.index) !== 0) continue;
+    const stmtStart = m.index;
+    let stmtEnd = src.length;
+    let sd = 0;
+    for (let j = m.index + m[0].length; j < src.length; j++) {
+      const c = src[j];
+      if (c === '{' || c === '(' || c === '[') sd++;
+      else if (c === '}' || c === ')' || c === ']') sd--;
+      else if (c === ';' && sd === 0) { stmtEnd = j + 1; break; }
+      else if (c === '\n' && sd === 0 && j > m.index + m[0].length) {
+        const rest = src.slice(j + 1).match(/^[ \t]*(\S)/);
+        if (rest && !/[.)\]},?:+\-*/]/.test(rest[1])) { stmtEnd = j + 1; break; }
+      }
+    }
+    decls.push(src.slice(stmtStart, stmtEnd));
+  }
+
+  const fnRe = /^[ \t]*(?:async\s+)?function\s+[A-Za-z_$][\w$]*\s*\(/gm;
+  while ((m = fnRe.exec(src)) !== null) {
+    if (_syappBraceDepthAt(src, m.index) !== 0) continue;
+    const bodyStart = src.indexOf('{', m.index + m[0].length);
+    if (bodyStart < 0) continue;
+    const bodyEnd = _syappScanBalancedBrace(src, bodyStart);
+    if (bodyEnd < 0) continue;
+    decls.push(src.slice(m.index, bodyEnd + 1));
+  }
+
+  // -------------------- compose --------------------
+  const parts = [];
+  if (imports.length > 0) { parts.push(imports.join('\n')); parts.push(''); }
+  if (decls.length > 0) { parts.push(decls.join('\n\n')); parts.push(''); }
+  parts.push(classSrc);
+  parts.push('');
+  parts.push(`export default ${funcClassName};`);
+
+  return parts.join('\n');
+}
+
+/**
+ * Serialize the user config into a JSON string suitable for `--config`.
+ * Skips internal keys (`pack`, `_mainSourceFile`, `mainfunc`) and any
+ * value that cannot be JSON round-tripped (functions, circular refs,
+ * BigInt, etc.). Returns null when nothing serializable remains.
+ * @private
+ */
+function _syappBuildPackConfigJson(userConfig) {
+  if (!userConfig || typeof userConfig !== 'object') return null;
+  const skip = new Set(['pack', '_mainSourceFile', 'mainfunc']);
+  const out = {};
+  let skippedNonSerializable = 0;
+  for (const k of Object.keys(userConfig)) {
+    if (skip.has(k)) continue;
+    const v = userConfig[k];
+    if (typeof v === 'function' || typeof v === 'undefined' || typeof v === 'symbol') {
+      skippedNonSerializable++;
+      continue;
+    }
+    try {
+      const json = JSON.stringify(v);
+      if (json === undefined) { skippedNonSerializable++; continue; }
+      JSON.parse(json);
+      out[k] = v;
+    } catch (_) {
+      skippedNonSerializable++;
+    }
+  }
+  if (skippedNonSerializable > 0) {
+    _syappPackLog(
+      `warning: ${skippedNonSerializable} non-serializable config key(s) skipped for --config`
+    );
+  }
+  if (Object.keys(out).length === 0) return null;
+  return JSON.stringify(out);
+}
+
+/**
+ * Locate the pack target for a `new SyAPP(MyFunc, { pack: true })` call.
+ *
+ * Returns `{ file, tempFiles }` on success or `{ error }` on failure.
+ * `tempFiles` lists every temporary file that MUST be cleaned up after
+ * the child process exits.
+ *
+ * @private
+ */
+function _syappResolvePackTarget(mainFunc, userConfig, syappJsPath) {
+  const funcClassName = typeof mainFunc === 'function' && mainFunc.name ? mainFunc.name : null;
+  if (!funcClassName) {
+    return { error: 'anonymous main func cannot be packed (isolation requires a class name)' };
+  }
+
+  // -------------------- 1. Collect candidate source files --------------------
+  const candidates = [];
+  if (userConfig && typeof userConfig._mainSourceFile === 'string' && userConfig._mainSourceFile) {
+    candidates.push(userConfig._mainSourceFile);
+  }
+  const argv1 = process.argv[1];
+  if (argv1 && typeof argv1 === 'string') {
+    const abs = path.isAbsolute(argv1) ? argv1 : path.resolve(process.cwd(), argv1);
+    if (path.resolve(abs) !== path.resolve(syappJsPath) && fs.existsSync(abs)) {
+      candidates.push(abs);
+    }
+  }
+  const callerPath = _syappFindCallerPath(syappJsPath);
+  if (callerPath) candidates.push(callerPath);
+
+  if (candidates.length === 0) {
+    return { error: 'could not determine a candidate source file (set _mainSourceFile, or run `node MyApp.js` directly)' };
+  }
+
+  // -------------------- 2. Walk candidates until one resolves --------------------
+  const tempFiles = [];
+  for (const candidate of candidates) {
+    if (!fs.existsSync(candidate)) continue;
+
+    let src;
+    try { src = fs.readFileSync(candidate, 'utf8'); }
+    catch (_) { continue; }
+
+    // ---- Case A: class is DEFINED in this file ----
+    if (_syappClassDefinedInSource(src, funcClassName)) {
+      // A1: file also has a `new SyAPP(...pack: true)` call → isolate
+      if (_syappSourceHasPackCall(src)) {
+        const isolated = _syappIsolateMainFuncSource(src, funcClassName, candidate);
+        if (!isolated) {
+          return { error: `could not isolate "${funcClassName}" from ${candidate}` };
+        }
+        const tempFile = path.join(
+          os.tmpdir(),
+          `syapp_pack_src_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mjs`
+        );
+        try { fs.writeFileSync(tempFile, isolated, 'utf8'); }
+        catch (e) { return { error: `failed to write isolation temp file: ${e.message}` }; }
+        tempFiles.push(tempFile);
+        _syappPackLog(`isolation: ${candidate} → ${tempFile}`);
+        return { file: tempFile, tempFiles };
+      }
+      // A2: no pack call → pack the file as-is
+      _syappPackLog(`direct pack (A2): ${candidate}`);
+      return { file: candidate, tempFiles };
+    }
+
+    // ---- Case B: class is IMPORTED from another file ----
+    const importedFrom = _syappFindClassSourceFile(src, funcClassName, candidate);
+    if (importedFrom) {
+      // Check whether the resolved class source ALSO has a pack call.
+      // Extremely unusual, but if it does, isolate it (otherwise the
+      // packed bundle's `new SyAPP(...pack: true)` would recurse).
+      try {
+        const resolvedSrc = fs.readFileSync(importedFrom, 'utf8');
+        if (_syappSourceHasPackCall(resolvedSrc) &&
+            _syappClassDefinedInSource(resolvedSrc, funcClassName)) {
+          const isolated = _syappIsolateMainFuncSource(resolvedSrc, funcClassName, importedFrom);
+          if (!isolated) {
+            return { error: `could not isolate "${funcClassName}" from ${importedFrom}` };
+          }
+          const tempFile = path.join(
+            os.tmpdir(),
+            `syapp_pack_src_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mjs`
+          );
+          try { fs.writeFileSync(tempFile, isolated, 'utf8'); }
+          catch (e) { return { error: `failed to write isolation temp file: ${e.message}` }; }
+          tempFiles.push(tempFile);
+          _syappPackLog(`isolation (resolved): ${importedFrom} → ${tempFile}`);
+          return { file: tempFile, tempFiles };
+        }
+      } catch (_) { /* fall through */ }
+      _syappPackLog(`direct pack (B): ${candidate} → ${importedFrom}`);
+      return { file: importedFrom, tempFiles };
+    }
+  }
+
+  return {
+    error:
+      `could not resolve a source file for class "${funcClassName}". ` +
+      `Tried: ${candidates.join(', ')}`
+  };
+}
+
+/**
+ * Run the constructor-level pack flow.
+ *
+ * SILENT MODE: every step logs to `~/.syapp/pack.log` instead of the
+ * terminal. The user sees only a short failure notice (on error) or a
+ * short success notice (on success).
+ *
+ * @param {Function} mainFunc - Main func class
+ * @param {Object} userConfig - Config from `new SyAPP(mainFunc, userConfig)`
+ * @returns {number} Exit code to propagate to the parent process
+ * @private
+ */
+function _syappRunPackMode(mainFunc, userConfig) {
+  const syappJsPath = url.fileURLToPath(import.meta.url);
+
+  // Truncate the log so each run's transcript is self-contained.
+  try {
+    if (!fs.existsSync(_SYAPP_PACK_LOG_DIR)) {
+      fs.mkdirSync(_SYAPP_PACK_LOG_DIR, { recursive: true });
+    }
+    fs.writeFileSync(_SYAPP_PACK_LOG_FILE, '', 'utf8');
+  } catch (_) {}
+  _syappPackLog(`pack mode start — syapp=${syappJsPath}`);
+
+  const resolved = _syappResolvePackTarget(mainFunc, userConfig, syappJsPath);
+  if (resolved.error) {
+    _syappPackLog(`ERROR resolve: ${resolved.error}`);
+    _syappPackFailSummary(resolved.error);
+    return 1;
+  }
+
+  const sourceFile = resolved.file;
+  const tempFiles = Array.isArray(resolved.tempFiles) ? resolved.tempFiles : [];
+  _syappPackLog(`pack target: ${sourceFile}`);
+
+  try {
+    // -------------------- 3. Run `--pack` on the target file --------------------
+    // `stdio: 'pipe'` — subprocess output is captured and written to
+    // the log file, NOT to the parent's terminal.
+    _syappPackLog(`running: node ${syappJsPath} --pack ${sourceFile}`);
+    const packResult = spawnSync(
+      process.execPath,
+      [syappJsPath, '--pack', sourceFile],
+      { stdio: 'pipe', cwd: process.cwd(), encoding: 'utf8' }
+    );
+    if (packResult.stdout) _syappPackLog(`--pack stdout:\n${packResult.stdout}`);
+    if (packResult.stderr) _syappPackLog(`--pack stderr:\n${packResult.stderr}`);
+    if (packResult.error || packResult.status !== 0) {
+      _syappPackLog(`ERROR --pack: status=${packResult.status}`);
+      _syappPackFailSummary(
+        `--pack failed (status ${packResult.status || 'error'}). ` +
+        `\n   ${_syappPackLogTail(20)}`
+      );
+      return packResult.status || 1;
+    }
+
+    // -------------------- 4. Locate the pack output --------------------
+    let outputFile = null;
+    try {
+      const src = fs.readFileSync(sourceFile, 'utf8');
+      const m = src.match(/class\s+([A-Za-z_$][\w$]*)\s+extends\s+/);
+      const baseName = m ? m[1] : 'untitled';
+      outputFile = path.resolve(path.dirname(sourceFile), `${baseName}-pack.js`);
+    } catch (_) {}
+    if (!outputFile || !fs.existsSync(outputFile)) {
+      try {
+        const dir = path.dirname(sourceFile);
+        const candidates = fs.readdirSync(dir).filter(f => f.endsWith('-pack.js'));
+        if (candidates.length === 1) outputFile = path.join(dir, candidates[0]);
+      } catch (_) {}
+    }
+    if (!outputFile || !fs.existsSync(outputFile)) {
+      _syappPackLog(`ERROR output: pack file not found`);
+      _syappPackFailSummary(
+        `output file not found. \n   ${_syappPackLogTail(20)}`
+      );
+      return 1;
+    }
+    _syappPackLog(`pack output: ${outputFile}`);
+
+    // If the input was a temp isolation file, the output also landed in
+    // `os.tmpdir()`, so we must remove it after the child exits.
+    if (tempFiles.includes(sourceFile)) {
+      tempFiles.push(outputFile);
+    }
+
+    // -------------------- 5. Spawn the child CLI --------------------
+    const configJson = _syappBuildPackConfigJson(userConfig);
+    _syappPackLog(`child config: ${configJson === null ? '(none)' : configJson}`);
+
+    const childArgs = [syappJsPath];
+    if (configJson !== null) childArgs.push('--config', configJson);
+    childArgs.push(outputFile);
+
+    // ------------------------------------------------------------------
+    // SILENT CHILD BOOTSTRAP.
+    //
+    // `stdio: ['inherit', 'pipe', 'pipe']` means:
+    //   • stdin  → inherited (the app needs the terminal)
+    //   • stdout → piped  (captured here, mirrored to log)
+    //   • stderr → piped  (captured here, mirrored to log)
+    //
+    // BUT the child needs to keep the terminal FOR ITSELF — it is the
+    // actual running SyAPP instance and its HUD drives the whole
+    // screen. So we cannot pipe stdout in the normal sense (the child
+    // would have no TTY and the HUD would render to a pipe).
+    //
+    // The correct silent strategy is:
+    //   1. inject an environment variable `SYAPP_PACK_CHILD=1` so the
+    //      child CLI KNOWS it is running as a silent child;
+    //   2. inside the child CLI's `_bootApp` (and elsewhere where
+    //      banner logs are emitted), suppress console output when that
+    //      env var is set;
+    //   3. use `stdio: 'inherit'` so the child owns the terminal for
+    //      the HUD.
+    //
+    // That is why the rest of the child invocation below is
+    // `spawnSync(..., { stdio: 'inherit', env: { ...process.env, SYAPP_PACK_CHILD: '1' } })`.
+    // The child's own bootstrap logs (HTTP server banner, route
+    // discovery, stream server banner, etc.) are gated on that env
+    // var and are silenced accordingly — see the `_bootApp` /
+    // `_installCtrlC` / streaming-server modifications in the CLI
+    // section of this file.
+    // ------------------------------------------------------------------
+    _syappPackLog(`running child: node ${childArgs.join(' ')}`);
+
+    const _sigintSuppress = () => {};
+    process.on('SIGINT', _sigintSuppress);
+    let childResult;
+    try {
+      childResult = spawnSync(process.execPath, childArgs, {
+        stdio: 'inherit',
+        cwd: process.cwd(),
+        env: { ...process.env, SYAPP_PACK_CHILD: '1' }
+      });
+    } finally {
+      try { process.removeListener('SIGINT', _sigintSuppress); } catch (_) {}
+    }
+    _syappPackLog(`child exited: status=${childResult.status}`);
+
+    if (childResult.status === 0) {
+      _syappPackSuccessSummary();
+    } else {
+      _syappPackFailSummary(`child exited with status ${childResult.status}`);
+    }
+
+    return childResult.status || 0;
+  } finally {
+    for (const f of tempFiles) {
+      try { fs.unlinkSync(f); } catch (_) {}
+    }
+  }
+}
+
 // --------------------------- SyAPP Class ---------------------------
 
 /**
@@ -27765,6 +28522,34 @@ class SyAPP {
     } else {
       mainFunc = mainFuncOrConfig?.mainfunc || TemplateFunc;
       userConfig = mainFuncOrConfig || {};
+    }
+
+    // ============================================================
+    // CONSTRUCTOR-LEVEL PACK MODE
+    // ============================================================
+    // When `pack: true` is set, the constructor does NOT boot normally.
+    // Instead it behaves like:
+    //
+    //     node SyAPP.js --pack <mainfunc-file>
+    //     node SyAPP.js --config '<serialized userConfig>' <packfile>
+    //
+    // — see _syappRunPackMode for the exact flow. This branch is
+    // reached only when the caller explicitly opts in, so every other
+    // code path is untouched.
+    //
+    // SILENT MODE: no pack-step output reaches stdout. The full
+    // transcript goes to `~/.syapp/pack.log`; only a short summary
+    // is printed to stderr on success or failure.
+    //
+    // The process that calls this constructor EXITS once the child
+    // process finishes, so the user's script does not continue past
+    // `new SyAPP(...)` in pack mode. This is intentional: the pack
+    // flow produces a bundle and hands control to a fresh SyAPP
+    // child, which is the actual running instance.
+    // ============================================================
+    if (userConfig && userConfig.pack === true) {
+      const packExitCode = _syappRunPackMode(mainFunc, userConfig);
+      process.exit(packExitCode);
     }
 
     /**
