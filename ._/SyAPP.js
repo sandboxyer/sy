@@ -37209,6 +37209,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     let _noCommentStrip = false  // --comment present: skip comment removal
     let _nameFlag = false        // --name present
     let _customName = null       // explicit --name <value>
+    let _userConfigArg = {}      // --config <json> parsed object
+    let _viewConfigMode = false  // --viewconfig present
     const _plainArgs = []
 
     for (let i = 0; i < _rawCliArgs.length; i++) {
@@ -37269,9 +37271,125 @@ if (import.meta.url === `file://${process.argv[1]}`) {
             i++
           }
         }
+      } else if (a === '--config') {
+        // --config <json> : JSON object forwarded to the new SyAPP()
+        // instance as its configuration object.
+        const next = _rawCliArgs[i + 1]
+        if (next === undefined) {
+          console.error(ColorText.brightRed('❌ --config requires a JSON string argument'))
+          process.exit(1)
+        }
+        try {
+          const parsed = JSON.parse(next)
+          if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            console.error(ColorText.brightRed('❌ --config requires a JSON object'))
+            process.exit(1)
+          }
+          _userConfigArg = parsed
+          i++
+        } catch (e) {
+          console.error(ColorText.brightRed(`❌ --config invalid JSON: ${e.message}`))
+          process.exit(1)
+        }
+      } else if (a === '--viewconfig') {
+        _viewConfigMode = true
       } else {
         _plainArgs.push(a)
       }
+    }
+
+    // ---- --viewconfig : print configuration reference and exit ----
+    if (_viewConfigMode) {
+      const _vc = ColorText
+      const _line = _vc.brightCyan('═'.repeat(67))
+      console.log(`
+${_line}
+  ${_vc.brightCyan('SyAPP --config  |  Configuration JSON Reference')}
+${_line}
+
+${_vc.brightYellow('USAGE')}
+
+  node SyAPP.js --config '<json>' [file.js|saveName]
+
+  The JSON passed to ${_vc.green('--config')} is used as the configuration object
+  for the new ${_vc.brightWhite('SyAPP()')} instance, equivalent to:
+
+      ${_vc.dim('new SyAPP(MyFunc, <json>)')}
+
+  The JSON value MUST be a single object literal. Quotes must be
+  shell-escaped (typically by wrapping the value in single quotes).
+
+${_vc.brightYellow('SUPPORTED KEYS')}
+
+  ${_vc.green('mainFuncName')}         string
+      Custom name for the main function.
+
+  ${_vc.green('port')}                 number  (default: 3000)
+      HTTP server port (only used when enableHTTP is true).
+
+  ${_vc.green('host')}                 string  (default: "0.0.0.0")
+      HTTP server bind host.
+
+  ${_vc.green('enableHTTP')}           boolean (default: false)
+      Enable the built-in HTTP server.
+
+  ${_vc.green('httpConfig')}           object  (default: {})
+      Arbitrary config object passed to build functions.
+
+  ${_vc.green('baseRoute')}            boolean (default: false)
+      Use base routes (drop the func-name prefix).
+
+  ${_vc.green('includeFuncName')}      boolean (default: true)
+      Include the function name in HTTP routes.
+
+  ${_vc.green('RefreshMode')}          boolean (default: true)
+      Enable the global auto-refresh loop.
+
+  ${_vc.green('RefreshInterval')}      number  (default: 400)
+      Auto-refresh interval in ms.
+
+  ${_vc.green('maxFuncHistorySize')}   number  (default: 20)
+      Max function-history entries per session.
+
+  ${_vc.green('mouseClickMode')}       "single" | "double"  (default: "single")
+      Click mode for the HUD.
+
+  ${_vc.green('autoPinPages')}         boolean (default: false)
+      Auto-generate pinned nav buttons for pages.
+
+  ${_vc.green('processArgs')}          array of strings
+      Positional args forwarded to ${_vc.dim('this.Args()')}.
+
+${_vc.brightYellow('EXAMPLES')}
+
+  ${_vc.dim('# Load MyApp.js with a custom main func name')}
+  node SyAPP.js --config '{"mainFuncName":"admin"}' MyApp.js
+
+  ${_vc.dim('# Enable the HTTP server on port 8080')}
+  node SyAPP.js --config '{"enableHTTP":true,"port":8080}' MyApp.js
+
+  ${_vc.dim('# Double-click mode, no auto-refresh')}
+  node SyAPP.js --config '{"mouseClickMode":"double","RefreshMode":false}' MyApp.js
+
+  ${_vc.dim('# Combined with --server (streaming host)')}
+  node SyAPP.js --server 9000 --config '{"mainFuncName":"app"}' MyApp.js
+
+  ${_vc.dim('# Combined with a saved app name')}
+  node SyAPP.js --config '{"port":8080}' my-saved-app
+
+${_vc.brightYellow('NOTES')}
+
+  • ${_vc.green('--config')} does NOT propagate to processes spawned by ${_vc.green('--bg')};
+    configure the child via its own file / saved state instead.
+
+  • Values from ${_vc.green('--config')} are merged with the CLI-internal
+    values (${_vc.dim('processArgs')}, ${_vc.dim('_mainSourceFile')}); the internal
+    values always win on conflict.
+
+  • ${_vc.green('--viewconfig')} is informational only and exits immediately —
+    it never boots an app.
+`)
+      return
     }
 
     // `--connect` mode runs standalone — no SyAPP app is loaded.
@@ -37515,7 +37633,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         } catch (_) {}
       }
 
-      const app = new SyAPP(FuncClass, extraConfig)
+      const app = new SyAPP(FuncClass, { ..._userConfigArg, ...extraConfig })
       _installCtrlC(app)
       if (_streamMode === 'server') {
         _startStreamingServer(app, _streamPort, _streamHost)
