@@ -130,6 +130,7 @@ CLEAR_ALL_LAYERS=0
 CLEAR_CURRENT_REPO=0
 SWITCH_TO_LAYER=0
 TARGET_LAYER_NUMBER=""
+SWI_CYCLE=0
 SWITCH_REPOSITORY=0
 TARGET_REPOSITORY=""
 LIST_ALL_LAYERS=0
@@ -181,11 +182,14 @@ while [ $# -gt 0 ]; do
             ;;
         swi|--swi|-s|switch|--switch)
             SWITCH_TO_LAYER=1
+            switch_token="$1"
             shift
             # Check if there's an argument (number or name)
             if [ $# -gt 0 ]; then
                 TARGET_LAYER_NUMBER="$1"
                 shift
+            elif [ "$switch_token" = "swi" ]; then
+                SWI_CYCLE=1
             fi
             ;;
         repo|--repo)
@@ -1649,6 +1653,89 @@ run_internal_tests() {
     return 0
 }
 
+# Cycle through layers: main -> instances -> main (infinite toggle)
+cycle_layers() {
+    # Determine the actual repository root
+    repository_root="$CURRENT_DIRECTORY"
+    
+    # If we're inside a ._ directory, go up to find the actual repo root
+    if [ "$(basename "$repository_root")" = "$LAYER_NAME" ]; then
+        repository_root="$(dirname "$repository_root")"
+    fi
+    
+    # Get repo name
+    repository_name=$(get_repo_name_from_git "$repository_root")
+    if [ -z "$repository_name" ]; then
+        repository_name=$(get_main_repo_name "$repository_root")
+    fi
+    
+    # Get parent directory
+    parent_directory="$(dirname "$repository_root")"
+    
+    # Build ordered list of layers: main first (if exists), then instances
+    layer_list=""
+    if [ -d "$parent_directory/$repository_name" ]; then
+        layer_list="$parent_directory/$repository_name"
+    fi
+    
+    for directory in "$parent_directory"/${repository_name}_*; do
+        [ -d "$directory" ] || continue
+        basename_directory=$(basename "$directory")
+        # Skip ._ directories
+        if [ "$basename_directory" = "$LAYER_NAME" ]; then
+            continue
+        fi
+        if [ -z "$layer_list" ]; then
+            layer_list="$directory"
+        else
+            layer_list="$layer_list
+$directory"
+        fi
+    done
+    
+    if [ -z "$layer_list" ]; then
+        [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_RED}Error: No layers found for repository '%s'${COLOR_RESET}\n" "$repository_name"
+        return 1
+    fi
+    
+    # Find current index and total count
+    cycle_total=0
+    cycle_current=-1
+    cycle_index=0
+    while IFS= read -r cycle_dir; do
+        [ -z "$cycle_dir" ] && continue
+        cycle_total=$((cycle_total + 1))
+        if [ "$cycle_dir" = "$repository_root" ]; then
+            cycle_current=$cycle_index
+        fi
+        cycle_index=$((cycle_index + 1))
+    done <<EOF
+$layer_list
+EOF
+    
+    # Compute next index (cycle back to first after last)
+    if [ "$cycle_current" -lt 0 ]; then
+        cycle_next=0
+    else
+        cycle_next=$(( (cycle_current + 1) % cycle_total ))
+    fi
+    
+    # Get target directory at next index
+    target_directory=$(printf "%s\n" "$layer_list" | sed -n "$((cycle_next + 1))p")
+    
+    if [ -z "$target_directory" ] || [ ! -d "$target_directory" ]; then
+        [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_RED}Error: Target directory not found${COLOR_RESET}\n"
+        return 1
+    fi
+    
+    [ $VERBOSE_MODE -eq 1 ] && printf "Cycling to: %s\n" "$target_directory"
+    
+    cd "$target_directory" || return 1
+    
+    [ $VERBOSE_MODE -eq 1 ] && printf "Now at: %s\n" "$PWD"
+    return 0
+}
+
 # Main logic
 if [ $RUN_INTERNAL_TESTS -eq 1 ]; then
     run_internal_tests
@@ -1702,7 +1789,11 @@ if [ $DIFF_NAVIGATE -eq 1 ]; then
 fi
 
 if [ $SWITCH_TO_LAYER -eq 1 ]; then
-    switch_to_layer
+    if [ $SWI_CYCLE -eq 1 ]; then
+        cycle_layers
+    else
+        switch_to_layer
+    fi
     [ $? -eq 0 ] && [ $VERBOSE_MODE -eq 0 ] && clear
     return $? 2>/dev/null || exit $?
 fi
