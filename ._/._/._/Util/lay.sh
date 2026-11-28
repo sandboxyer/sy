@@ -96,9 +96,12 @@ show_help() {
     printf "  lay clear          # Clear instances of current repo only (with verification)\n"
     printf "  lay swi [N|name]   # Switch to layer by number or custom name (0 = main repo)\n"
     printf "  lay repo [name|N]  # Switch to a different repository (by name or 1-based index)\n"
+    printf "  lay repo           # Show detailed info about current repo (instances, diffs, ranking)\n"
+    printf "  lay repo clear     # Clear instances of current repo only (keep main repo)\n"
     printf "  lay reposwi [name|N] # Alternative: switch to different repository\n"
     printf "  lay list           # List all layer instances (full names)\n"
-    printf "  lay repos          # List unique repository names\n"
+    printf "  lay repos          # List unique repos with instance counts, branch, diff stats and instances\n"
+    printf "  lay repos clear    # Clear all repo instances in current path (keep main repos)\n"
     printf "  lay diff           # Navigate to a git diff file's directory\n"
     printf "  lay --test         # Run internal tests\n"
     printf "  lay reverse        # Force go back/up (silent)\n"
@@ -133,6 +136,7 @@ TARGET_LAYER_NUMBER=""
 SWI_CYCLE=0
 SWITCH_REPOSITORY=0
 TARGET_REPOSITORY=""
+SHOW_REPO_DETAILS=0
 LIST_ALL_LAYERS=0
 LIST_ALL_REPOSITORIES=0
 RUN_INTERNAL_TESTS=0
@@ -193,12 +197,20 @@ while [ $# -gt 0 ]; do
             fi
             ;;
         repo|--repo)
-            SWITCH_REPOSITORY=1
             shift
-            # Check for argument (name or number)
-            if [ $# -gt 0 ]; then
-                TARGET_REPOSITORY="$1"
+            # Check for 'clear' subcommand: lay repo clear
+            if [ $# -gt 0 ] && ( [ "$1" = "clear" ] || [ "$1" = "--clear" ] ); then
+                CLEAR_CURRENT_REPO=1
                 shift
+            else
+                # Check for argument (name or number)
+                if [ $# -gt 0 ]; then
+                    SWITCH_REPOSITORY=1
+                    TARGET_REPOSITORY="$1"
+                    shift
+                else
+                    SHOW_REPO_DETAILS=1
+                fi
             fi
             ;;
         reposwi|--reposwi|-rs|reposwitch|swirepo|swi-repo)
@@ -217,6 +229,12 @@ while [ $# -gt 0 ]; do
         repos|--repos|-rp)
             LIST_ALL_REPOSITORIES=1
             shift
+            # Check for 'clear' subcommand: lay repos clear
+            if [ $# -gt 0 ] && ( [ "$1" = "clear" ] || [ "$1" = "--clear" ] ); then
+                LIST_ALL_REPOSITORIES=0
+                CLEAR_ALL_LAYERS=1
+                shift
+            fi
             ;;
         diff|--diff|-df)
             DIFF_NAVIGATE=1
@@ -464,6 +482,71 @@ get_current_branch() {
     # Fallback to master if we can't determine
     printf "master"
     return 0
+}
+
+# Get diff line stats (+insertions/-deletions) for a directory
+get_diff_stats() {
+    stats_directory="$1"
+    stats_insertions=0
+    stats_deletions=0
+    if [ -d "$stats_directory/.git" ] && command -v git >/dev/null 2>&1; then
+        stats_numstat=$(cd "$stats_directory" 2>/dev/null && { git diff --numstat 2>/dev/null; git diff --numstat --cached 2>/dev/null; })
+        if [ -n "$stats_numstat" ]; then
+            stats_insertions=$(printf "%s\n" "$stats_numstat" | awk 'NF>=3 && $1!="-" {s+=$1} END {print s+0}')
+            stats_deletions=$(printf "%s\n" "$stats_numstat" | awk 'NF>=3 && $2!="-" {s+=$2} END {print s+0}')
+        fi
+    fi
+    printf "+%d/-%d" "$stats_insertions" "$stats_deletions"
+    return 0
+}
+
+# Build newline-separated colored entries for instances of a repo
+build_instance_entries_nl() {
+    biparent="$1"
+    biprefix="$2"
+    bicurrent="$3"
+    for bidir in "$biparent"/${biprefix}_*; do
+        [ -d "$bidir" ] || continue
+        bibname=$(basename "$bidir")
+        [ "$bibname" = "$LAYER_NAME" ] && continue
+        bibr=$(get_current_branch "$bidir")
+        bist=$(get_diff_stats "$bidir")
+        if [ -n "$bicurrent" ] && [ "$bibname" = "$bicurrent" ]; then
+            printf "%s\n" "${COLOR_GREEN}${COLOR_BOLD}${bibname}${COLOR_RESET}(${COLOR_CYAN}${bibr}${COLOR_RESET} ${COLOR_YELLOW}${bist}${COLOR_RESET})"
+        else
+            printf "%s\n" "${bibname}(${COLOR_CYAN}${bibr}${COLOR_RESET} ${COLOR_YELLOW}${bist}${COLOR_RESET})"
+        fi
+    done
+}
+
+# Fit entries into one line within terminal width; append ... if truncated
+fit_entries() {
+    feprefix="$1"
+    felines="$2"
+    fewidth="$3"
+    ffline=""
+    while IFS= read -r feentry; do
+        [ -z "$feentry" ] && continue
+        if [ -z "$ffline" ]; then
+            fecand="$feprefix$feentry"
+        else
+            fecand="$ffline ${COLOR_MAGENTA}•${COLOR_RESET} $feentry"
+        fi
+        felength=$(printf "%s" "$fecand" | sed 's/\\033\[[0-9;]*m//g' | awk '{n+=length($0)} END{print n+0}')
+        if [ "$felength" -le "$fewidth" ]; then
+            ffline="$fecand"
+        else
+            if [ -n "$ffline" ]; then
+                ffline="$ffline ..."
+            else
+                ffline="$feprefix..."
+            fi
+            break
+        fi
+    done <<EOF
+$felines
+EOF
+    printf "%s" "$ffline"
 }
 
 # Copy files from repository state (clean, no changes)
@@ -1280,15 +1363,131 @@ list_repositories() {
             # Add to seen list
             printf "%s\n" "$base_repository_name" >> "$seen_file"
             
-            # Print with indicator if current
+            # Count instances for this repository (exclude ._ and main repo)
+            repo_instance_count=0
+            for instance_directory in "$parent_directory"/*/; do
+                [ -d "$instance_directory" ] || continue
+                instance_basename=$(basename "$instance_directory")
+                if [ "$instance_basename" = "$LAYER_NAME" ]; then
+                    continue
+                fi
+                if [ "$instance_basename" = "$base_repository_name" ]; then
+                    continue
+                fi
+                instance_base=$(printf "%s" "$instance_basename" | sed 's/_[^_]*$//')
+                if [ "$instance_base" = "$base_repository_name" ]; then
+                    repo_instance_count=$((repo_instance_count + 1))
+                fi
+            done
+            
+            # Main repo branch + diff stats
+            repo_main_branch=""
+            repo_main_stats="+0/-0"
+            if [ -d "$parent_directory/$base_repository_name" ]; then
+                repo_main_branch=$(get_current_branch "$parent_directory/$base_repository_name")
+                repo_main_stats=$(get_diff_stats "$parent_directory/$base_repository_name")
+            fi
+            
+            repo_current_basename="$(basename "$repository_root")"
+            repo_term_width=$(tput cols 2>/dev/null || printf "80")
+            is_numeric "$repo_term_width" || repo_term_width=80
+            [ "$repo_term_width" -le 0 ] && repo_term_width=80
+            
+            # Minimal prefix: dot+number+name - count (branch stats)
             if [ "$base_repository_name" = "$current_repository" ]; then
-                printf "  ${COLOR_GREEN}● %d. %s ${COLOR_BOLD}(current)${COLOR_RESET}\n" "$counter" "$base_repository_name"
+                repo_prefix="  ${COLOR_GREEN}●${COLOR_RESET} ${counter}. ${COLOR_BOLD}${base_repository_name}${COLOR_RESET} - ${repo_instance_count} (${COLOR_CYAN}${repo_main_branch:-?}${COLOR_RESET} ${COLOR_YELLOW}${repo_main_stats}${COLOR_RESET}) "
             else
-                printf "  %d. %s\n" "$counter" "$base_repository_name"
+                repo_prefix="  ${counter}. ${base_repository_name} - ${repo_instance_count} (${COLOR_CYAN}${repo_main_branch:-?}${COLOR_RESET} ${COLOR_YELLOW}${repo_main_stats}${COLOR_RESET}) "
+            fi
+            
+            repo_entries_nl=$(build_instance_entries_nl "$parent_directory" "$base_repository_name" "$repo_current_basename")
+            repo_fitted=$(fit_entries "$repo_prefix" "$repo_entries_nl" "$repo_term_width")
+            if [ -z "$repo_fitted" ]; then
+                printf "%b\033[0m\n" "$repo_prefix"
+            else
+                printf "%b\033[0m\n" "$repo_fitted"
             fi
             counter=$((counter + 1))
         fi
     done
+    return 0
+}
+
+# Show detailed information about the current repository
+show_repo_details() {
+    repository_root="$CURRENT_DIRECTORY"
+    if [ "$(basename "$repository_root")" = "$LAYER_NAME" ]; then
+        repository_root="$(dirname "$repository_root")"
+    fi
+    parent_directory="$(dirname "$repository_root")"
+    
+    repository_name=$(get_repo_name_from_git "$repository_root")
+    if [ -z "$repository_name" ]; then
+        repository_name=$(get_main_repo_name "$repository_root")
+    fi
+    current_basename="$(basename "$repository_root")"
+    
+    term_width=$(tput cols 2>/dev/null || printf "80")
+    is_numeric "$term_width" || term_width=80
+    [ "$term_width" -le 0 ] && term_width=80
+    
+    printf "${COLOR_CYAN}Repository ${COLOR_BOLD}'%s'${COLOR_RESET}\n" "$repository_name"
+    printf "  Path: %s\n" "$parent_directory/$repository_name"
+    
+    if [ -d "$parent_directory/$repository_name" ]; then
+        main_branch=$(get_current_branch "$parent_directory/$repository_name")
+        main_stats=$(get_diff_stats "$parent_directory/$repository_name")
+        printf "  Main: ${COLOR_BOLD}%s${COLOR_RESET} ${COLOR_CYAN}%s${COLOR_RESET} ${COLOR_YELLOW}%s${COLOR_RESET}\n" "$repository_name" "$main_branch" "$main_stats"
+    else
+        printf "  Main: (not found)\n"
+    fi
+    
+    instance_count=0
+    ranked=""
+    for directory in "$parent_directory"/${repository_name}_*; do
+        [ -d "$directory" ] || continue
+        basename_directory=$(basename "$directory")
+        [ "$basename_directory" = "$LAYER_NAME" ] && continue
+        instance_count=$((instance_count + 1))
+        instance_branch=$(get_current_branch "$directory")
+        instance_stats=$(get_diff_stats "$directory")
+        inst_ins=$(printf "%s" "$instance_stats" | sed 's/^+\([0-9]*\).*/\1/')
+        inst_del=$(printf "%s" "$instance_stats" | sed 's/.*\/-\([0-9]*\)$/\1/')
+        is_numeric "$inst_ins" || inst_ins=0
+        is_numeric "$inst_del" || inst_del=0
+        inst_total=$((inst_ins + inst_del))
+        ranked="${ranked}${inst_total}|${basename_directory}|${instance_branch}|${instance_stats}
+"
+    done
+    
+    if [ "$instance_count" -eq 0 ]; then
+        printf "  Instances (0): (none)\n"
+        return 0
+    fi
+    
+    sorted_data=$(printf "%s" "$ranked" | sort -t'|' -k1,1 -n -r)
+    entries_nl=""
+    while IFS='|' read -r inst_total inst_name inst_branch inst_stats; do
+        [ -z "$inst_name" ] && continue
+        if [ "$inst_name" = "$current_basename" ]; then
+            entry="${COLOR_GREEN}${COLOR_BOLD}${inst_name}${COLOR_RESET}(${COLOR_CYAN}${inst_branch}${COLOR_RESET} ${COLOR_YELLOW}${inst_stats}${COLOR_RESET})"
+        else
+            entry="${inst_name}(${COLOR_CYAN}${inst_branch}${COLOR_RESET} ${COLOR_YELLOW}${inst_stats}${COLOR_RESET})"
+        fi
+        if [ -z "$entries_nl" ]; then
+            entries_nl="$entry"
+        else
+            entries_nl="$entries_nl
+$entry"
+        fi
+    done <<EOF
+$sorted_data
+EOF
+    
+    prefix="  Instances ($instance_count): "
+    fitted=$(fit_entries "$prefix" "$entries_nl" "$term_width")
+    printf "%b\033[0m\n" "$fitted"
+    
     return 0
 }
 
@@ -1749,6 +1948,11 @@ fi
 
 if [ $LIST_ALL_REPOSITORIES -eq 1 ]; then
     list_repositories
+    return $? 2>/dev/null || exit $?
+fi
+
+if [ $SHOW_REPO_DETAILS -eq 1 ]; then
+    show_repo_details
     return $? 2>/dev/null || exit $?
 fi
 
